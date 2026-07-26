@@ -1142,7 +1142,9 @@ fn is_valid_conversation_id(id: &str, kind: ConversationKind) -> bool {
     let valid_prefix = match kind {
         ConversationKind::Channel => matches!(id.as_bytes().first(), Some(b'C' | b'G')),
         ConversationKind::DirectMessage => id.starts_with('D'),
-        ConversationKind::GroupDirectMessage => id.starts_with('G'),
+        ConversationKind::GroupDirectMessage => {
+            matches!(id.as_bytes().first(), Some(b'C' | b'G'))
+        }
     };
     valid_prefix
         && (2..=64).contains(&id.len())
@@ -1743,6 +1745,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbox_accepts_a_c_prefixed_mpim_from_counts_and_discovery() {
+        let mut api = fake_api();
+        api.counts.mpims = vec![entry("CTEAM", true, 2)];
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![RawConversation {
+                is_mpim: true,
+                ..raw_conversation("CTEAM", "mpdm-alice--bob-1")
+            }],
+            ..RawConversationsPage::default()
+        }]));
+        api.history.messages = vec![raw_message("100.000001", "recent")];
+        let history_calls = api.history_calls.clone();
+
+        let report = service(api).inbox(1, 3).await.unwrap();
+
+        assert_eq!(report.total_unread_conversations, 1);
+        assert!(!report.has_more_conversations);
+        assert_eq!(report.conversations.len(), 1);
+        assert_eq!(
+            report.conversations[0].conversation.kind,
+            ConversationKind::GroupDirectMessage
+        );
+        assert_eq!(report.conversations[0].messages.messages.len(), 1);
+        assert_eq!(
+            *history_calls.lock().unwrap(),
+            vec![HistoryCall {
+                channel: "CTEAM".into(),
+                cursor: None,
+                limit: 3,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn empty_inbox_skips_discovery_and_history_but_preserves_thread_unreads() {
         let mut api = fake_api();
         api.counts.threads = RawThreadCounts {
@@ -1855,7 +1891,11 @@ mod tests {
                 },
                 RawConversation {
                     is_mpim: true,
-                    ..raw_conversation("GTEAM", "mpdm-alice--bob-1")
+                    ..raw_conversation("CTEAM", "mpdm-alice--bob-1")
+                },
+                RawConversation {
+                    is_mpim: true,
+                    ..raw_conversation("GTEAM", "mpdm-carol--dan-1")
                 },
             ],
             response_metadata: RawResponseMetadata {
@@ -1868,10 +1908,10 @@ mod tests {
         }]));
 
         let page = service(api)
-            .list_conversations(Some("start-page"), 3)
+            .list_conversations(Some("start-page"), 4)
             .await
             .unwrap();
-        assert_eq!(page.conversations.len(), 3);
+        assert_eq!(page.conversations.len(), 4);
         assert_eq!(page.conversations[0].name, "general");
         assert_eq!(page.conversations[1].kind, ConversationKind::DirectMessage);
         assert_eq!(page.conversations[1].name, "alice");
@@ -1881,8 +1921,53 @@ mod tests {
             page.conversations[2].kind,
             ConversationKind::GroupDirectMessage
         );
+        assert_eq!(
+            page.conversations[3].kind,
+            ConversationKind::GroupDirectMessage
+        );
         assert!(page.has_more);
         assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
+    }
+
+    #[tokio::test]
+    async fn finds_a_c_prefixed_mpim_conversation() {
+        let mut api = fake_api();
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![RawConversation {
+                is_mpim: true,
+                ..raw_conversation("CTEAM", "mpdm-alice--bob-1")
+            }],
+            ..RawConversationsPage::default()
+        }]));
+
+        let report = service(api).find_conversations("alice", 1).await.unwrap();
+
+        assert_eq!(report.conversations.len(), 1);
+        assert_eq!(
+            report.conversations[0].kind,
+            ConversationKind::GroupDirectMessage
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_mpim_conversation_ids() {
+        for id in ["DTEAM", "C-TEAM"] {
+            let mut api = fake_api();
+            api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+                channels: vec![RawConversation {
+                    is_mpim: true,
+                    ..raw_conversation(id, "mpdm-alice--bob-1")
+                }],
+                ..RawConversationsPage::default()
+            }]));
+
+            assert!(matches!(
+                service(api).list_conversations(None, 1).await,
+                Err(Error::InvalidResponse {
+                    method: "conversations.list"
+                })
+            ));
+        }
     }
 
     #[tokio::test]

@@ -65,7 +65,7 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: MPIM discovery and inbox compatibility
+- [x] Milestone 1: MPIM discovery and inbox compatibility
 
 ### Checkpoint Protocol
 
@@ -121,7 +121,27 @@ Authenticated smoke commands run with credentials injected only into the subproc
 ./target/release/lurkline mcp
 ```
 
-Status: Not started.
+Status: Complete on 2026-07-26. The existing kind-aware validator now permits
+`C` or `G` only for group DMs. Synthetic regressions cover list normalization
+for both prefixes, `C`-prefixed find and inbox behavior, and rejection of both
+a `D`-prefixed MPIM and a malformed `C`-prefixed ID. `cargo fmt --check`,
+`cargo test mpim --locked` (3 matching unit tests), `cargo test inbox --locked`
+(6 matching unit tests and 1 CLI process test), `cargo clippy --all-targets
+--locked -- -D warnings`, `cargo test --locked` (65 unit, 3 CLI process, 1 raw
+MCP stdio, and 1 package-metadata test), and `cargo build --release --locked`
+all pass. The persistent adversarial reviewer reported no blocking findings in
+round 1, identified the explicit malformed-ID case as a non-blocking residual
+risk, and reported clean after that regression was added in round 2.
+
+Authenticated bounded live smokes passed with credentials injected only into
+each subprocess environment. CLI doctor authenticated to the expected team;
+list returned 9 conversations, find returned 1 result, search returned 5
+results, and inbox returned all 3 unread conversations. Raw MCP initialized,
+listed all 5 required tools, and returned the same passing doctor, list, find,
+search, and inbox result counts before a clean shutdown. Only structural
+counts and status were emitted; no credential or workspace content was printed
+or persisted, the temporary smoke harness was removed, and the macOS clipboard
+was cleared and verified empty.
 
 ## Final Verification
 
