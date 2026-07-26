@@ -183,16 +183,16 @@ Verification:
 - [x] Configuration and runtime errors cannot reveal token or cookie values.
 - [x] Synthetic tests exercise request shape, parsing, bounds, authentication
       expiry, non-JSON, oversized responses, and Slack API errors.
-- [ ] Formatting, lint, all tests, locked release build, CLI smoke, and raw MCP
+- [x] Formatting, lint, all tests, locked release build, CLI smoke, and raw MCP
       smoke pass from the final path.
 - [x] README documents installation, configuration, security model, commands, MCP
       setup, limitations, and recovery from expired credentials.
 - [x] Goal branch has Conventional Commit checkpoints and an adversarial review
       trail.
-- [ ] Final audited branch is fast-forwarded into local `main`.
-- [ ] `/Users/smarzola/projects/lurkline` exists and is the verified Git root.
-- [ ] Private GitHub repository `smarzola/lurkline` exists with pushed `main`.
-- [ ] Remote URL, default branch, visibility, and commit SHA are read back.
+- [x] Final audited branch is fast-forwarded into local `main`.
+- [x] `/Users/smarzola/projects/lurkline` exists and is the verified Git root.
+- [x] Private GitHub repository `smarzola/lurkline` exists with pushed `main`.
+- [x] Remote URL, default branch, visibility, and commit SHA are read back.
 
 ## Required Final Verification
 
@@ -224,7 +224,8 @@ tools/list, and one validation-error tool call rather than left running.
 - [x] 2026-07-26: Milestone 2 implemented, reviewed, and verified (26 tests).
 - [x] 2026-07-26: Milestone 3 implemented, reviewed, and verified (29 tests).
 - [x] 2026-07-26: Independent final audit passed after two repair rounds.
-- [ ] Final path, local main, GitHub repository, push, and read-back verified.
+- [x] 2026-07-26: Final path, local main, private GitHub repository, push, and
+  read-back verified.
 
 ## Decision Log
 
@@ -281,3 +282,12 @@ independent audit here before marking the goal complete.
 - 2026-07-26 independent final audit re-check: `CLEAN` with 32 unit and 2
   integration tests, locked Clippy, release build, formatting, and full diff
   checks passing.
+- 2026-07-26 final-path verification: after removing relocated Cargo artifacts,
+  a clean rebuild from `/Users/smarzola/projects/lurkline` passed formatting,
+  locked Clippy, 32 unit tests, 2 integration tests, locked release build, CLI
+  help, full diff checks, Git-root readback, and a clean working tree.
+- 2026-07-26 external delivery: fast-forwarded audited
+  `feat/browser-session-slack` into local `main`; created private
+  `smarzola/lurkline`; pushed `main`; read back private visibility, `main` as the
+  default branch, SSH `origin`, and matching local/remote commit
+  `24b17f646891efe3f0db322116738073a6ec5c86`.
