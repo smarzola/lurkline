@@ -9,13 +9,14 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use fs4::FileExt;
 use keyring::v1::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     config::{
-        Config, CredentialBundle, credential_bundle_from_getter, validate_base_url,
+        Config, CredentialBundle, Secret, credential_bundle_from_getter, validate_base_url,
         validate_identifier,
     },
     error::{Error, Result},
@@ -25,10 +26,6 @@ const KEYRING_SERVICE: &str = "me.smarzola.lurkline.slack-session";
 const REGISTRY_VERSION: u8 = 1;
 const CREDENTIAL_VERSION: u8 = 1;
 const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
-#[allow(
-    dead_code,
-    reason = "used by the milestone 2 profile-management commands"
-)]
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -69,10 +66,6 @@ pub(crate) struct ProfileMetadata {
 }
 
 impl ProfileMetadata {
-    #[allow(
-        dead_code,
-        reason = "used by the milestone 2 profile-management commands"
-    )]
     pub(crate) fn from_bundle(bundle: &CredentialBundle) -> Self {
         Self {
             workspace_url: bundle.workspace_url(),
@@ -149,10 +142,6 @@ impl ProfileRegistryState {
             .and_then(ProfileName::parse)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the milestone 2 profile-management commands"
-    )]
     pub(crate) fn register(&mut self, profile: &ProfileName, metadata: ProfileMetadata) {
         self.profiles.insert(profile.to_string(), metadata);
         if self.default_profile.is_none() {
@@ -160,10 +149,6 @@ impl ProfileRegistryState {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the milestone 2 profile-management commands"
-    )]
     pub(crate) fn remove(&mut self, profile: &ProfileName) -> bool {
         let removed = self.profiles.remove(profile.as_str()).is_some();
         if removed && self.default_profile.as_deref() == Some(profile.as_str()) {
@@ -199,6 +184,26 @@ impl ProfileRegistry {
         Self { path }
     }
 
+    fn lock_shared(&self) -> Result<File> {
+        let file = self.open_lock_file()?;
+        FileExt::lock_shared(&file).map_err(|_| Error::ProfileRegistryLock)?;
+        Ok(file)
+    }
+
+    fn lock_exclusive(&self) -> Result<File> {
+        let file = self.open_lock_file()?;
+        FileExt::lock(&file).map_err(|_| Error::ProfileRegistryLock)?;
+        Ok(file)
+    }
+
+    fn open_lock_file(&self) -> Result<File> {
+        let directory = self.path.parent().ok_or(Error::ProfileRegistryLock)?;
+        fs::create_dir_all(directory).map_err(|_| Error::ProfileRegistryLock)?;
+        set_lock_directory_permissions(directory)?;
+        let path = directory.join("profiles.lock");
+        open_lock_file(&path).map_err(|_| Error::ProfileRegistryLock)
+    }
+
     pub(crate) fn load(&self) -> Result<ProfileRegistryState> {
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
@@ -227,10 +232,6 @@ impl ProfileRegistry {
         Ok(registry)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the milestone 2 profile-management commands"
-    )]
     pub(crate) fn save(&self, registry: &ProfileRegistryState) -> Result<()> {
         registry.validate()?;
         let encoded =
@@ -306,10 +307,6 @@ fn linux_registry_directory(
 }
 
 #[cfg(unix)]
-#[allow(
-    dead_code,
-    reason = "used by the milestone 2 profile-management commands"
-)]
 fn open_temporary(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -321,19 +318,36 @@ fn open_temporary(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(not(unix))]
-#[allow(
-    dead_code,
-    reason = "used by the milestone 2 profile-management commands"
-)]
 fn open_temporary(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 #[cfg(unix)]
-#[allow(
-    dead_code,
-    reason = "used by the milestone 2 profile-management commands"
-)]
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+#[cfg(unix)]
 fn set_directory_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -341,19 +355,24 @@ fn set_directory_permissions(path: &Path) -> Result<()> {
         .map_err(|_| Error::ProfileRegistryWrite)
 }
 
+#[cfg(unix)]
+fn set_lock_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|_| Error::ProfileRegistryLock)
+}
+
 #[cfg(not(unix))]
-#[allow(
-    dead_code,
-    reason = "used by the milestone 2 profile-management commands"
-)]
+fn set_lock_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
 fn set_directory_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the milestone 2 profile-management commands"
-)]
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -362,15 +381,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 
 pub(crate) trait CredentialStore {
     fn get(&self, profile: &ProfileName) -> Result<Option<Zeroizing<Vec<u8>>>>;
-    #[allow(
-        dead_code,
-        reason = "used by the milestone 2 profile-management commands"
-    )]
     fn set(&self, profile: &ProfileName, secret: &[u8]) -> Result<()>;
-    #[allow(
-        dead_code,
-        reason = "used by the milestone 2 profile-management commands"
-    )]
     fn delete(&self, profile: &ProfileName) -> Result<bool>;
 }
 
@@ -429,10 +440,6 @@ fn map_keyring_error(profile: &ProfileName, error: KeyringError) -> Error {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the milestone 2 profile-management commands"
-)]
 #[derive(Serialize)]
 struct StoredCredentialRef<'a> {
     version: u8,
@@ -452,10 +459,6 @@ struct StoredCredentialOwned {
     cookie: String,
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the milestone 2 profile-management commands"
-)]
 pub(crate) fn encode_bundle(bundle: &CredentialBundle) -> Result<Zeroizing<Vec<u8>>> {
     let stored = StoredCredentialRef {
         version: CREDENTIAL_VERSION,
@@ -479,14 +482,265 @@ pub(crate) fn decode_bundle(profile: &ProfileName, encoded: &[u8]) -> Result<Cre
             profile: profile.to_string(),
         });
     }
-    CredentialBundle::parse(
-        std::mem::take(&mut stored.base_url),
-        std::mem::take(&mut stored.team_id),
-        std::mem::take(&mut stored.token),
-        std::mem::take(&mut stored.cookie),
-    )
-    .map_err(|_| Error::InvalidStoredCredential {
+    let parsed = (|| {
+        let token = Secret::parse("SLACK_TOKEN", std::mem::take(&mut stored.token))?;
+        let cookie = Secret::parse("SLACK_COOKIE", std::mem::take(&mut stored.cookie))?;
+        CredentialBundle::parse_with_secrets(
+            std::mem::take(&mut stored.base_url),
+            std::mem::take(&mut stored.team_id),
+            token,
+            cookie,
+        )
+    })();
+    parsed.map_err(|_| Error::InvalidStoredCredential {
         profile: profile.to_string(),
+    })
+}
+
+trait RegistryStore {
+    fn load_state(&self) -> Result<ProfileRegistryState>;
+    fn save_state(&self, state: &ProfileRegistryState) -> Result<()>;
+}
+
+impl RegistryStore for ProfileRegistry {
+    fn load_state(&self) -> Result<ProfileRegistryState> {
+        self.load()
+    }
+
+    fn save_state(&self, state: &ProfileRegistryState) -> Result<()> {
+        self.save(state)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AuthProfile {
+    pub profile: String,
+    pub workspace_url: String,
+    pub team_id: String,
+    pub default: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AuthListReport {
+    pub default_profile: Option<String>,
+    pub profiles: Vec<AuthProfile>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AuthStatusReport {
+    pub profile: String,
+    pub workspace_url: String,
+    pub team_id: String,
+    pub default: bool,
+    pub credential_present: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AuthImportReport {
+    pub profile: String,
+    pub workspace_url: String,
+    pub team_id: String,
+    pub default: bool,
+    pub replaced_workspace: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AuthRemoveReport {
+    pub profile: String,
+    pub removed: bool,
+    pub default_profile: Option<String>,
+}
+
+pub(crate) fn list_profiles() -> Result<AuthListReport> {
+    let registry = ProfileRegistry::discover()?;
+    let _lock = registry.lock_shared()?;
+    list_profiles_with(&registry)
+}
+
+fn list_profiles_with(registry: &impl RegistryStore) -> Result<AuthListReport> {
+    let state = registry.load_state()?;
+    let profiles = state
+        .profiles
+        .iter()
+        .map(|(profile, metadata)| AuthProfile {
+            profile: profile.clone(),
+            workspace_url: metadata.workspace_url.clone(),
+            team_id: metadata.team_id.clone(),
+            default: state.default_profile.as_deref() == Some(profile),
+        })
+        .collect();
+    Ok(AuthListReport {
+        default_profile: state.default_profile,
+        profiles,
+    })
+}
+
+pub(crate) fn profile_status(explicit_profile: Option<&str>) -> Result<AuthStatusReport> {
+    let registry = ProfileRegistry::discover()?;
+    let _lock = registry.lock_shared()?;
+    profile_status_with(
+        explicit_profile,
+        env::var("LURKLINE_PROFILE").ok().as_deref(),
+        &registry,
+        &NativeCredentialStore,
+    )
+}
+
+fn profile_status_with(
+    explicit_profile: Option<&str>,
+    environment_profile: Option<&str>,
+    registry: &impl RegistryStore,
+    store: &impl CredentialStore,
+) -> Result<AuthStatusReport> {
+    let state = registry.load_state()?;
+    let profile = state.selected_profile(explicit_profile, environment_profile)?;
+    let metadata = state
+        .profiles
+        .get(profile.as_str())
+        .ok_or_else(|| Error::ProfileNotFound {
+            profile: profile.to_string(),
+        })?;
+    let credential_present = match store.get(&profile)? {
+        Some(encoded) => {
+            let bundle = decode_bundle(&profile, &encoded)?;
+            if !metadata.matches(&bundle) {
+                return Err(Error::CredentialProfileMismatch {
+                    profile: profile.to_string(),
+                });
+            }
+            true
+        }
+        None => false,
+    };
+    Ok(AuthStatusReport {
+        profile: profile.to_string(),
+        workspace_url: metadata.workspace_url.clone(),
+        team_id: metadata.team_id.clone(),
+        default: state.default_profile.as_deref() == Some(profile.as_str()),
+        credential_present,
+    })
+}
+
+pub(crate) fn store_profile(
+    profile: &ProfileName,
+    bundle: CredentialBundle,
+    replace_workspace: bool,
+) -> Result<AuthImportReport> {
+    let registry = ProfileRegistry::discover()?;
+    store_profile_locked(
+        profile,
+        bundle,
+        replace_workspace,
+        &registry,
+        &NativeCredentialStore,
+    )
+}
+
+fn store_profile_locked(
+    profile: &ProfileName,
+    bundle: CredentialBundle,
+    replace_workspace: bool,
+    registry: &ProfileRegistry,
+    store: &impl CredentialStore,
+) -> Result<AuthImportReport> {
+    let _lock = registry.lock_exclusive()?;
+    store_profile_with(profile, bundle, replace_workspace, registry, store)
+}
+
+fn store_profile_with(
+    profile: &ProfileName,
+    bundle: CredentialBundle,
+    replace_workspace: bool,
+    registry: &impl RegistryStore,
+    store: &impl CredentialStore,
+) -> Result<AuthImportReport> {
+    let mut state = registry.load_state()?;
+    let metadata = ProfileMetadata::from_bundle(&bundle);
+    let current = state.profiles.get(profile.as_str());
+    let replaced_workspace = current.is_some_and(|existing| existing != &metadata);
+    if replaced_workspace && !replace_workspace {
+        return Err(Error::ProfileWorkspaceMismatch {
+            profile: profile.to_string(),
+        });
+    }
+
+    let encoded = encode_bundle(&bundle)?;
+    if current.is_some() && !replaced_workspace {
+        store.set(profile, &encoded)?;
+        return Ok(AuthImportReport {
+            profile: profile.to_string(),
+            workspace_url: metadata.workspace_url,
+            team_id: metadata.team_id,
+            default: state.default_profile.as_deref() == Some(profile.as_str()),
+            replaced_workspace: false,
+        });
+    }
+
+    let previous = store.get(profile)?;
+    store.set(profile, &encoded)?;
+    state.register(profile, metadata.clone());
+    if let Err(error) = registry.save_state(&state) {
+        let rollback = match previous {
+            Some(previous) => store.set(profile, &previous),
+            None => store.delete(profile).map(|_| ()),
+        };
+        if rollback.is_err() {
+            return Err(Error::CredentialReconciliation {
+                profile: profile.to_string(),
+            });
+        }
+        return Err(error);
+    }
+
+    Ok(AuthImportReport {
+        profile: profile.to_string(),
+        workspace_url: metadata.workspace_url,
+        team_id: metadata.team_id,
+        default: state.default_profile.as_deref() == Some(profile.as_str()),
+        replaced_workspace,
+    })
+}
+
+pub(crate) fn remove_profile(explicit_profile: Option<&str>) -> Result<AuthRemoveReport> {
+    let registry = ProfileRegistry::discover()?;
+    remove_profile_locked(
+        explicit_profile,
+        env::var("LURKLINE_PROFILE").ok().as_deref(),
+        &registry,
+        &NativeCredentialStore,
+    )
+}
+
+fn remove_profile_locked(
+    explicit_profile: Option<&str>,
+    environment_profile: Option<&str>,
+    registry: &ProfileRegistry,
+    store: &impl CredentialStore,
+) -> Result<AuthRemoveReport> {
+    let _lock = registry.lock_exclusive()?;
+    remove_profile_with(explicit_profile, environment_profile, registry, store)
+}
+
+fn remove_profile_with(
+    explicit_profile: Option<&str>,
+    environment_profile: Option<&str>,
+    registry: &impl RegistryStore,
+    store: &impl CredentialStore,
+) -> Result<AuthRemoveReport> {
+    let mut state = registry.load_state()?;
+    let profile = state.selected_profile(explicit_profile, environment_profile)?;
+    if !state.profiles.contains_key(profile.as_str()) {
+        return Err(Error::ProfileNotFound {
+            profile: profile.to_string(),
+        });
+    }
+    store.delete(&profile)?;
+    state.remove(&profile);
+    registry.save_state(&state)?;
+    Ok(AuthRemoveReport {
+        profile: profile.to_string(),
+        removed: true,
+        default_profile: state.default_profile,
     })
 }
 
@@ -522,6 +776,7 @@ fn resolve_stored_config(
     registry: &ProfileRegistry,
     store: &impl CredentialStore,
 ) -> Result<Config> {
+    let _lock = registry.lock_shared()?;
     let environment_profile = get("LURKLINE_PROFILE");
     let state = registry.load()?;
     let profile = state.selected_profile(explicit_profile, environment_profile.as_deref())?;
@@ -546,9 +801,9 @@ fn resolve_stored_config(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         sync::{
-            Mutex,
+            Arc, Barrier, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::{SystemTime, UNIX_EPOCH},
@@ -584,6 +839,10 @@ mod tests {
     struct MemoryStore {
         values: Mutex<BTreeMap<String, Vec<u8>>>,
         reads: AtomicUsize,
+        sets: AtomicUsize,
+        deletes: AtomicUsize,
+        set_failures: Mutex<VecDeque<bool>>,
+        delete_failures: Mutex<VecDeque<bool>>,
     }
 
     impl MemoryStore {
@@ -592,6 +851,26 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(profile.to_string(), encode_bundle(bundle).unwrap().to_vec());
+        }
+
+        fn fail_next_set(&self) {
+            self.set_failures.lock().unwrap().push_back(true);
+        }
+
+        fn fail_next_delete(&self) {
+            self.delete_failures.lock().unwrap().push_back(true);
+        }
+
+        fn queue_set_results(&self, failures: impl IntoIterator<Item = bool>) {
+            self.set_failures.lock().unwrap().extend(failures);
+        }
+
+        fn decoded(&self, profile: &ProfileName) -> Option<CredentialBundle> {
+            self.values
+                .lock()
+                .unwrap()
+                .get(profile.as_str())
+                .map(|encoded| decode_bundle(profile, encoded).unwrap())
         }
     }
 
@@ -608,6 +887,16 @@ mod tests {
         }
 
         fn set(&self, profile: &ProfileName, secret: &[u8]) -> Result<()> {
+            self.sets.fetch_add(1, Ordering::SeqCst);
+            if self
+                .set_failures
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(false)
+            {
+                return Err(Error::CredentialStore);
+            }
             self.values
                 .lock()
                 .unwrap()
@@ -616,12 +905,56 @@ mod tests {
         }
 
         fn delete(&self, profile: &ProfileName) -> Result<bool> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            if self
+                .delete_failures
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(false)
+            {
+                return Err(Error::CredentialStore);
+            }
             Ok(self
                 .values
                 .lock()
                 .unwrap()
                 .remove(profile.as_str())
                 .is_some())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryRegistry {
+        state: Mutex<ProfileRegistryState>,
+        saves: AtomicUsize,
+        save_failures: Mutex<VecDeque<bool>>,
+    }
+
+    impl MemoryRegistry {
+        fn fail_next_save(&self) {
+            self.save_failures.lock().unwrap().push_back(true);
+        }
+    }
+
+    impl RegistryStore for MemoryRegistry {
+        fn load_state(&self) -> Result<ProfileRegistryState> {
+            Ok(self.state.lock().unwrap().clone())
+        }
+
+        fn save_state(&self, state: &ProfileRegistryState) -> Result<()> {
+            self.saves.fetch_add(1, Ordering::SeqCst);
+            if self
+                .save_failures
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(false)
+            {
+                return Err(Error::ProfileRegistryWrite);
+            }
+            *self.state.lock().unwrap() = state.clone();
+            Ok(())
         }
     }
 
@@ -892,6 +1225,393 @@ mod tests {
         store.insert(&profile, &bundle("other", "TOTHER", "stored-token"));
         let mismatch = resolve_config_with(None, |_| None, &registry, &store).unwrap_err();
         assert!(matches!(mismatch, Error::CredentialProfileMismatch { .. }));
+    }
+
+    #[test]
+    fn profile_management_preserves_defaults_and_requires_explicit_replacement() {
+        let registry = MemoryRegistry::default();
+        let store = MemoryStore::default();
+        let beta = ProfileName::parse("beta").unwrap();
+        let alpha = ProfileName::parse("alpha").unwrap();
+
+        let first = store_profile_with(
+            &beta,
+            bundle("beta", "TBETA", "xoxc-first"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap();
+        assert!(first.default);
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::json!({
+                "profile": "beta",
+                "workspace_url": "https://beta.slack.com",
+                "team_id": "TBETA",
+                "default": true,
+                "replaced_workspace": false
+            })
+        );
+        let second = store_profile_with(
+            &alpha,
+            bundle("alpha", "TALPHA", "xoxc-second"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap();
+        assert!(!second.default);
+
+        let list = list_profiles_with(&registry).unwrap();
+        assert_eq!(list.default_profile.as_deref(), Some("beta"));
+        assert_eq!(
+            list.profiles
+                .iter()
+                .map(|profile| profile.profile.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert_eq!(
+            serde_json::to_value(&list).unwrap(),
+            serde_json::json!({
+                "default_profile": "beta",
+                "profiles": [
+                    {
+                        "profile": "alpha",
+                        "workspace_url": "https://alpha.slack.com",
+                        "team_id": "TALPHA",
+                        "default": false
+                    },
+                    {
+                        "profile": "beta",
+                        "workspace_url": "https://beta.slack.com",
+                        "team_id": "TBETA",
+                        "default": true
+                    }
+                ]
+            })
+        );
+        let status = profile_status_with(Some("alpha"), None, &registry, &store).unwrap();
+        assert!(status.credential_present);
+        assert!(!status.default);
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            serde_json::json!({
+                "profile": "alpha",
+                "workspace_url": "https://alpha.slack.com",
+                "team_id": "TALPHA",
+                "default": false,
+                "credential_present": true
+            })
+        );
+        let rendered = serde_json::to_string(&status).unwrap();
+        assert!(!rendered.contains("xoxc-"));
+        assert!(!rendered.contains("xoxd-"));
+
+        let saves_before_refresh = registry.saves.load(Ordering::SeqCst);
+        store_profile_with(
+            &beta,
+            bundle("beta", "TBETA", "xoxc-refreshed"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.saves.load(Ordering::SeqCst),
+            saves_before_refresh,
+            "same-workspace refresh must update only keyring"
+        );
+        assert_eq!(store.decoded(&beta).unwrap().token(), "xoxc-refreshed");
+
+        let mismatch = store_profile_with(
+            &beta,
+            bundle("other", "TOTHER", "xoxc-other"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(mismatch, Error::ProfileWorkspaceMismatch { .. }));
+        assert_eq!(store.decoded(&beta).unwrap().team_id, "TBETA");
+
+        let replaced = store_profile_with(
+            &beta,
+            bundle("other", "TOTHER", "xoxc-other"),
+            true,
+            &registry,
+            &store,
+        )
+        .unwrap();
+        assert!(replaced.replaced_workspace);
+        assert!(replaced.default);
+        assert_eq!(store.decoded(&beta).unwrap().team_id, "TOTHER");
+    }
+
+    #[test]
+    fn concurrent_profile_imports_preserve_both_registry_and_keyring_entries() {
+        let directory = TestDirectory::new("concurrent-imports");
+        let registry = directory.registry();
+        let store = Arc::new(MemoryStore::default());
+        let barrier = Arc::new(Barrier::new(3));
+
+        let mut threads = Vec::new();
+        for (name, workspace, team) in [("alpha", "alpha", "TALPHA"), ("beta", "beta", "TBETA")] {
+            let registry = registry.clone();
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let profile = ProfileName::parse(name).unwrap();
+                barrier.wait();
+                store_profile_locked(
+                    &profile,
+                    bundle(workspace, team, "xoxc-concurrent"),
+                    false,
+                    &registry,
+                    store.as_ref(),
+                )
+                .unwrap();
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let state = registry.load().unwrap();
+        assert_eq!(
+            state
+                .profiles
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert!(
+            state
+                .default_profile
+                .as_ref()
+                .is_some_and(|profile| { profile == "alpha" || profile == "beta" })
+        );
+        for profile in ["alpha", "beta"] {
+            assert!(
+                store
+                    .decoded(&ProfileName::parse(profile).unwrap())
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_profile_import_and_removal_leave_cross_store_state_consistent() {
+        let directory = TestDirectory::new("concurrent-import-remove");
+        let registry = directory.registry();
+        let store = Arc::new(MemoryStore::default());
+        for (name, workspace, team) in [("keep", "keep", "TKEEP"), ("remove", "remove", "TREMOVE")]
+        {
+            store_profile_locked(
+                &ProfileName::parse(name).unwrap(),
+                bundle(workspace, team, "xoxc-initial"),
+                false,
+                &registry,
+                store.as_ref(),
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(3));
+        let import_thread = {
+            let registry = registry.clone();
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store_profile_locked(
+                    &ProfileName::parse("new").unwrap(),
+                    bundle("new", "TNEW", "xoxc-new"),
+                    false,
+                    &registry,
+                    store.as_ref(),
+                )
+                .unwrap();
+            })
+        };
+        let remove_thread = {
+            let registry = registry.clone();
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                remove_profile_locked(Some("remove"), None, &registry, store.as_ref()).unwrap();
+            })
+        };
+        barrier.wait();
+        import_thread.join().unwrap();
+        remove_thread.join().unwrap();
+
+        let state = registry.load().unwrap();
+        assert_eq!(
+            state
+                .profiles
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["keep", "new"]
+        );
+        assert_eq!(state.default_profile.as_deref(), Some("keep"));
+        assert!(
+            store
+                .decoded(&ProfileName::parse("keep").unwrap())
+                .is_some()
+        );
+        assert!(store.decoded(&ProfileName::parse("new").unwrap()).is_some());
+        assert!(
+            store
+                .decoded(&ProfileName::parse("remove").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn profile_store_rolls_back_every_failure_boundary() {
+        let profile = ProfileName::parse("work").unwrap();
+
+        let registry = MemoryRegistry::default();
+        let store = MemoryStore::default();
+        store.fail_next_set();
+        let error = store_profile_with(
+            &profile,
+            bundle("example", "T123", "xoxc-test"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::CredentialStore));
+        assert!(registry.load_state().unwrap().profiles.is_empty());
+        assert!(store.decoded(&profile).is_none());
+
+        let registry = MemoryRegistry::default();
+        let store = MemoryStore::default();
+        registry.fail_next_save();
+        let error = store_profile_with(
+            &profile,
+            bundle("example", "T123", "xoxc-test"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::ProfileRegistryWrite));
+        assert!(registry.load_state().unwrap().profiles.is_empty());
+        assert!(store.decoded(&profile).is_none());
+
+        let registry = MemoryRegistry::default();
+        let store = MemoryStore::default();
+        store_profile_with(
+            &profile,
+            bundle("original", "TORIGINAL", "xoxc-original"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap();
+        registry.fail_next_save();
+        let error = store_profile_with(
+            &profile,
+            bundle("replacement", "TREPLACE", "xoxc-replacement"),
+            true,
+            &registry,
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::ProfileRegistryWrite));
+        let restored = store.decoded(&profile).unwrap();
+        assert_eq!(restored.team_id, "TORIGINAL");
+        assert_eq!(restored.token(), "xoxc-original");
+
+        registry.fail_next_save();
+        store.queue_set_results([false, true]);
+        let error = store_profile_with(
+            &profile,
+            bundle("replacement", "TREPLACE", "xoxc-replacement"),
+            true,
+            &registry,
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::CredentialReconciliation { .. }));
+        assert_eq!(store.decoded(&profile).unwrap().team_id, "TREPLACE");
+
+        let registry = MemoryRegistry::default();
+        let store = MemoryStore::default();
+        registry.fail_next_save();
+        store.fail_next_delete();
+        let error = store_profile_with(
+            &profile,
+            bundle("example", "T123", "xoxc-test"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::CredentialReconciliation { .. }));
+        assert!(store.decoded(&profile).is_some());
+    }
+
+    #[test]
+    fn profile_removal_is_retryable_and_reselects_default() {
+        let registry = MemoryRegistry::default();
+        let store = MemoryStore::default();
+        let beta = ProfileName::parse("beta").unwrap();
+        let alpha = ProfileName::parse("alpha").unwrap();
+        store_profile_with(
+            &beta,
+            bundle("beta", "TBETA", "xoxc-beta"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap();
+        store_profile_with(
+            &alpha,
+            bundle("alpha", "TALPHA", "xoxc-alpha"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap();
+
+        store.fail_next_delete();
+        let error = remove_profile_with(Some("beta"), None, &registry, &store).unwrap_err();
+        assert!(matches!(error, Error::CredentialStore));
+        assert_eq!(
+            registry.load_state().unwrap().default_profile.as_deref(),
+            Some("beta")
+        );
+        assert!(store.decoded(&beta).is_some());
+
+        registry.fail_next_save();
+        let error = remove_profile_with(Some("beta"), None, &registry, &store).unwrap_err();
+        assert!(matches!(error, Error::ProfileRegistryWrite));
+        assert!(store.decoded(&beta).is_none());
+        assert!(registry.load_state().unwrap().profiles.contains_key("beta"));
+
+        let retry = remove_profile_with(Some("beta"), None, &registry, &store).unwrap();
+        assert!(retry.removed);
+        assert_eq!(retry.default_profile.as_deref(), Some("alpha"));
+        assert_eq!(
+            serde_json::to_value(&retry).unwrap(),
+            serde_json::json!({
+                "profile": "beta",
+                "removed": true,
+                "default_profile": "alpha"
+            })
+        );
+        let final_remove = remove_profile_with(Some("alpha"), None, &registry, &store).unwrap();
+        assert_eq!(final_remove.default_profile, None);
+        assert!(registry.load_state().unwrap().profiles.is_empty());
     }
 
     #[test]

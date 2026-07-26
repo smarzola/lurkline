@@ -185,14 +185,19 @@ fn error_code(error: &Error) -> &'static str {
         Error::InvalidConfig { .. } => "invalid_config",
         Error::InvalidInput { .. } => "invalid_input",
         Error::MissingProfile => "missing_profile",
-        Error::ProfileNotFound { .. } => "profile_not_found",
+        Error::ProfileNotFound { .. } | Error::ProfileWorkspaceMismatch { .. } => {
+            "profile_not_found"
+        }
         Error::InvalidProfileRegistry => "invalid_profile_registry",
-        Error::ProfileRegistryRead | Error::ProfileRegistryWrite => "profile_registry",
+        Error::ProfileRegistryRead | Error::ProfileRegistryWrite | Error::ProfileRegistryLock => {
+            "profile_registry"
+        }
         Error::CredentialStoreUnavailable => "credential_store_unavailable",
         Error::CredentialStore => "credential_store",
-        Error::InvalidStoredCredential { .. } | Error::CredentialProfileMismatch { .. } => {
-            "invalid_stored_credential"
-        }
+        Error::InvalidStoredCredential { .. }
+        | Error::CredentialProfileMismatch { .. }
+        | Error::CredentialReconciliation { .. } => "invalid_stored_credential",
+        Error::InputRead => "input_read",
         Error::Authentication => "authentication",
         Error::SlackApi { .. } => "slack_api",
         Error::HttpStatus { .. } => "http_status",

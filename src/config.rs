@@ -49,6 +49,7 @@ pub(crate) struct CredentialBundle {
 }
 
 impl CredentialBundle {
+    #[cfg(test)]
     pub(crate) fn parse(
         base_url: String,
         team_id: String,
@@ -57,6 +58,26 @@ impl CredentialBundle {
     ) -> Result<Self> {
         let token = Secret::parse("SLACK_TOKEN", token)?;
         let cookie = Secret::parse("SLACK_COOKIE", cookie)?;
+        Self::parse_with_secrets(base_url, team_id, token, cookie)
+    }
+
+    pub(crate) fn parse_borrowed(
+        base_url: String,
+        team_id: String,
+        token: &str,
+        cookie: &str,
+    ) -> Result<Self> {
+        let token = Secret::parse("SLACK_TOKEN", token.to_owned())?;
+        let cookie = Secret::parse("SLACK_COOKIE", cookie.to_owned())?;
+        Self::parse_with_secrets(base_url, team_id, token, cookie)
+    }
+
+    pub(crate) fn parse_with_secrets(
+        base_url: String,
+        team_id: String,
+        token: Secret,
+        cookie: Secret,
+    ) -> Result<Self> {
         let base_url = validate_base_url(&base_url)?;
         validate_identifier("SLACK_TEAM_ID", &team_id)?;
         validate_session_cookie(&cookie)?;
@@ -68,12 +89,10 @@ impl CredentialBundle {
         })
     }
 
-    #[allow(dead_code, reason = "used by the milestone 2 credential writer")]
     pub(crate) fn token(&self) -> &str {
         self.token.expose()
     }
 
-    #[allow(dead_code, reason = "used by the milestone 2 credential writer")]
     pub(crate) fn cookie(&self) -> &str {
         self.cookie.expose()
     }
@@ -153,6 +172,15 @@ impl Config {
             timeout: Duration::from_millis(timeout_ms),
             max_response_bytes,
         })
+    }
+
+    pub(crate) fn into_bundle(self) -> CredentialBundle {
+        CredentialBundle {
+            base_url: self.base_url,
+            team_id: self.team_id,
+            token: self.token,
+            cookie: self.cookie,
+        }
     }
 
     #[cfg(test)]

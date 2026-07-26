@@ -11,6 +11,7 @@ repository = "https://github.com/smarzola/lurkline"
 async-trait = "0.1"
 clap = { version = "4.6", features = ["derive"] }
 futures-util = "0.3"
+fs4 = "1.1"
 keyring = "4.1"
 reqwest = { version = "0.13", default-features = false, features = ["multipart", "rustls", "stream"] }
 rmcp = { version = "2.2", features = ["transport-io"] }

@@ -48,6 +48,13 @@ impl SlackHttpClient {
         &self.config
     }
 
+    pub(crate) async fn validate_session(self) -> Result<Config> {
+        SlackApi::client_counts(&self).await?;
+        Arc::try_unwrap(self.config).map_err(|_| Error::InvalidResponse {
+            method: "client.counts",
+        })
+    }
+
     async fn post_form<T>(
         &self,
         method: &'static str,

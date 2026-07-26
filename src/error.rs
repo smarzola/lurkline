@@ -19,12 +19,18 @@ pub enum Error {
     MissingProfile,
     #[error("credential profile {profile} was not found")]
     ProfileNotFound { profile: String },
+    #[error(
+        "credential profile {profile} belongs to another workspace; pass --replace-workspace to replace it"
+    )]
+    ProfileWorkspaceMismatch { profile: String },
     #[error("credential profile registry is invalid; repair or remove it before continuing")]
     InvalidProfileRegistry,
     #[error("credential profile registry could not be read")]
     ProfileRegistryRead,
     #[error("credential profile registry could not be written")]
     ProfileRegistryWrite,
+    #[error("credential profile registry could not be locked")]
+    ProfileRegistryLock,
     #[error(
         "the operating system credential store is unavailable; configure all four SLACK_* environment variables instead"
     )]
@@ -39,6 +45,12 @@ pub enum Error {
         "stored credentials for profile {profile} do not match its registry metadata; re-import the profile"
     )]
     CredentialProfileMismatch { profile: String },
+    #[error(
+        "credential update for profile {profile} could not be rolled back; re-import the profile before use"
+    )]
+    CredentialReconciliation { profile: String },
+    #[error("could not read cURL input from standard input")]
+    InputRead,
     #[error("Slack browser session is expired or invalid; copy fresh browser credentials")]
     Authentication,
     #[error("Slack method {method} failed: {code}")]
