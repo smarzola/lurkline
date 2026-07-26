@@ -8,9 +8,9 @@ use crate::{
     mcp,
     model::{
         ConversationKind, DoctorReport, Message, MessagePage, ThreadPage, UnreadReport,
-        UserSearchReport,
+        UserSearchReport, UserSearchTruncationReason,
     },
-    service::SlackService,
+    service::{MAX_USERS, SlackService},
 };
 
 #[derive(Debug, Parser)]
@@ -278,18 +278,38 @@ fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
     }
     if report.users.is_empty() {
         println!("No users matched.");
-        return Ok(());
+    } else {
+        for user in &report.users {
+            println!(
+                "{}\t@{}\t{}\t{}",
+                user.id, user.name, user.display_name, user.real_name
+            );
+        }
     }
-    for user in report.users {
-        println!(
-            "{}\t@{}\t{}\t{}",
-            user.id, user.name, user.display_name, user.real_name
-        );
-    }
-    if report.truncated {
-        println!("More matching users may exist; narrow the query or raise --limit.");
+    if let Some(notice) = user_truncation_notice(&report) {
+        println!("{notice}");
     }
     Ok(())
+}
+
+fn user_truncation_notice(report: &UserSearchReport) -> Option<String> {
+    match report.truncation_reason {
+        Some(UserSearchTruncationReason::ResultLimit) if report.users.len() < MAX_USERS => {
+            Some(format!(
+                "Result limit reached after scanning {} users; raise --limit to return more matches.",
+                report.scanned_users
+            ))
+        }
+        Some(UserSearchTruncationReason::ResultLimit) => Some(format!(
+            "More matches exist after scanning {} users; the {}-result maximum was reached.",
+            report.scanned_users, MAX_USERS
+        )),
+        Some(UserSearchTruncationReason::ScanLimit) => Some(format!(
+            "Search stopped after scanning {} users (scan cap {}); matches may exist beyond the scanned pages.",
+            report.scanned_users, report.scan_limit
+        )),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -356,5 +376,50 @@ mod tests {
             Cli::try_parse_from(["lurkline", "mcp"]).unwrap().command,
             Command::Mcp
         ));
+    }
+
+    #[test]
+    fn warns_when_an_empty_user_search_hit_the_scan_cap() {
+        let report = UserSearchReport {
+            query: "missing".into(),
+            users: vec![],
+            truncated: true,
+            truncation_reason: Some(UserSearchTruncationReason::ScanLimit),
+            scanned_users: 4_000,
+            scan_limit: 4_000,
+        };
+        assert_eq!(
+            user_truncation_notice(&report).as_deref(),
+            Some(
+                "Search stopped after scanning 4000 users (scan cap 4000); matches may exist beyond the scanned pages."
+            )
+        );
+    }
+
+    #[test]
+    fn does_not_suggest_an_impossible_limit_above_the_maximum() {
+        let report = UserSearchReport {
+            query: "many".into(),
+            users: (0..MAX_USERS)
+                .map(|index| crate::model::User {
+                    id: format!("U{index}"),
+                    name: String::new(),
+                    display_name: String::new(),
+                    real_name: String::new(),
+                    title: String::new(),
+                    deleted: false,
+                    is_bot: false,
+                    timezone: None,
+                    image_url: None,
+                })
+                .collect(),
+            truncated: true,
+            truncation_reason: Some(UserSearchTruncationReason::ResultLimit),
+            scanned_users: 101,
+            scan_limit: 4_000,
+        };
+        let notice = user_truncation_notice(&report).unwrap();
+        assert!(notice.contains("100-result maximum"));
+        assert!(!notice.contains("raise --limit"));
     }
 }

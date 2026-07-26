@@ -284,16 +284,20 @@ fn sanitize_error_code(code: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        convert::Infallible,
+        sync::{Arc, Mutex},
+    };
 
     use axum::{
         Router,
-        body::Bytes,
+        body::{Body, Bytes},
         extract::{OriginalUri, State},
         http::{HeaderMap, StatusCode, Uri},
-        response::IntoResponse,
+        response::{IntoResponse, Response},
         routing::post,
     };
+    use futures_util::stream;
     use tokio::net::TcpListener;
     use url::Url;
 
@@ -338,11 +342,31 @@ mod tests {
         (SlackHttpClient::new(config).unwrap(), capture)
     }
 
+    async fn chunked_handler() -> Response<Body> {
+        let chunks = [
+            Ok::<_, Infallible>(Bytes::from(vec![b'x'; 800])),
+            Ok::<_, Infallible>(Bytes::from(vec![b'y'; 800])),
+        ];
+        Response::new(Body::from_stream(stream::iter(chunks)))
+    }
+
+    async fn chunked_server(limit: usize) -> SlackHttpClient {
+        let app = Router::new().route("/api/client.counts", post(chunked_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = Config::for_test(Url::parse(&format!("http://{address}/")).unwrap(), limit);
+        SlackHttpClient::new(config).unwrap()
+    }
+
     #[tokio::test]
     async fn sends_browser_session_request_shape() {
         let (client, capture) = server(
             StatusCode::OK,
-            br#"{"ok":true,"channels":[],"ims":[],"mpims":[]}"#.to_vec(),
+            br#"{"ok":true,"channels":[],"ims":[],"mpims":[],"threads":{"has_unreads":false}}"#
+                .to_vec(),
             64 * 1024,
         )
         .await;
@@ -489,7 +513,7 @@ mod tests {
     async fn does_not_scan_valid_json_values_for_login_words() {
         let (client, _) = server(
             StatusCode::OK,
-            br#"{"ok":true,"channels":[],"ims":[],"mpims":[],"alert":"signin <html>"}"#.to_vec(),
+            br#"{"ok":true,"channels":[],"ims":[],"mpims":[],"threads":{"has_unreads":false},"alert":"signin <html>"}"#.to_vec(),
             64 * 1024,
         )
         .await;
@@ -497,7 +521,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforces_streamed_response_limit() {
+    async fn rejects_advertised_oversized_response() {
         let body = format!(
             "{{\"ok\":true,\"padding\":\"{}\",\"channels\":[]}}",
             "x".repeat(2048)
@@ -509,8 +533,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enforces_streamed_response_limit_without_content_length() {
+        let client = chunked_server(1024).await;
+        let error = client.client_counts().await.unwrap_err();
+        assert!(matches!(error, Error::ResponseTooLarge { limit: 1024, .. }));
+    }
+
+    #[tokio::test]
     async fn rejects_malformed_success_payloads() {
         let cases = [
+            ("counts", br#"{"ok":true}"#.as_slice()),
             (
                 "history",
                 br#"{"ok":true,"messages":[{"text":"missing ts"}]}"#.as_slice(),
@@ -524,6 +556,7 @@ mod tests {
         for (case, body) in cases {
             let (client, _) = server(StatusCode::OK, body.to_vec(), 64 * 1024).await;
             let result = match case {
+                "counts" => client.client_counts().await.map(|_| ()),
                 "history" => client.conversation_history("C123", 20).await.map(|_| ()),
                 "users" => client.users_list(None, 200).await.map(|_| ()),
                 _ => unreachable!(),

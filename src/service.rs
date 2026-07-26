@@ -9,11 +9,12 @@ use crate::{
         ClientCountsPayload, ConversationKind, DoctorReport, FileReference, Message, MessagePage,
         RawMessage, RawMessagePage, RawMessagesList, RawUnread, RawUser, RawUsersPage, Reaction,
         ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
+        UserSearchTruncationReason,
     },
 };
 
 const MAX_MESSAGES: usize = 200;
-const MAX_USERS: usize = 100;
+pub(crate) const MAX_USERS: usize = 100;
 const USERS_PAGE_SIZE: usize = 200;
 const MAX_USER_PAGES: usize = 20;
 
@@ -58,22 +59,32 @@ impl SlackService {
 
     pub(crate) async fn unreads(&self) -> Result<UnreadReport> {
         let counts = self.api.client_counts().await?;
+        if counts
+            .threads
+            .unread_count_by_channel
+            .keys()
+            .any(|id| !is_valid_any_conversation_id(id))
+        {
+            return Err(Error::InvalidResponse {
+                method: "client.counts",
+            });
+        }
         let mut conversations = Vec::new();
         append_unreads(
             &mut conversations,
             counts.channels,
             ConversationKind::Channel,
-        );
+        )?;
         append_unreads(
             &mut conversations,
             counts.ims,
             ConversationKind::DirectMessage,
-        );
+        )?;
         append_unreads(
             &mut conversations,
             counts.mpims,
             ConversationKind::GroupDirectMessage,
-        );
+        )?;
         conversations.sort_by(|left, right| {
             right
                 .mention_count
@@ -161,13 +172,20 @@ impl SlackService {
         let mut users = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
+        let mut scanned_users = 0;
 
         for page_index in 0..MAX_USER_PAGES {
             let page = self
                 .api
                 .users_list(cursor.as_deref(), USERS_PAGE_SIZE)
                 .await?;
+            if page.members.len() > USERS_PAGE_SIZE {
+                return Err(Error::InvalidResponse {
+                    method: "users.list",
+                });
+            }
             for raw_user in page.members {
+                scanned_users += 1;
                 if !is_valid_user_id(&raw_user.id) {
                     return Err(Error::InvalidResponse {
                         method: "users.list",
@@ -179,6 +197,9 @@ impl SlackService {
                             query,
                             users,
                             truncated: true,
+                            truncation_reason: Some(UserSearchTruncationReason::ResultLimit),
+                            scanned_users,
+                            scan_limit: USERS_PAGE_SIZE * MAX_USER_PAGES,
                         });
                     }
                     users.push(normalize_user(raw_user));
@@ -190,6 +211,9 @@ impl SlackService {
                     query,
                     users,
                     truncated: false,
+                    truncation_reason: None,
+                    scanned_users,
+                    scan_limit: USERS_PAGE_SIZE * MAX_USER_PAGES,
                 });
             };
             if !seen_cursors.insert(next.clone()) {
@@ -203,6 +227,9 @@ impl SlackService {
                     query,
                     users,
                     truncated: true,
+                    truncation_reason: Some(UserSearchTruncationReason::ScanLimit),
+                    scanned_users,
+                    scan_limit: USERS_PAGE_SIZE * MAX_USER_PAGES,
                 });
             }
         }
@@ -214,7 +241,15 @@ fn append_unreads(
     target: &mut Vec<UnreadConversation>,
     source: Vec<RawUnread>,
     kind: ConversationKind,
-) {
+) -> Result<()> {
+    if source
+        .iter()
+        .any(|entry| !is_valid_conversation_id(&entry.id, kind))
+    {
+        return Err(Error::InvalidResponse {
+            method: "client.counts",
+        });
+    }
     target.extend(
         source
             .into_iter()
@@ -228,6 +263,7 @@ fn append_unreads(
                 latest: entry.latest,
             }),
     );
+    Ok(())
 }
 
 fn normalize_messages(
@@ -350,6 +386,23 @@ fn is_valid_timestamp(timestamp: &str) -> bool {
 
 fn is_valid_user_id(user_id: &str) -> bool {
     (2..=64).contains(&user_id.len()) && user_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn is_valid_conversation_id(id: &str, kind: ConversationKind) -> bool {
+    let valid_prefix = match kind {
+        ConversationKind::Channel => matches!(id.as_bytes().first(), Some(b'C' | b'G')),
+        ConversationKind::DirectMessage => id.starts_with('D'),
+        ConversationKind::GroupDirectMessage => id.starts_with('G'),
+    };
+    valid_prefix
+        && (2..=64).contains(&id.len())
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn is_valid_any_conversation_id(id: &str) -> bool {
+    matches!(id.as_bytes().first(), Some(b'C' | b'D' | b'G'))
+        && (2..=64).contains(&id.len())
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn validate_query(query: &str) -> Result<String> {
@@ -552,13 +605,13 @@ mod tests {
     async fn normalizes_only_explicit_slack_unreads_across_kinds() {
         let mut api = fake_api();
         api.counts = ClientCountsPayload {
-            channels: vec![entry("C_READ", false, 9), entry("C_UNREAD", true, 1)],
-            ims: vec![entry("D_UNREAD", true, 3)],
-            mpims: vec![entry("G_UNREAD", true, 0)],
+            channels: vec![entry("CREAD", false, 9), entry("CUNREAD", true, 1)],
+            ims: vec![entry("DUNREAD", true, 3)],
+            mpims: vec![entry("GUNREAD", true, 0)],
             threads: RawThreadCounts {
                 has_unreads: true,
                 mention_count: 2,
-                unread_count_by_channel: BTreeMap::from([("C_UNREAD".into(), 4)]),
+                unread_count_by_channel: BTreeMap::from([("CUNREAD".into(), 4)]),
             },
         };
         let report = service(api).unreads().await.unwrap();
@@ -569,7 +622,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["D_UNREAD", "C_UNREAD", "G_UNREAD"]
+            vec!["DUNREAD", "CUNREAD", "GUNREAD"]
         );
         assert_eq!(
             report.conversations[0].kind,
@@ -584,21 +637,18 @@ mod tests {
         let mut api = fake_api();
         api.counts = ClientCountsPayload {
             channels: vec![RawUnread {
-                id: "C_NULL".into(),
+                id: "CNULL".into(),
                 has_unreads: true,
                 mention_count: 0,
                 last_read: None,
                 latest: None,
             }],
-            ims: vec![entry("D_ONE", true, 1)],
-            mpims: vec![entry("G_ONE", true, 1)],
+            ims: vec![entry("DONE", true, 1)],
+            mpims: vec![entry("GONE", true, 1)],
             threads: RawThreadCounts {
                 has_unreads: true,
                 mention_count: 3,
-                unread_count_by_channel: BTreeMap::from([
-                    ("C_NULL".into(), 2),
-                    ("D_ONE".into(), 1),
-                ]),
+                unread_count_by_channel: BTreeMap::from([("CNULL".into(), 2), ("DONE".into(), 1)]),
             },
         };
         let report = service(api).unreads().await.unwrap();
@@ -609,7 +659,7 @@ mod tests {
                 "team_id": "T000TEST",
                 "conversations": [
                     {
-                        "id": "D_ONE",
+                        "id": "DONE",
                         "kind": "direct_message",
                         "has_unreads": true,
                         "mention_count": 1,
@@ -617,7 +667,7 @@ mod tests {
                         "latest": "200.0"
                     },
                     {
-                        "id": "G_ONE",
+                        "id": "GONE",
                         "kind": "group_direct_message",
                         "has_unreads": true,
                         "mention_count": 1,
@@ -625,7 +675,7 @@ mod tests {
                         "latest": "200.0"
                     },
                     {
-                        "id": "C_NULL",
+                        "id": "CNULL",
                         "kind": "channel",
                         "has_unreads": true,
                         "mention_count": 0,
@@ -637,8 +687,8 @@ mod tests {
                     "has_unreads": true,
                     "mention_count": 3,
                     "unread_count_by_channel": {
-                        "C_NULL": 2,
-                        "D_ONE": 1
+                        "CNULL": 2,
+                        "DONE": 1
                     }
                 }
             })
@@ -803,6 +853,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_user_search_reports_the_scan_cap_as_incomplete() {
+        let mut pages = VecDeque::new();
+        for page in 0..MAX_USER_PAGES {
+            pages.push_back(RawUsersPage {
+                members: vec![],
+                response_metadata: RawResponseMetadata {
+                    next_cursor: format!("cursor-{page}"),
+                },
+            });
+        }
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(pages);
+        let report = service(api).find_users("missing", 10).await.unwrap();
+        assert!(report.users.is_empty());
+        assert!(report.truncated);
+        assert_eq!(
+            report.truncation_reason,
+            Some(UserSearchTruncationReason::ScanLimit)
+        );
+        assert_eq!(report.scan_limit, 4_000);
+    }
+
+    #[tokio::test]
+    async fn rejects_user_pages_larger_than_the_requested_bound() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: (0..=USERS_PAGE_SIZE)
+                .map(|index| raw_user(&format!("U{index}"), "user", "User"))
+                .collect(),
+            ..RawUsersPage::default()
+        }]));
+        assert!(matches!(
+            service(api).find_users("user", 10).await,
+            Err(Error::InvalidResponse {
+                method: "users.list"
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn validates_all_external_inputs() {
         let service = service(fake_api());
         assert!(matches!(
@@ -831,6 +921,28 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_empty_essential_response_identifiers() {
+        let mut counts_api = fake_api();
+        counts_api.counts.channels = vec![entry("", true, 1)];
+        assert!(matches!(
+            service(counts_api).unreads().await,
+            Err(Error::InvalidResponse {
+                method: "client.counts"
+            })
+        ));
+
+        let mut thread_counts_api = fake_api();
+        thread_counts_api
+            .counts
+            .threads
+            .unread_count_by_channel
+            .insert(String::new(), 1);
+        assert!(matches!(
+            service(thread_counts_api).unreads().await,
+            Err(Error::InvalidResponse {
+                method: "client.counts"
+            })
+        ));
+
         let mut message_api = fake_api();
         message_api.history.messages = vec![raw_message("", "bad")];
         assert!(matches!(

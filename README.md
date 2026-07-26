@@ -110,6 +110,11 @@ not guess from timestamp comparisons. Message results include normalized author,
 thread, reaction, and file-reference fields. Private download URLs are returned
 as references but files are not downloaded.
 
+User search requests at most 20 pages of 200 users (4,000 scanned profiles) and
+returns at most 100 matches. JSON includes `truncated`, `truncation_reason`,
+`scanned_users`, and `scan_limit`; a `scan_limit` result means matches may exist
+beyond the scanned pages even when the returned user list is empty.
+
 ## MCP
 
 Run the server over stdio:

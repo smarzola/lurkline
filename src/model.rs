@@ -5,20 +5,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ClientCountsPayload {
-    #[serde(default)]
     pub channels: Vec<RawUnread>,
-    #[serde(default)]
     pub ims: Vec<RawUnread>,
-    #[serde(default)]
     pub mpims: Vec<RawUnread>,
-    #[serde(default)]
     pub threads: RawThreadCounts,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RawUnread {
     pub id: String,
-    #[serde(default)]
     pub has_unreads: bool,
     #[serde(default)]
     pub mention_count: u64,
@@ -30,7 +25,6 @@ pub(crate) struct RawUnread {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawThreadCounts {
-    #[serde(default)]
     pub has_unreads: bool,
     #[serde(default)]
     pub mention_count: u64,
@@ -250,4 +244,14 @@ pub struct UserSearchReport {
     pub query: String,
     pub users: Vec<User>,
     pub truncated: bool,
+    pub truncation_reason: Option<UserSearchTruncationReason>,
+    pub scanned_users: usize,
+    pub scan_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UserSearchTruncationReason {
+    ResultLimit,
+    ScanLimit,
 }

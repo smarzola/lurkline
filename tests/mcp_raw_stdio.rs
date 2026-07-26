@@ -121,6 +121,15 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     .await;
     let invalid = response_with_id(&mut stdout, 3).await;
     assert_eq!(invalid["result"]["isError"], true);
+    assert_eq!(
+        invalid["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "invalid_input",
+                "message": "invalid channel_id: must be a Slack channel, DM, or group-DM ID"
+            }
+        })
+    );
     assert!(
         invalid["result"]["content"][0]["text"]
             .as_str()

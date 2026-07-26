@@ -223,7 +223,7 @@ tools/list, and one validation-error tool call rather than left running.
 - [x] 2026-07-26: Milestone 1 implemented, reviewed, and verified (13 tests).
 - [x] 2026-07-26: Milestone 2 implemented, reviewed, and verified (26 tests).
 - [x] 2026-07-26: Milestone 3 implemented, reviewed, and verified (29 tests).
-- [ ] Independent final audit passed.
+- [x] 2026-07-26: Independent final audit passed after two repair rounds.
 - [ ] Final path, local main, GitHub repository, push, and read-back verified.
 
 ## Decision Log
@@ -267,3 +267,17 @@ independent audit here before marking the goal complete.
 - 2026-07-26 Milestone 3 review: `CLEAN`; six read-only MCP tools, in-process
   and process-level protocol coverage, stdout/stderr separation, operator docs,
   packaging metadata, dependency lock, license, and credential hygiene accepted.
+- 2026-07-26 independent final audit round 1: high false-complete user search;
+  medium malformed unread acceptance and unstructured MCP errors; medium
+  chunked-limit coverage gap; low EOF whitespace.
+- 2026-07-26 final-audit repairs: exposed typed user-search truncation and scan
+  bounds; rejected oversized user pages and malformed unread containers/IDs;
+  added structured MCP error envelopes and union output schemas; exercised
+  unknown-length chunk overflow; removed whitespace defects.
+- 2026-07-26 independent final audit round 2: medium unvalidated thread-count
+  map keys and low impossible `--limit` guidance at the supported maximum.
+- 2026-07-26 final repair: validated every thread-count conversation ID and made
+  limit guidance maximum-aware, with regressions.
+- 2026-07-26 independent final audit re-check: `CLEAN` with 32 unit and 2
+  integration tests, locked Clippy, release build, formatting, and full diff
+  checks passing.

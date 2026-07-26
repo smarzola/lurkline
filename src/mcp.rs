@@ -1,12 +1,13 @@
 use std::fmt;
 
 use rmcp::{
-    Json, ServerHandler, ServiceExt,
+    ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::CallToolResult,
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     error::Error,
@@ -63,6 +64,67 @@ const fn default_user_limit() -> usize {
     20
 }
 
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+enum ToolOutput<T> {
+    Data(T),
+    Error { error: ToolError },
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct ToolError {
+    code: String,
+    message: String,
+}
+
+fn tool_result<T: Serialize>(result: crate::error::Result<T>) -> CallToolResult {
+    match result {
+        Ok(value) => match serde_json::to_value(ToolOutput::Data(value)) {
+            Ok(value) => CallToolResult::structured(value),
+            Err(_) => serialization_error_result(),
+        },
+        Err(error) => {
+            let output = ToolOutput::<T>::Error {
+                error: ToolError {
+                    code: error_code(&error).into(),
+                    message: error.to_string(),
+                },
+            };
+            match serde_json::to_value(output) {
+                Ok(value) => CallToolResult::structured_error(value),
+                Err(_) => serialization_error_result(),
+            }
+        }
+    }
+}
+
+fn serialization_error_result() -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "error": {
+            "code": "output_serialization",
+            "message": "could not serialize tool output"
+        }
+    }))
+}
+
+fn error_code(error: &Error) -> &'static str {
+    match error {
+        Error::MissingConfig(_) => "missing_config",
+        Error::InvalidConfig { .. } => "invalid_config",
+        Error::InvalidInput { .. } => "invalid_input",
+        Error::Authentication => "authentication",
+        Error::SlackApi { .. } => "slack_api",
+        Error::HttpStatus { .. } => "http_status",
+        Error::ResponseTooLarge { .. } => "response_too_large",
+        Error::InvalidResponse { .. } => "invalid_response",
+        Error::Timeout { .. } => "timeout",
+        Error::Transport { .. } => "transport",
+        Error::NotFound { .. } => "not_found",
+        Error::Output => "output_serialization",
+        Error::McpTransport => "mcp_transport",
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct McpServer {
     service: SlackService,
@@ -87,6 +149,7 @@ impl McpServer {
     /// Validate configuration and make a bounded Slack authentication probe.
     #[tool(
         name = "slack_doctor",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<DoctorReport>>(),
         annotations(
             title = "Diagnose Slack browser-session access",
             read_only_hint = true,
@@ -95,17 +158,14 @@ impl McpServer {
             open_world_hint = true
         )
     )]
-    async fn doctor(&self) -> std::result::Result<Json<DoctorReport>, String> {
-        self.service
-            .doctor()
-            .await
-            .map(Json)
-            .map_err(|error| error.to_string())
+    async fn doctor(&self) -> CallToolResult {
+        tool_result(self.service.doctor().await)
     }
 
     /// List channels, DMs, group DMs, and thread counts Slack explicitly marks unread.
     #[tool(
         name = "slack_list_unreads",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<UnreadReport>>(),
         annotations(
             title = "List Slack unreads",
             read_only_hint = true,
@@ -114,17 +174,14 @@ impl McpServer {
             open_world_hint = true
         )
     )]
-    async fn list_unreads(&self) -> std::result::Result<Json<UnreadReport>, String> {
-        self.service
-            .unreads()
-            .await
-            .map(Json)
-            .map_err(|error| error.to_string())
+    async fn list_unreads(&self) -> CallToolResult {
+        tool_result(self.service.unreads().await)
     }
 
     /// Read bounded recent history from one Slack channel, DM, or group DM.
     #[tool(
         name = "slack_read_channel",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<MessagePage>>(),
         annotations(
             title = "Read Slack channel history",
             read_only_hint = true,
@@ -136,17 +193,18 @@ impl McpServer {
     async fn read_channel(
         &self,
         Parameters(request): Parameters<ReadChannelRequest>,
-    ) -> std::result::Result<Json<MessagePage>, String> {
-        self.service
-            .read_channel(&request.channel_id, request.limit)
-            .await
-            .map(Json)
-            .map_err(|error| error.to_string())
+    ) -> CallToolResult {
+        tool_result(
+            self.service
+                .read_channel(&request.channel_id, request.limit)
+                .await,
+        )
     }
 
     /// Read a bounded Slack thread by its channel ID and root timestamp.
     #[tool(
         name = "slack_read_thread",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ThreadPage>>(),
         annotations(
             title = "Read Slack thread",
             read_only_hint = true,
@@ -158,17 +216,18 @@ impl McpServer {
     async fn read_thread(
         &self,
         Parameters(request): Parameters<ReadThreadRequest>,
-    ) -> std::result::Result<Json<ThreadPage>, String> {
-        self.service
-            .read_thread(&request.channel_id, &request.thread_ts, request.limit)
-            .await
-            .map(Json)
-            .map_err(|error| error.to_string())
+    ) -> CallToolResult {
+        tool_result(
+            self.service
+                .read_thread(&request.channel_id, &request.thread_ts, request.limit)
+                .await,
+        )
     }
 
     /// Fetch one exact Slack message by channel ID and message timestamp.
     #[tool(
         name = "slack_get_message",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<Message>>(),
         annotations(
             title = "Get exact Slack message",
             read_only_hint = true,
@@ -180,17 +239,18 @@ impl McpServer {
     async fn get_message(
         &self,
         Parameters(request): Parameters<GetMessageRequest>,
-    ) -> std::result::Result<Json<Message>, String> {
-        self.service
-            .get_message(&request.channel_id, &request.message_ts)
-            .await
-            .map(Json)
-            .map_err(|error| error.to_string())
+    ) -> CallToolResult {
+        tool_result(
+            self.service
+                .get_message(&request.channel_id, &request.message_ts)
+                .await,
+        )
     }
 
     /// Find bounded Slack user profiles across paginated workspace membership.
     #[tool(
         name = "slack_find_users",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<UserSearchReport>>(),
         annotations(
             title = "Find Slack users",
             read_only_hint = true,
@@ -202,12 +262,8 @@ impl McpServer {
     async fn find_users(
         &self,
         Parameters(request): Parameters<FindUsersRequest>,
-    ) -> std::result::Result<Json<UserSearchReport>, String> {
-        self.service
-            .find_users(&request.query, request.limit)
-            .await
-            .map(Json)
-            .map_err(|error| error.to_string())
+    ) -> CallToolResult {
+        tool_result(self.service.find_users(&request.query, request.limit).await)
     }
 }
 
@@ -365,6 +421,15 @@ mod tests {
             .await
             .expect("validation is a tool result");
         assert_eq!(invalid.is_error, Some(true));
+        assert_eq!(
+            invalid.structured_content,
+            Some(json!({
+                "error": {
+                    "code": "invalid_input",
+                    "message": "invalid channel_id: must be a Slack channel, DM, or group-DM ID"
+                }
+            }))
+        );
         let invalid_text = invalid
             .content
             .first()
