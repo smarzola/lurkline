@@ -43,10 +43,10 @@ pub enum Command {
     },
     /// Read a bounded snapshot of conversations Slack explicitly marks unread.
     Inbox {
-        /// Maximum unread conversations to load.
+        /// Maximum unread conversations to load, from 1 through 50.
         #[arg(long = "conversations", default_value_t = 10)]
         conversation_limit: usize,
-        /// Maximum recent messages to load per unread conversation.
+        /// Maximum recent messages to load per unread conversation, from 1 through 200.
         #[arg(long = "messages", default_value_t = 20)]
         message_limit: usize,
         /// Emit stable JSON.
@@ -93,7 +93,7 @@ pub enum ChannelCommand {
     Read {
         /// Slack conversation ID or unambiguous exact name.
         channel_id: String,
-        /// Maximum messages to return.
+        /// Maximum messages to return, from 1 through 200.
         #[arg(long, default_value_t = 50)]
         limit: usize,
         /// Opaque Slack cursor from a previous channel response.
@@ -113,7 +113,7 @@ pub enum ThreadCommand {
         channel_id: String,
         /// Slack timestamp of the thread root.
         thread_ts: String,
-        /// Maximum messages to return.
+        /// Maximum messages to return, from 1 through 200.
         #[arg(long, default_value_t = 100)]
         limit: usize,
         /// Opaque Slack cursor from a previous thread response.
@@ -127,7 +127,7 @@ pub enum ThreadCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum MessageCommand {
-    /// Fetch one message by channel ID and timestamp.
+    /// Fetch one message by conversation ID or exact name and timestamp.
     Get {
         /// Slack conversation ID or unambiguous exact name.
         channel_id: String,
@@ -146,7 +146,7 @@ pub enum ConversationsCommand {
         /// Opaque Slack cursor from a previous list response.
         #[arg(long)]
         cursor: Option<String>,
-        /// Maximum conversations to return.
+        /// Maximum conversations to return, from 1 through 200.
         #[arg(long, default_value_t = 100)]
         limit: usize,
         /// Emit stable JSON.
@@ -157,7 +157,7 @@ pub enum ConversationsCommand {
     Find {
         /// Case-insensitive substring to find.
         query: String,
-        /// Maximum conversations to return.
+        /// Maximum conversations to return, from 1 through 100.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Emit stable JSON.
@@ -184,7 +184,7 @@ pub enum SearchCommand {
         /// Opaque Slack cursor from a previous search response.
         #[arg(long)]
         cursor: Option<String>,
-        /// Maximum matching messages to return.
+        /// Maximum matching messages to return, from 1 through 100.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Emit stable JSON.
@@ -199,7 +199,7 @@ pub enum UsersCommand {
     Find {
         /// Case-insensitive substring to find.
         query: String,
-        /// Maximum users to return.
+        /// Maximum users to return, from 1 through 100.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Emit stable JSON.

@@ -109,6 +109,25 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_search_messages",
         ])
     );
+    for tool_name in [
+        "slack_read_channel",
+        "slack_read_thread",
+        "slack_get_message",
+    ] {
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == tool_name)
+            .unwrap();
+        assert!(
+            tool["inputSchema"]["properties"]["channel_id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("unambiguous exact name"),
+            "{tool_name} schema describes channel_id as ID-only"
+        );
+    }
 
     send(
         &mut stdin,
