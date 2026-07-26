@@ -40,6 +40,15 @@ cargo install --locked --path .
 lurkline --help
 ```
 
+Versioned GitHub Releases also provide native archives for Linux x86_64, Linux
+ARM64, and Apple silicon macOS. Each archive has a matching `.sha256` file:
+
+```sh
+shasum -a 256 -c lurkline-v0.1.0-macos-aarch64.tar.gz.sha256
+tar -xzf lurkline-v0.1.0-macos-aarch64.tar.gz
+install lurkline-v0.1.0-macos-aarch64/lurkline /usr/local/bin/lurkline
+```
+
 For development:
 
 ```sh

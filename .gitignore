@@ -3,4 +3,5 @@
 /.env.*
 *.har
 *.har.gz
-
+__pycache__/
+*.py[cod]

@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Match tag to package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag must be a semantic version such as v0.1.0"
+            exit 1
+          fi
+
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(sed -nE 's/^version = "([^"]+)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$version" != "$package_version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $package_version"
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Release tag must point to a commit on origin/main"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: macos-aarch64
+            runner: macos-26
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target "${{ matrix.target }}"
+
+      - name: Select Rust toolchain
+        run: rustup default stable
+
+      - name: Cache Cargo data
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package release artifact
+        run: |
+          python3 scripts/package-release.py \
+            --binary "target/${{ matrix.target }}/release/lurkline" \
+            --version "${{ needs.validate.outputs.version }}" \
+            --platform "${{ matrix.platform }}" \
+            --output-dir dist
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lurkline-${{ github.ref_name }}-${{ matrix.platform }}
+          path: |
+            dist/lurkline-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+            dist/lurkline-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: lurkline-${{ github.ref_name }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release artifact set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            "lurkline-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+            "lurkline-${GITHUB_REF_NAME}-linux-aarch64.tar.gz"
+            "lurkline-${GITHUB_REF_NAME}-macos-aarch64.tar.gz"
+          )
+
+          for archive in "${expected[@]}"; do
+            test -f "dist/$archive"
+            test -f "dist/$archive.sha256"
+            (
+              cd dist
+              shasum -a 256 -c "$archive.sha256"
+            )
+          done
+
+          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" = "6"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "lurkline $GITHUB_REF_NAME"
