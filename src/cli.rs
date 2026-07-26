@@ -5,7 +5,10 @@ use crate::{
     config::Config,
     error::{Error, Result},
     http::SlackHttpClient,
-    model::{ConversationKind, DoctorReport, UnreadReport},
+    model::{
+        ConversationKind, DoctorReport, Message, MessagePage, ThreadPage, UnreadReport,
+        UserSearchReport,
+    },
     service::SlackService,
 };
 
@@ -34,6 +37,87 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Read messages from a channel, DM, or group DM.
+    Channel {
+        #[command(subcommand)]
+        command: ChannelCommand,
+    },
+    /// Read a message thread.
+    Thread {
+        #[command(subcommand)]
+        command: ThreadCommand,
+    },
+    /// Fetch an exact message.
+    Message {
+        #[command(subcommand)]
+        command: MessageCommand,
+    },
+    /// Find workspace users.
+    Users {
+        #[command(subcommand)]
+        command: UsersCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChannelCommand {
+    /// Read recent channel history.
+    Read {
+        /// Slack channel, DM, or group-DM ID.
+        channel_id: String,
+        /// Maximum messages to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ThreadCommand {
+    /// Read a thread root and its replies.
+    Read {
+        /// Slack channel, DM, or group-DM ID.
+        channel_id: String,
+        /// Slack timestamp of the thread root.
+        thread_ts: String,
+        /// Maximum messages to return.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MessageCommand {
+    /// Fetch one message by channel ID and timestamp.
+    Get {
+        /// Slack channel, DM, or group-DM ID.
+        channel_id: String,
+        /// Exact Slack message timestamp.
+        message_ts: String,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UsersCommand {
+    /// Find users by ID, handle, name, display name, or title.
+    Find {
+        /// Case-insensitive substring to find.
+        query: String,
+        /// Maximum users to return.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run_cli(cli: Cli) -> Result<()> {
@@ -43,6 +127,37 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Doctor { json } => print_doctor(service.doctor().await?, json),
         Command::Unreads { json } => print_unreads(service.unreads().await?, json),
+        Command::Channel {
+            command:
+                ChannelCommand::Read {
+                    channel_id,
+                    limit,
+                    json,
+                },
+        } => print_message_page(service.read_channel(&channel_id, limit).await?, json),
+        Command::Thread {
+            command:
+                ThreadCommand::Read {
+                    channel_id,
+                    thread_ts,
+                    limit,
+                    json,
+                },
+        } => print_thread_page(
+            service.read_thread(&channel_id, &thread_ts, limit).await?,
+            json,
+        ),
+        Command::Message {
+            command:
+                MessageCommand::Get {
+                    channel_id,
+                    message_ts,
+                    json,
+                },
+        } => print_message(service.get_message(&channel_id, &message_ts).await?, json),
+        Command::Users {
+            command: UsersCommand::Find { query, limit, json },
+        } => print_users(service.find_users(&query, limit).await?, json),
     }
 }
 
@@ -97,6 +212,82 @@ fn print_unreads(report: UnreadReport, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_message_page(page: MessagePage, json: bool) -> Result<()> {
+    if json {
+        return print_json(&page);
+    }
+    print_messages(&page.messages);
+    if page.has_more {
+        println!(
+            "more\t{}",
+            page.next_cursor.as_deref().unwrap_or("available")
+        );
+    }
+    Ok(())
+}
+
+fn print_thread_page(page: ThreadPage, json: bool) -> Result<()> {
+    if json {
+        return print_json(&page);
+    }
+    println!("thread\t{}\t{}", page.channel_id, page.thread_ts);
+    print_messages(&page.messages);
+    if page.has_more {
+        println!(
+            "more\t{}",
+            page.next_cursor.as_deref().unwrap_or("available")
+        );
+    }
+    Ok(())
+}
+
+fn print_message(message: Message, json: bool) -> Result<()> {
+    if json {
+        return print_json(&message);
+    }
+    print_messages(&[message]);
+    Ok(())
+}
+
+fn print_messages(messages: &[Message]) {
+    if messages.is_empty() {
+        println!("No messages.");
+        return;
+    }
+    for message in messages {
+        let author = message
+            .author_id
+            .as_deref()
+            .or(message.author_name.as_deref())
+            .unwrap_or("-");
+        let text = message.text.replace('\n', "\\n").replace('\t', "\\t");
+        println!(
+            "{}\t{}\t{}\treplies={}",
+            message.ts, author, text, message.reply_count
+        );
+    }
+}
+
+fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    if report.users.is_empty() {
+        println!("No users matched.");
+        return Ok(());
+    }
+    for user in report.users {
+        println!(
+            "{}\t@{}\t{}\t{}",
+            user.id, user.name, user.display_name, user.real_name
+        );
+    }
+    if report.truncated {
+        println!("More matching users may exist; narrow the query or raise --limit.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -116,6 +307,46 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Unreads { json: false }
+        ));
+    }
+
+    #[test]
+    fn parses_all_read_commands_and_bounds_flags() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline", "channel", "read", "C123", "--limit", "12", "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Channel {
+                command: ChannelCommand::Read {
+                    limit: 12,
+                    json: true,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lurkline", "thread", "read", "C123", "100.000001"])
+                .unwrap()
+                .command,
+            Command::Thread {
+                command: ThreadCommand::Read { limit: 100, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lurkline", "message", "get", "C123", "100.000001"])
+                .unwrap()
+                .command,
+            Command::Message { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lurkline", "users", "find", "alice", "--limit", "3"])
+                .unwrap()
+                .command,
+            Command::Users {
+                command: UsersCommand::Find { limit: 3, .. }
+            }
         ));
     }
 }

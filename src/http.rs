@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::{
     config::Config,
     error::{Error, Result},
-    model::ClientCountsPayload,
+    model::{ClientCountsPayload, RawMessagePage, RawMessagesList, RawUsersPage},
     service::SlackApi,
 };
 
@@ -144,6 +144,79 @@ impl SlackApi for SlackHttpClient {
         )
         .await
     }
+
+    async fn conversation_history(&self, channel: &str, limit: usize) -> Result<RawMessagePage> {
+        self.post_form(
+            "conversations.history",
+            "message-pane/requestHistory",
+            &[
+                ("channel", channel.into()),
+                ("limit", limit.to_string()),
+                ("ignore_replies", "true".into()),
+                ("include_pin_count", "true".into()),
+                ("inclusive", "true".into()),
+                ("no_user_profile", "true".into()),
+                ("include_stories", "true".into()),
+                ("include_free_team_extra_messages", "true".into()),
+                ("include_date_joined", "true".into()),
+                ("include_tombstones", "true".into()),
+                ("cached_latest_updates", "{}".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn conversation_replies(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        limit: usize,
+    ) -> Result<RawMessagePage> {
+        self.post_form(
+            "conversations.replies",
+            "message-pane/requestReplies",
+            &[
+                ("channel", channel.into()),
+                ("ts", thread_ts.into()),
+                ("limit", limit.to_string()),
+                ("inclusive", "true".into()),
+                ("include_stories", "true".into()),
+                ("include_date_joined", "true".into()),
+                ("include_tombstones", "true".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn messages_list(&self, channel: &str, message_ts: &str) -> Result<RawMessagesList> {
+        let message_ids = serde_json::json!([{
+            "channel": channel,
+            "timestamps": [message_ts],
+        }])
+        .to_string();
+        self.post_form(
+            "messages.list",
+            "messages-ufm",
+            &[
+                ("message_ids", message_ids),
+                ("org_wide_aware", "true".into()),
+                ("cached_latest_updates", "{}".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn users_list(&self, cursor: Option<&str>, limit: usize) -> Result<RawUsersPage> {
+        let mut fields = vec![
+            ("limit", limit.to_string()),
+            ("include_locale", "true".into()),
+            ("include_profile_only_users", "true".into()),
+        ];
+        if let Some(cursor) = cursor {
+            fields.push(("cursor", cursor.into()));
+        }
+        self.post_form("users.list", "users-list", &fields).await
+    }
 }
 
 fn browser_headers(config: &Config) -> Result<HeaderMap> {
@@ -216,8 +289,8 @@ mod tests {
     use axum::{
         Router,
         body::Bytes,
-        extract::State,
-        http::{HeaderMap, StatusCode},
+        extract::{OriginalUri, State},
+        http::{HeaderMap, StatusCode, Uri},
         response::IntoResponse,
         routing::post,
     };
@@ -226,8 +299,7 @@ mod tests {
 
     use super::*;
 
-    type CapturedRequest = Arc<Mutex<Option<(HeaderMap, Vec<u8>)>>>;
-
+    type CapturedRequest = Arc<Mutex<Option<(Uri, HeaderMap, Vec<u8>)>>>;
     #[derive(Clone)]
     struct Capture {
         request: CapturedRequest,
@@ -237,10 +309,11 @@ mod tests {
 
     async fn handler(
         State(capture): State<Capture>,
+        OriginalUri(uri): OriginalUri,
         headers: HeaderMap,
         body: Bytes,
     ) -> impl IntoResponse {
-        *capture.request.lock().unwrap() = Some((headers, body.to_vec()));
+        *capture.request.lock().unwrap() = Some((uri, headers, body.to_vec()));
         (
             capture.response_status,
             capture.response_body.as_ref().clone(),
@@ -254,7 +327,7 @@ mod tests {
             response_body: Arc::new(body),
         };
         let app = Router::new()
-            .route("/api/client.counts", post(handler))
+            .route("/api/{method}", post(handler))
             .with_state(capture.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -275,8 +348,9 @@ mod tests {
         .await;
         client.client_counts().await.unwrap();
         let guard = capture.request.lock().unwrap();
-        let (headers, body) = guard.as_ref().unwrap();
+        let (uri, headers, body) = guard.as_ref().unwrap();
         let body = String::from_utf8_lossy(body);
+        assert_eq!(uri.path(), "/api/client.counts");
         assert_eq!(headers.get(COOKIE).unwrap(), "d=xoxd-test-secret; b=test");
         assert!(
             headers
@@ -307,6 +381,85 @@ mod tests {
                 "missing multipart field {expected}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sends_bounded_read_method_shapes() {
+        let cases = [
+            (
+                "history",
+                br#"{"ok":true,"messages":[]}"#.as_slice(),
+                "/api/conversations.history",
+                vec!["C123", "limit", "42", "ignore_replies"],
+            ),
+            (
+                "replies",
+                br#"{"ok":true,"messages":[]}"#.as_slice(),
+                "/api/conversations.replies",
+                vec!["C123", "100.000001", "limit", "20"],
+            ),
+            (
+                "message",
+                br#"{"ok":true,"messages":{},"messages_data":{}}"#.as_slice(),
+                "/api/messages.list",
+                vec!["message_ids", "C123", "100.000001", "messages-ufm"],
+            ),
+            (
+                "users",
+                br#"{"ok":true,"members":[]}"#.as_slice(),
+                "/api/users.list",
+                vec!["cursor", "next-page", "limit", "200"],
+            ),
+        ];
+
+        for (case, response, expected_path, expected_fields) in cases {
+            let (client, capture) = server(StatusCode::OK, response.to_vec(), 64 * 1024).await;
+            match case {
+                "history" => {
+                    client.conversation_history("C123", 42).await.unwrap();
+                }
+                "replies" => {
+                    client
+                        .conversation_replies("C123", "100.000001", 20)
+                        .await
+                        .unwrap();
+                }
+                "message" => {
+                    client.messages_list("C123", "100.000001").await.unwrap();
+                }
+                "users" => {
+                    client.users_list(Some("next-page"), 200).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let guard = capture.request.lock().unwrap();
+            let (uri, _, body) = guard.as_ref().unwrap();
+            let body = String::from_utf8_lossy(body);
+            assert_eq!(uri.path(), expected_path);
+            for expected in expected_fields {
+                assert!(
+                    body.contains(expected),
+                    "{case}: missing multipart value {expected}"
+                );
+            }
+            if case == "message" {
+                let message_ids = multipart_text_field(&body, "message_ids").unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(message_ids).unwrap(),
+                    serde_json::json!([{
+                        "channel": "C123",
+                        "timestamps": ["100.000001"]
+                    }])
+                );
+            }
+        }
+    }
+
+    fn multipart_text_field<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+        let marker = format!("name=\"{name}\"");
+        let after_name = body.split_once(&marker)?.1;
+        let value = after_name.split_once("\r\n\r\n")?.1;
+        value.split_once("\r\n--").map(|(value, _)| value)
     }
 
     #[tokio::test]
@@ -353,6 +506,47 @@ mod tests {
         let (client, _) = server(StatusCode::OK, body, 1024).await;
         let error = client.client_counts().await.unwrap_err();
         assert!(matches!(error, Error::ResponseTooLarge { limit: 1024, .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_success_payloads() {
+        let cases = [
+            (
+                "history",
+                br#"{"ok":true,"messages":[{"text":"missing ts"}]}"#.as_slice(),
+            ),
+            ("history", br#"{"ok":true,"has_more":false}"#.as_slice()),
+            (
+                "users",
+                br#"{"ok":true,"members":[{"name":"missing-id"}]}"#.as_slice(),
+            ),
+        ];
+        for (case, body) in cases {
+            let (client, _) = server(StatusCode::OK, body.to_vec(), 64 * 1024).await;
+            let result = match case {
+                "history" => client.conversation_history("C123", 20).await.map(|_| ()),
+                "users" => client.users_list(None, 200).await.map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(matches!(result, Err(Error::InvalidResponse { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_safe_slack_api_error_codes() {
+        let (client, _) = server(
+            StatusCode::OK,
+            br#"{"ok":false,"error":"channel_not_found"}"#.to_vec(),
+            64 * 1024,
+        )
+        .await;
+        assert!(matches!(
+            client.conversation_history("C123", 20).await,
+            Err(Error::SlackApi {
+                method: "conversations.history",
+                ref code
+            }) if code == "channel_not_found"
+        ));
     }
 
     #[test]

@@ -8,6 +8,11 @@ pub enum Error {
     MissingConfig(&'static str),
     #[error("invalid {name}: {reason}")]
     InvalidConfig { name: &'static str, reason: String },
+    #[error("invalid {field}: {reason}")]
+    InvalidInput {
+        field: &'static str,
+        reason: &'static str,
+    },
     #[error("Slack browser session is expired or invalid; copy fresh browser credentials")]
     Authentication,
     #[error("Slack method {method} failed: {code}")]
@@ -22,6 +27,8 @@ pub enum Error {
     Timeout { method: &'static str },
     #[error("Slack method {method} could not be reached")]
     Transport { method: &'static str },
+    #[error("{resource} was not found")]
+    NotFound { resource: &'static str },
     #[error("could not serialize output")]
     Output,
 }
@@ -32,5 +39,9 @@ impl Error {
             name,
             reason: reason.into(),
         }
+    }
+
+    pub(crate) fn invalid_input(field: &'static str, reason: &'static str) -> Self {
+        Self::InvalidInput { field, reason }
     }
 }

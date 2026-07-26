@@ -221,7 +221,7 @@ tools/list, and one validation-error tool call rather than left running.
 - [x] 2026-07-26: selected globally unused name `lurkline`.
 - [x] 2026-07-26: created staging repository and typed goal branch from baseline.
 - [x] 2026-07-26: Milestone 1 implemented, reviewed, and verified (13 tests).
-- [ ] Milestone 2 implemented, reviewed, verified, and committed.
+- [x] 2026-07-26: Milestone 2 implemented, reviewed, and verified (26 tests).
 - [ ] Milestone 3 implemented, reviewed, verified, and committed.
 - [ ] Independent final audit passed.
 - [ ] Final path, local main, GitHub repository, push, and read-back verified.
@@ -253,3 +253,14 @@ independent audit here before marking the goal complete.
   arbitrary non-JSON treated as authentication failure; thread counts typed as
   `BTreeMap<String, u64>` with an exact serialized-schema regression.
 - 2026-07-26 Milestone 1 re-check: `CLEAN`.
+- 2026-07-26 Milestone 2 review: blocking captured `messages.list`
+  `message_ids` mismatch; high false-complete local truncation; medium malformed
+  payload acceptance and missing error fixtures.
+- 2026-07-26 Milestone 2 repair: structurally asserted the captured
+  `{channel,timestamps}` request shape; covered both response containers; reported
+  local truncation; required essential response fields; rejected empty
+  identifiers; and added malformed/API-error fixtures.
+- 2026-07-26 Milestone 2 re-check: found and repaired a high compatibility
+  regression caused by assuming every Slack user ID starts with `U`; added `W`
+  enterprise-user coverage.
+- 2026-07-26 Milestone 2 final re-check: `CLEAN`.
