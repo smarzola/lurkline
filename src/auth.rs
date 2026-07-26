@@ -16,11 +16,14 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     config::{
-        Config, CredentialBundle, Secret, credential_bundle_from_getter, validate_base_url,
-        validate_identifier,
+        Config, CredentialBundle, Secret, credential_bundle_from_fallible_getter,
+        validate_base_url, validate_identifier,
     },
     error::{Error, Result},
 };
+
+#[cfg(test)]
+use crate::config::credential_bundle_from_getter;
 
 const KEYRING_SERVICE: &str = "me.smarzola.lurkline.slack-session";
 const REGISTRY_VERSION: u8 = 1;
@@ -233,6 +236,14 @@ impl ProfileRegistry {
     }
 
     pub(crate) fn save(&self, registry: &ProfileRegistryState) -> Result<()> {
+        self.save_with_directory_sync(registry, sync_directory)
+    }
+
+    fn save_with_directory_sync(
+        &self,
+        registry: &ProfileRegistryState,
+        sync: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         registry.validate()?;
         let encoded =
             serde_json::to_vec_pretty(registry).map_err(|_| Error::ProfileRegistryWrite)?;
@@ -265,7 +276,10 @@ impl ProfileRegistry {
                 .map_err(|_| Error::ProfileRegistryWrite)?;
             file.sync_all().map_err(|_| Error::ProfileRegistryWrite)?;
             fs::rename(&path, &self.path).map_err(|_| Error::ProfileRegistryWrite)?;
-            sync_directory(directory)?;
+            // Rename is the commit point. A directory-sync failure cannot safely
+            // be reported as an uncommitted write because callers would roll back
+            // the keyring after the new registry became visible.
+            let _ = sync(directory);
             Ok(())
         })();
         if result.is_err() {
@@ -578,9 +592,10 @@ fn list_profiles_with(registry: &impl RegistryStore) -> Result<AuthListReport> {
 pub(crate) fn profile_status(explicit_profile: Option<&str>) -> Result<AuthStatusReport> {
     let registry = ProfileRegistry::discover()?;
     let _lock = registry.lock_shared()?;
+    let environment_profile = environment_profile_for_selection(explicit_profile)?;
     profile_status_with(
         explicit_profile,
-        env::var("LURKLINE_PROFILE").ok().as_deref(),
+        environment_profile.as_deref(),
         &registry,
         &NativeCredentialStore,
     )
@@ -676,7 +691,11 @@ fn store_profile_with(
         });
     }
 
-    let previous = store.get(profile)?;
+    let previous = if current.is_some() {
+        store.get(profile)?
+    } else {
+        None
+    };
     store.set(profile, &encoded)?;
     state.register(profile, metadata.clone());
     if let Err(error) = registry.save_state(&state) {
@@ -703,9 +722,10 @@ fn store_profile_with(
 
 pub(crate) fn remove_profile(explicit_profile: Option<&str>) -> Result<AuthRemoveReport> {
     let registry = ProfileRegistry::discover()?;
+    let environment_profile = environment_profile_for_selection(explicit_profile)?;
     remove_profile_locked(
         explicit_profile,
-        env::var("LURKLINE_PROFILE").ok().as_deref(),
+        environment_profile.as_deref(),
         &registry,
         &NativeCredentialStore,
     )
@@ -745,16 +765,71 @@ fn remove_profile_with(
 }
 
 pub(crate) fn resolve_config(explicit_profile: Option<&str>) -> Result<Config> {
-    let mut get = environment_value;
-    if let Some(bundle) = credential_bundle_from_getter(&mut get)? {
-        return Config::from_bundle_getter(bundle, get);
+    let mut credential_get = strict_environment_value;
+    if let Some(bundle) = credential_bundle_from_fallible_getter(&mut credential_get)? {
+        return Config::from_bundle_getter(bundle, environment_value);
     }
+    let environment_profile = environment_profile_for_selection(explicit_profile)?;
     let registry = ProfileRegistry::discover()?;
-    resolve_stored_config(explicit_profile, get, &registry, &NativeCredentialStore)
+    resolve_stored_config(
+        explicit_profile,
+        move |name| {
+            if name == "LURKLINE_PROFILE" {
+                environment_profile.clone()
+            } else {
+                environment_value(name)
+            }
+        },
+        &registry,
+        &NativeCredentialStore,
+    )
 }
 
 fn environment_value(name: &str) -> Option<String> {
     env::var(name).ok()
+}
+
+fn strict_environment_value(name: &'static str) -> Result<Option<String>> {
+    environment_value_from_result(name, env::var(name))
+}
+
+fn environment_profile_for_selection(explicit_profile: Option<&str>) -> Result<Option<String>> {
+    environment_profile_from_getter(explicit_profile, || {
+        strict_environment_value("LURKLINE_PROFILE")
+    })
+}
+
+fn environment_profile_from_getter(
+    explicit_profile: Option<&str>,
+    get: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    if explicit_profile.is_some() {
+        Ok(None)
+    } else {
+        get()
+    }
+}
+
+fn environment_value_from_result(
+    name: &'static str,
+    value: std::result::Result<String, env::VarError>,
+) -> Result<Option<String>> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(value)) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+
+                let mut bytes = value.into_vec();
+                bytes.zeroize();
+            }
+            #[cfg(not(unix))]
+            drop(value);
+            Err(Error::invalid_config(name, "must be valid UTF-8"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1126,6 +1201,29 @@ mod tests {
     }
 
     #[test]
+    fn registry_rename_is_the_commit_point_if_directory_sync_fails() {
+        let directory = TestDirectory::new("registry-commit-point");
+        let registry = directory.registry();
+        let profile = ProfileName::parse("work").unwrap();
+        let mut state = ProfileRegistryState::default();
+        state.register(
+            &profile,
+            ProfileMetadata::from_bundle(&bundle("example", "T123", "xoxc-test")),
+        );
+        let sync_calls = AtomicUsize::new(0);
+
+        registry
+            .save_with_directory_sync(&state, |_| {
+                sync_calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::ProfileRegistryWrite)
+            })
+            .unwrap();
+
+        assert_eq!(sync_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.load().unwrap(), state);
+    }
+
+    #[test]
     fn complete_environment_overrides_profiles_without_store_access() {
         let directory = TestDirectory::new("environment");
         let registry = directory.registry();
@@ -1165,6 +1263,48 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Error::MissingConfig("SLACK_BASE_URL")));
         assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_slack_environment_is_rejected_as_present() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut get = |name| {
+            if name == "SLACK_TOKEN" {
+                environment_value_from_result(
+                    "SLACK_TOKEN",
+                    Err(env::VarError::NotUnicode(OsString::from_vec(vec![0xff]))),
+                )
+            } else {
+                Ok(None)
+            }
+        };
+        let error = credential_bundle_from_fallible_getter(&mut get).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::InvalidConfig {
+                name: "SLACK_TOKEN",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn explicit_profile_does_not_read_lower_priority_environment_profile() {
+        let reads = AtomicUsize::new(0);
+        let environment_profile = environment_profile_from_getter(Some("work"), || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            Err(Error::invalid_config(
+                "LURKLINE_PROFILE",
+                "must be valid UTF-8",
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(environment_profile, None);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1489,6 +1629,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, Error::CredentialStore));
+        assert!(registry.load_state().unwrap().profiles.is_empty());
+        assert!(store.decoded(&profile).is_none());
+
+        let registry = MemoryRegistry::default();
+        let store = MemoryStore::default();
+        let orphan = bundle("orphan", "TORPHAN", "xoxc-original");
+        store
+            .set(&profile, &encode_bundle(&orphan).unwrap())
+            .unwrap();
+        registry.fail_next_save();
+        let error = store_profile_with(
+            &profile,
+            bundle("example", "T123", "xoxc-test"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::ProfileRegistryWrite));
         assert!(registry.load_state().unwrap().profiles.is_empty());
         assert!(store.decoded(&profile).is_none());
 

@@ -269,8 +269,10 @@ async fn run_auth(command: AuthCommand, profile: Option<&str>) -> Result<()> {
             let profile = profile
                 .ok_or_else(|| Error::invalid_input("profile", "is required for cURL import"))
                 .and_then(ProfileName::parse)?;
-            let input = read_curl_stdin()?;
-            let bundle = parse_copy_as_curl(&input)?;
+            let bundle = {
+                let input = read_curl_stdin()?;
+                parse_copy_as_curl(&input)?
+            };
             let config = Config::from_bundle_getter(bundle, |name| env::var(name).ok())?;
             let client = SlackHttpClient::new(config)?;
             let bundle = client.validate_session().await?.into_bundle();

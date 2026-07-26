@@ -196,13 +196,20 @@ impl Config {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn credential_bundle_from_getter(
     get: &mut impl FnMut(&str) -> Option<String>,
 ) -> Result<Option<CredentialBundle>> {
-    let base_url = get("SLACK_BASE_URL");
-    let team_id = get("SLACK_TEAM_ID");
-    let token = get("SLACK_TOKEN").map(Secret);
-    let cookie = get("SLACK_COOKIE").map(Secret);
+    credential_bundle_from_fallible_getter(&mut |name| Ok(get(name)))
+}
+
+pub(crate) fn credential_bundle_from_fallible_getter(
+    get: &mut impl FnMut(&'static str) -> Result<Option<String>>,
+) -> Result<Option<CredentialBundle>> {
+    let base_url = get("SLACK_BASE_URL")?;
+    let team_id = get("SLACK_TEAM_ID")?;
+    let token = get("SLACK_TOKEN")?.map(Secret);
+    let cookie = get("SLACK_COOKIE")?.map(Secret);
     if base_url.is_none() && team_id.is_none() && token.is_none() && cookie.is_none() {
         return Ok(None);
     }
