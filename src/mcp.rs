@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::Error,
     model::{
-        ConversationPage, ConversationSearchReport, DoctorReport, Message, MessagePage,
-        MessageSearchPage, ThreadPage, UnreadReport, UserSearchReport,
+        ConversationPage, ConversationSearchReport, DoctorReport, InboxReport, Message,
+        MessagePage, MessageSearchPage, ThreadPage, UnreadReport, UserSearchReport,
     },
     service::SlackService,
 };
@@ -22,6 +22,8 @@ use crate::{
 struct ReadChannelRequest {
     /// Slack channel, DM, or group-DM ID.
     channel_id: String,
+    /// Opaque Slack cursor from a previous channel response.
+    cursor: Option<String>,
     /// Maximum messages to return, from 1 through 200.
     #[serde(default = "default_channel_limit")]
     limit: usize,
@@ -33,9 +35,21 @@ struct ReadThreadRequest {
     channel_id: String,
     /// Slack timestamp of the thread root.
     thread_ts: String,
+    /// Opaque Slack cursor from a previous thread response.
+    cursor: Option<String>,
     /// Maximum root and reply messages to return, from 1 through 200.
     #[serde(default = "default_thread_limit")]
     limit: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReadInboxRequest {
+    /// Maximum unread conversations to load, from 1 through 50.
+    #[serde(default = "default_inbox_conversation_limit")]
+    conversation_limit: usize,
+    /// Maximum recent messages to load per conversation, from 1 through 200.
+    #[serde(default = "default_inbox_message_limit")]
+    message_limit: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -92,6 +106,14 @@ struct SearchMessagesRequest {
 
 const fn default_channel_limit() -> usize {
     50
+}
+
+const fn default_inbox_conversation_limit() -> usize {
+    10
+}
+
+const fn default_inbox_message_limit() -> usize {
+    20
 }
 
 const fn default_thread_limit() -> usize {
@@ -229,6 +251,29 @@ impl McpServer {
         tool_result(self.service.unreads().await)
     }
 
+    /// Read a bounded snapshot of conversations Slack explicitly marks unread.
+    #[tool(
+        name = "slack_read_inbox",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<InboxReport>>(),
+        annotations(
+            title = "Read Slack inbox",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn read_inbox(
+        &self,
+        Parameters(request): Parameters<ReadInboxRequest>,
+    ) -> CallToolResult {
+        tool_result(
+            self.service
+                .inbox(request.conversation_limit, request.message_limit)
+                .await,
+        )
+    }
+
     /// List a bounded page of Slack channels, DMs, and group DMs with names.
     #[tool(
         name = "slack_list_conversations",
@@ -323,7 +368,11 @@ impl McpServer {
     ) -> CallToolResult {
         tool_result(
             self.service
-                .read_channel(&request.channel_id, request.limit)
+                .read_channel(
+                    &request.channel_id,
+                    request.cursor.as_deref(),
+                    request.limit,
+                )
                 .await,
         )
     }
@@ -346,7 +395,12 @@ impl McpServer {
     ) -> CallToolResult {
         tool_result(
             self.service
-                .read_thread(&request.channel_id, &request.thread_ts, request.limit)
+                .read_thread(
+                    &request.channel_id,
+                    &request.thread_ts,
+                    request.cursor.as_deref(),
+                    request.limit,
+                )
                 .await,
         )
     }
@@ -448,6 +502,7 @@ mod tests {
         async fn conversation_history(
             &self,
             _channel: &str,
+            _cursor: Option<&str>,
             _limit: usize,
         ) -> Result<RawMessagePage> {
             unreachable!("invalid test input must fail before HTTP")
@@ -457,6 +512,7 @@ mod tests {
             &self,
             _channel: &str,
             _thread_ts: &str,
+            _cursor: Option<&str>,
             _limit: usize,
         ) -> Result<RawMessagePage> {
             unreachable!("not called")
@@ -535,6 +591,7 @@ mod tests {
                 "slack_list_conversations",
                 "slack_list_unreads",
                 "slack_read_channel",
+                "slack_read_inbox",
                 "slack_read_thread",
                 "slack_search_messages",
             ])
@@ -596,6 +653,27 @@ mod tests {
             Some(json!({
                 "team_id": "T000TEST",
                 "conversations": [],
+                "threads": {
+                    "has_unreads": false,
+                    "mention_count": 0,
+                    "unread_count_by_channel": {}
+                }
+            }))
+        );
+
+        let inbox = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("slack_read_inbox"))
+            .await
+            .expect("inbox call");
+        assert_eq!(inbox.is_error, Some(false));
+        assert_eq!(
+            inbox.structured_content,
+            Some(json!({
+                "team_id": "T000TEST",
+                "conversations": [],
+                "total_unread_conversations": 0,
+                "has_more_conversations": false,
                 "threads": {
                     "has_unreads": false,
                     "mention_count": 0,

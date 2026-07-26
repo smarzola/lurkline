@@ -148,23 +148,32 @@ impl SlackApi for SlackHttpClient {
         .await
     }
 
-    async fn conversation_history(&self, channel: &str, limit: usize) -> Result<RawMessagePage> {
+    async fn conversation_history(
+        &self,
+        channel: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawMessagePage> {
+        let mut fields = vec![
+            ("channel", channel.into()),
+            ("limit", limit.to_string()),
+            ("ignore_replies", "true".into()),
+            ("include_pin_count", "true".into()),
+            ("inclusive", "true".into()),
+            ("no_user_profile", "true".into()),
+            ("include_stories", "true".into()),
+            ("include_free_team_extra_messages", "true".into()),
+            ("include_date_joined", "true".into()),
+            ("include_tombstones", "true".into()),
+            ("cached_latest_updates", "{}".into()),
+        ];
+        if let Some(cursor) = cursor {
+            fields.push(("cursor", cursor.into()));
+        }
         self.post_form(
             "conversations.history",
             "message-pane/requestHistory",
-            &[
-                ("channel", channel.into()),
-                ("limit", limit.to_string()),
-                ("ignore_replies", "true".into()),
-                ("include_pin_count", "true".into()),
-                ("inclusive", "true".into()),
-                ("no_user_profile", "true".into()),
-                ("include_stories", "true".into()),
-                ("include_free_team_extra_messages", "true".into()),
-                ("include_date_joined", "true".into()),
-                ("include_tombstones", "true".into()),
-                ("cached_latest_updates", "{}".into()),
-            ],
+            &fields,
         )
         .await
     }
@@ -173,20 +182,25 @@ impl SlackApi for SlackHttpClient {
         &self,
         channel: &str,
         thread_ts: &str,
+        cursor: Option<&str>,
         limit: usize,
     ) -> Result<RawMessagePage> {
+        let mut fields = vec![
+            ("channel", channel.into()),
+            ("ts", thread_ts.into()),
+            ("limit", limit.to_string()),
+            ("inclusive", "true".into()),
+            ("include_stories", "true".into()),
+            ("include_date_joined", "true".into()),
+            ("include_tombstones", "true".into()),
+        ];
+        if let Some(cursor) = cursor {
+            fields.push(("cursor", cursor.into()));
+        }
         self.post_form(
             "conversations.replies",
             "message-pane/requestReplies",
-            &[
-                ("channel", channel.into()),
-                ("ts", thread_ts.into()),
-                ("limit", limit.to_string()),
-                ("inclusive", "true".into()),
-                ("include_stories", "true".into()),
-                ("include_date_joined", "true".into()),
-                ("include_tombstones", "true".into()),
-            ],
+            &fields,
         )
         .await
     }
@@ -455,13 +469,27 @@ mod tests {
                 "history",
                 br#"{"ok":true,"messages":[]}"#.as_slice(),
                 "/api/conversations.history",
-                vec!["C123", "limit", "42", "ignore_replies"],
+                vec![
+                    "C123",
+                    "limit",
+                    "42",
+                    "ignore_replies",
+                    "cursor",
+                    "history-cursor",
+                ],
             ),
             (
                 "replies",
                 br#"{"ok":true,"messages":[]}"#.as_slice(),
                 "/api/conversations.replies",
-                vec!["C123", "100.000001", "limit", "20"],
+                vec![
+                    "C123",
+                    "100.000001",
+                    "limit",
+                    "20",
+                    "cursor",
+                    "replies-cursor",
+                ],
             ),
             (
                 "message",
@@ -514,11 +542,14 @@ mod tests {
             let (client, capture) = server(StatusCode::OK, response.to_vec(), 64 * 1024).await;
             match case {
                 "history" => {
-                    client.conversation_history("C123", 42).await.unwrap();
+                    client
+                        .conversation_history("C123", Some("history-cursor"), 42)
+                        .await
+                        .unwrap();
                 }
                 "replies" => {
                     client
-                        .conversation_replies("C123", "100.000001", 20)
+                        .conversation_replies("C123", "100.000001", Some("replies-cursor"), 20)
                         .await
                         .unwrap();
                 }
@@ -559,6 +590,32 @@ mod tests {
                     }])
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn omits_history_and_thread_cursors_when_not_supplied() {
+        let calls = [
+            ("history", br#"{"ok":true,"messages":[]}"#.as_slice()),
+            ("replies", br#"{"ok":true,"messages":[]}"#.as_slice()),
+        ];
+        for (method, response) in calls {
+            let (client, capture) = server(StatusCode::OK, response.to_vec(), 64 * 1024).await;
+            if method == "history" {
+                client.conversation_history("C123", None, 20).await.unwrap();
+            } else {
+                client
+                    .conversation_replies("C123", "100.000001", None, 20)
+                    .await
+                    .unwrap();
+            }
+            let guard = capture.request.lock().unwrap();
+            let (_, _, body) = guard.as_ref().unwrap();
+            let body = String::from_utf8_lossy(body);
+            assert!(
+                !body.contains("name=\"cursor\""),
+                "{method} sent an absent cursor"
+            );
         }
     }
 
@@ -645,7 +702,10 @@ mod tests {
             let (client, _) = server(StatusCode::OK, body.to_vec(), 64 * 1024).await;
             let result = match case {
                 "counts" => client.client_counts().await.map(|_| ()),
-                "history" => client.conversation_history("C123", 20).await.map(|_| ()),
+                "history" => client
+                    .conversation_history("C123", None, 20)
+                    .await
+                    .map(|_| ()),
                 "users" => client.users_list(None, 200).await.map(|_| ()),
                 "conversations" => client.conversations_list(None, 200).await.map(|_| ()),
                 "search" => client.search_messages("deploy", None, 20).await.map(|_| ()),
@@ -664,7 +724,7 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            client.conversation_history("C123", 20).await,
+            client.conversation_history("C123", None, 20).await,
             Err(Error::SlackApi {
                 method: "conversations.history",
                 ref code

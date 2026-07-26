@@ -104,6 +104,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_list_conversations",
             "slack_list_unreads",
             "slack_read_channel",
+            "slack_read_inbox",
             "slack_read_thread",
             "slack_search_messages",
         ])
@@ -211,6 +212,31 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "error": {
                 "code": "invalid_input",
                 "message": "invalid query: must contain 1 to 512 non-control characters"
+            }
+        })
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_read_inbox",
+                "arguments": {"conversation_limit": 0, "message_limit": 20}
+            }
+        }),
+    )
+    .await;
+    let invalid_inbox = response_with_id(&mut stdout, 7).await;
+    assert_eq!(invalid_inbox["result"]["isError"], true);
+    assert_eq!(
+        invalid_inbox["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "invalid_input",
+                "message": "invalid conversation_limit: is outside the allowed range"
             }
         })
     );

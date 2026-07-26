@@ -11,15 +11,16 @@ use crate::{
     model::{
         ClientCountsPayload, Conversation, ConversationKind, ConversationPage,
         ConversationSearchReport, ConversationSearchTruncationReason, DoctorReport, FileReference,
-        Message, MessagePage, MessageSearchMatch, MessageSearchPage, RawConversation,
-        RawConversationsPage, RawMessage, RawMessagePage, RawMessageSearchMatch,
-        RawMessageSearchResponse, RawMessagesList, RawUnread, RawUser, RawUsersPage, Reaction,
-        ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
-        UserSearchTruncationReason,
+        InboxConversation, InboxReport, Message, MessagePage, MessageSearchMatch,
+        MessageSearchPage, RawConversation, RawConversationsPage, RawMessage, RawMessagePage,
+        RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList, RawUnread, RawUser,
+        RawUsersPage, Reaction, ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User,
+        UserSearchReport, UserSearchTruncationReason,
     },
 };
 
 const MAX_MESSAGES: usize = 200;
+pub(crate) const MAX_INBOX_CONVERSATIONS: usize = 50;
 pub(crate) const MAX_USERS: usize = 100;
 pub(crate) const MAX_CONVERSATIONS: usize = 100;
 pub(crate) const CONVERSATIONS_PAGE_SIZE: usize = 200;
@@ -31,11 +32,17 @@ const MAX_USER_PAGES: usize = 20;
 #[async_trait]
 pub(crate) trait SlackApi: Send + Sync {
     async fn client_counts(&self) -> Result<ClientCountsPayload>;
-    async fn conversation_history(&self, channel: &str, limit: usize) -> Result<RawMessagePage>;
+    async fn conversation_history(
+        &self,
+        channel: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawMessagePage>;
     async fn conversation_replies(
         &self,
         channel: &str,
         thread_ts: &str,
+        cursor: Option<&str>,
         limit: usize,
     ) -> Result<RawMessagePage>;
     async fn messages_list(&self, channel: &str, message_ts: &str) -> Result<RawMessagesList>;
@@ -96,18 +103,22 @@ impl SlackService {
             });
         }
         let mut conversations = Vec::new();
+        let mut seen_ids = HashSet::new();
         append_unreads(
             &mut conversations,
+            &mut seen_ids,
             counts.channels,
             ConversationKind::Channel,
         )?;
         append_unreads(
             &mut conversations,
+            &mut seen_ids,
             counts.ims,
             ConversationKind::DirectMessage,
         )?;
         append_unreads(
             &mut conversations,
+            &mut seen_ids,
             counts.mpims,
             ConversationKind::GroupDirectMessage,
         )?;
@@ -125,6 +136,56 @@ impl SlackService {
                 mention_count: counts.threads.mention_count,
                 unread_count_by_channel: counts.threads.unread_count_by_channel,
             },
+        })
+    }
+
+    pub(crate) async fn inbox(
+        &self,
+        conversation_limit: usize,
+        message_limit: usize,
+    ) -> Result<InboxReport> {
+        validate_limit(
+            "conversation_limit",
+            conversation_limit,
+            MAX_INBOX_CONVERSATIONS,
+        )?;
+        validate_limit("message_limit", message_limit, MAX_MESSAGES)?;
+        let unreads = self.unreads().await?;
+        let total_unread_conversations = unreads.conversations.len();
+        let selected = unreads
+            .conversations
+            .into_iter()
+            .take(conversation_limit)
+            .collect::<Vec<_>>();
+        let selected_ids = selected
+            .iter()
+            .map(|unread| unread.id.clone())
+            .collect::<HashSet<_>>();
+        let directory = self.load_conversations_by_id(&selected_ids).await?;
+        let mut conversations = Vec::with_capacity(selected.len());
+        for unread in selected {
+            let conversation = directory
+                .get(&unread.id)
+                .cloned()
+                .unwrap_or_else(|| fallback_conversation(&unread));
+            if conversation.kind != unread.kind {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+            let messages = self.read_channel(&unread.id, None, message_limit).await?;
+            conversations.push(InboxConversation {
+                conversation,
+                unread,
+                messages,
+            });
+        }
+        Ok(InboxReport {
+            team_id: self.team_id.clone(),
+            has_more_conversations: total_unread_conversations > conversations.len(),
+            total_unread_conversations,
+            conversations,
+            threads: unreads.threads,
         })
     }
 
@@ -337,13 +398,23 @@ impl SlackService {
         })
     }
 
-    pub(crate) async fn read_channel(&self, channel: &str, limit: usize) -> Result<MessagePage> {
+    pub(crate) async fn read_channel(
+        &self,
+        channel: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<MessagePage> {
         validate_limit("limit", limit, MAX_MESSAGES)?;
+        validate_cursor(cursor)?;
         let channel = self.resolve_conversation_id(channel).await?;
-        let raw = self.api.conversation_history(&channel, limit).await?;
+        let raw = self
+            .api
+            .conversation_history(&channel, cursor, limit)
+            .await?;
         let locally_truncated = raw.messages.len() > limit;
         let next_cursor =
             response_cursor("conversations.history", raw.response_metadata.next_cursor)?;
+        reject_repeated_cursor("conversations.history", cursor, next_cursor.as_deref())?;
         Ok(MessagePage {
             channel_id: channel.clone(),
             messages: normalize_messages(&channel, raw.messages, limit, "conversations.history")?,
@@ -356,18 +427,21 @@ impl SlackService {
         &self,
         channel: &str,
         thread_ts: &str,
+        cursor: Option<&str>,
         limit: usize,
     ) -> Result<ThreadPage> {
         validate_timestamp("thread_ts", thread_ts)?;
         validate_limit("limit", limit, MAX_MESSAGES)?;
+        validate_cursor(cursor)?;
         let channel = self.resolve_conversation_id(channel).await?;
         let raw = self
             .api
-            .conversation_replies(&channel, thread_ts, limit)
+            .conversation_replies(&channel, thread_ts, cursor, limit)
             .await?;
         let locally_truncated = raw.messages.len() > limit;
         let next_cursor =
             response_cursor("conversations.replies", raw.response_metadata.next_cursor)?;
+        reject_repeated_cursor("conversations.replies", cursor, next_cursor.as_deref())?;
         Ok(ThreadPage {
             channel_id: channel.clone(),
             thread_ts: thread_ts.to_owned(),
@@ -588,6 +662,71 @@ impl SlackService {
         unreachable!("bounded conversation ID lookup always returns")
     }
 
+    async fn load_conversations_by_id(
+        &self,
+        ids: &HashSet<String>,
+    ) -> Result<HashMap<String, Conversation>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut matched = Vec::new();
+        let mut matched_ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+
+        for page_index in 0..MAX_CONVERSATION_PAGES {
+            let page = self
+                .api
+                .conversations_list(cursor.as_deref(), CONVERSATIONS_PAGE_SIZE)
+                .await?;
+            if page.channels.len() > CONVERSATIONS_PAGE_SIZE {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+
+            normalize_conversations(page.channels.clone(), &HashMap::new())?;
+            for raw in page.channels {
+                if ids.contains(&raw.id) {
+                    if !matched_ids.insert(raw.id.clone()) {
+                        return Err(Error::InvalidResponse {
+                            method: "conversations.list",
+                        });
+                    }
+                    matched.push(raw);
+                }
+            }
+            if matched_ids.len() == ids.len() {
+                break;
+            }
+
+            let next = response_cursor("conversations.list", page.response_metadata.next_cursor)?;
+            let Some(next) = next else {
+                break;
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+            cursor = Some(next);
+            if page_index + 1 == MAX_CONVERSATION_PAGES {
+                break;
+            }
+        }
+
+        let users = if matched.iter().any(|conversation| conversation.is_im) {
+            self.load_user_directory().await?.users
+        } else {
+            HashMap::new()
+        };
+        Ok(normalize_conversations(matched, &users)?
+            .into_iter()
+            .map(|conversation| (conversation.id.clone(), conversation))
+            .collect())
+    }
+
     async fn load_user_directory(&self) -> Result<UserDirectory> {
         let mut users = HashMap::new();
         let mut cursor: Option<String> = None;
@@ -661,46 +800,49 @@ fn normalize_conversations(
                 });
             }
 
-            let (name, display_name, user_id) = if kind == ConversationKind::DirectMessage {
-                let user_id =
-                    raw.user
-                        .filter(|id| is_valid_user_id(id))
-                        .ok_or(Error::InvalidResponse {
+            let (name, display_name, name_is_fallback, user_id) =
+                if kind == ConversationKind::DirectMessage {
+                    let user_id = raw.user.filter(|id| is_valid_user_id(id)).ok_or(
+                        Error::InvalidResponse {
                             method: "conversations.list",
-                        })?;
-                let user = users.get(&user_id);
-                let name = user
-                    .map(|user| user.name.trim())
-                    .filter(|name| is_valid_conversation_name(name))
-                    .unwrap_or(&user_id)
-                    .to_owned();
-                let display_name = user
-                    .and_then(|user| {
-                        [
-                            user.display_name.trim(),
-                            user.real_name.trim(),
-                            user.name.trim(),
-                        ]
-                        .into_iter()
-                        .find(|value| is_valid_conversation_name(value))
-                    })
-                    .unwrap_or(&user_id)
-                    .to_owned();
-                (name, display_name, Some(user_id))
-            } else {
-                let name = raw.name.trim();
-                if !is_valid_conversation_name(name) {
-                    return Err(Error::InvalidResponse {
-                        method: "conversations.list",
-                    });
-                }
-                (name.to_owned(), name.to_owned(), None)
-            };
+                        },
+                    )?;
+                    let user = users.get(&user_id);
+                    let loaded_name = user
+                        .map(|user| user.name.trim())
+                        .filter(|name| is_valid_conversation_name(name))
+                        .map(str::to_owned);
+                    let name_is_fallback = loaded_name.is_none();
+                    let name = loaded_name.unwrap_or_else(|| user_id.clone());
+                    let display_name = user
+                        .and_then(|user| {
+                            [
+                                user.display_name.trim(),
+                                user.real_name.trim(),
+                                user.name.trim(),
+                            ]
+                            .into_iter()
+                            .find(|value| is_valid_conversation_name(value))
+                        })
+                        .unwrap_or(&user_id)
+                        .to_owned();
+                    (name, display_name, name_is_fallback, Some(user_id))
+                } else {
+                    let name = raw.name.trim();
+                    if !is_valid_conversation_name(name) {
+                        return Err(Error::InvalidResponse {
+                            method: "conversations.list",
+                        });
+                    }
+                    (name.to_owned(), name.to_owned(), false, None)
+                };
 
             Ok(Conversation {
                 id: raw.id,
                 name,
                 display_name,
+                name_is_fallback,
+                metadata_is_complete: true,
                 kind,
                 is_private: raw.is_private || kind != ConversationKind::Channel,
                 is_archived: raw.is_archived,
@@ -710,6 +852,22 @@ fn normalize_conversations(
             })
         })
         .collect()
+}
+
+fn fallback_conversation(unread: &UnreadConversation) -> Conversation {
+    Conversation {
+        id: unread.id.clone(),
+        name: unread.id.clone(),
+        display_name: unread.id.clone(),
+        name_is_fallback: true,
+        metadata_is_complete: false,
+        kind: unread.kind,
+        is_private: unread.kind != ConversationKind::Channel,
+        is_archived: false,
+        is_member: false,
+        member_count: None,
+        user_id: None,
+    }
 }
 
 fn conversation_matches(conversation: &Conversation, needle: &str) -> bool {
@@ -801,30 +959,27 @@ fn normalize_search_matches(
 
 fn append_unreads(
     target: &mut Vec<UnreadConversation>,
+    seen_ids: &mut HashSet<String>,
     source: Vec<RawUnread>,
     kind: ConversationKind,
 ) -> Result<()> {
-    if source
-        .iter()
-        .any(|entry| !is_valid_conversation_id(&entry.id, kind))
-    {
-        return Err(Error::InvalidResponse {
-            method: "client.counts",
-        });
-    }
-    target.extend(
-        source
-            .into_iter()
-            .filter(|entry| entry.has_unreads)
-            .map(|entry| UnreadConversation {
+    for entry in source {
+        if !is_valid_conversation_id(&entry.id, kind) || !seen_ids.insert(entry.id.clone()) {
+            return Err(Error::InvalidResponse {
+                method: "client.counts",
+            });
+        }
+        if entry.has_unreads {
+            target.push(UnreadConversation {
                 id: entry.id,
                 kind,
                 has_unreads: entry.has_unreads,
                 mention_count: entry.mention_count,
                 last_read: entry.last_read,
                 latest: entry.latest,
-            }),
-    );
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1065,6 +1220,20 @@ fn response_cursor(method: &'static str, value: String) -> Result<Option<String>
     Ok(Some(value))
 }
 
+fn reject_repeated_cursor(
+    method: &'static str,
+    current: Option<&str>,
+    next: Option<&str>,
+) -> Result<()> {
+    if current
+        .zip(next)
+        .is_some_and(|(current, next)| current == next)
+    {
+        return Err(Error::InvalidResponse { method });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1089,6 +1258,9 @@ mod tests {
         message_list: RawMessagesList,
         search: RawMessageSearchResponse,
         search_calls: Arc<Mutex<Vec<SearchCall>>>,
+        history_calls: Arc<Mutex<Vec<HistoryCall>>>,
+        reply_calls: Arc<Mutex<Vec<ReplyCall>>>,
+        conversation_calls: Arc<Mutex<Vec<ConversationCall>>>,
         conversation_pages: Mutex<VecDeque<RawConversationsPage>>,
         user_pages: Mutex<VecDeque<RawUsersPage>>,
     }
@@ -1096,6 +1268,27 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct SearchCall {
         query: String,
+        cursor: Option<String>,
+        limit: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HistoryCall {
+        channel: String,
+        cursor: Option<String>,
+        limit: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ReplyCall {
+        channel: String,
+        thread_ts: String,
+        cursor: Option<String>,
+        limit: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ConversationCall {
         cursor: Option<String>,
         limit: usize,
     }
@@ -1108,18 +1301,31 @@ mod tests {
 
         async fn conversation_history(
             &self,
-            _channel: &str,
-            _limit: usize,
+            channel: &str,
+            cursor: Option<&str>,
+            limit: usize,
         ) -> Result<RawMessagePage> {
+            self.history_calls.lock().unwrap().push(HistoryCall {
+                channel: channel.into(),
+                cursor: cursor.map(str::to_owned),
+                limit,
+            });
             Ok(self.history.clone())
         }
 
         async fn conversation_replies(
             &self,
-            _channel: &str,
-            _thread_ts: &str,
-            _limit: usize,
+            channel: &str,
+            thread_ts: &str,
+            cursor: Option<&str>,
+            limit: usize,
         ) -> Result<RawMessagePage> {
+            self.reply_calls.lock().unwrap().push(ReplyCall {
+                channel: channel.into(),
+                thread_ts: thread_ts.into(),
+                cursor: cursor.map(str::to_owned),
+                limit,
+            });
             Ok(self.replies.clone())
         }
 
@@ -1133,9 +1339,16 @@ mod tests {
 
         async fn conversations_list(
             &self,
-            _cursor: Option<&str>,
-            _limit: usize,
+            cursor: Option<&str>,
+            limit: usize,
         ) -> Result<RawConversationsPage> {
+            self.conversation_calls
+                .lock()
+                .unwrap()
+                .push(ConversationCall {
+                    cursor: cursor.map(str::to_owned),
+                    limit,
+                });
             Ok(self
                 .conversation_pages
                 .lock()
@@ -1179,6 +1392,7 @@ mod tests {
         async fn conversation_history(
             &self,
             _channel: &str,
+            _cursor: Option<&str>,
             _limit: usize,
         ) -> Result<RawMessagePage> {
             Err(Error::Authentication)
@@ -1188,6 +1402,7 @@ mod tests {
             &self,
             _channel: &str,
             _thread_ts: &str,
+            _cursor: Option<&str>,
             _limit: usize,
         ) -> Result<RawMessagePage> {
             Err(Error::Authentication)
@@ -1247,6 +1462,9 @@ mod tests {
                 ..RawMessageSearchResponse::default()
             },
             search_calls: Arc::new(Mutex::new(Vec::new())),
+            history_calls: Arc::new(Mutex::new(Vec::new())),
+            reply_calls: Arc::new(Mutex::new(Vec::new())),
+            conversation_calls: Arc::new(Mutex::new(Vec::new())),
             conversation_pages: Mutex::new(VecDeque::new()),
             user_pages: Mutex::new(VecDeque::new()),
         }
@@ -1344,6 +1562,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_duplicate_unread_ids_within_or_across_count_kinds() {
+        let mut same_list = fake_api();
+        same_list.counts.channels = vec![entry("CGENERAL", true, 1), entry("CGENERAL", true, 1)];
+        assert!(matches!(
+            service(same_list).unreads().await,
+            Err(Error::InvalidResponse {
+                method: "client.counts"
+            })
+        ));
+
+        let mut cross_list = fake_api();
+        cross_list.counts.channels = vec![entry("GTEAM", true, 1)];
+        cross_list.counts.mpims = vec![entry("GTEAM", true, 1)];
+        assert!(matches!(
+            service(cross_list).unreads().await,
+            Err(Error::InvalidResponse {
+                method: "client.counts"
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn unread_json_schema_is_stable_and_typed() {
         let mut api = fake_api();
         api.counts = ClientCountsPayload {
@@ -1404,6 +1644,170 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn inbox_selects_sorted_unreads_enriches_names_and_bounds_history() {
+        let mut api = fake_api();
+        api.counts = ClientCountsPayload {
+            channels: vec![entry("CGENERAL", true, 1)],
+            ims: vec![entry("DALI", true, 3)],
+            mpims: vec![entry("GTEAM", true, 0)],
+            threads: RawThreadCounts {
+                has_unreads: true,
+                mention_count: 2,
+                unread_count_by_channel: BTreeMap::from([("CGENERAL".into(), 2)]),
+            },
+        };
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                raw_conversation("CGENERAL", "general"),
+                RawConversation {
+                    id: "DALI".into(),
+                    is_im: true,
+                    user: Some("WALI".into()),
+                    ..RawConversation::default()
+                },
+                RawConversation {
+                    is_mpim: true,
+                    ..raw_conversation("GTEAM", "mpdm-alice--bob-1")
+                },
+            ],
+            ..RawConversationsPage::default()
+        }]));
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("WALI", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
+        api.history.messages = vec![raw_message("100.000001", "recent")];
+        let history_calls = api.history_calls.clone();
+
+        let report = service(api).inbox(2, 7).await.unwrap();
+
+        assert_eq!(report.total_unread_conversations, 3);
+        assert!(report.has_more_conversations);
+        assert_eq!(
+            report
+                .conversations
+                .iter()
+                .map(|entry| entry.conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["DALI", "CGENERAL"]
+        );
+        assert_eq!(report.conversations[0].conversation.name, "alice");
+        assert_eq!(
+            report.conversations[0].conversation.display_name,
+            "Alice Example"
+        );
+        assert!(!report.conversations[0].conversation.name_is_fallback);
+        assert!(report.conversations[0].conversation.metadata_is_complete);
+        assert_eq!(report.conversations[1].conversation.name, "general");
+        assert_eq!(report.conversations[0].messages.messages.len(), 1);
+        assert!(report.threads.has_unreads);
+        assert_eq!(report.threads.mention_count, 2);
+        assert_eq!(
+            *history_calls.lock().unwrap(),
+            vec![
+                HistoryCall {
+                    channel: "DALI".into(),
+                    cursor: None,
+                    limit: 7,
+                },
+                HistoryCall {
+                    channel: "CGENERAL".into(),
+                    cursor: None,
+                    limit: 7,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_inbox_skips_discovery_and_history_but_preserves_thread_unreads() {
+        let mut api = fake_api();
+        api.counts.threads = RawThreadCounts {
+            has_unreads: true,
+            mention_count: 4,
+            unread_count_by_channel: BTreeMap::from([("CGENERAL".into(), 4)]),
+        };
+        let conversation_calls = api.conversation_calls.clone();
+        let history_calls = api.history_calls.clone();
+
+        let report = service(api).inbox(10, 20).await.unwrap();
+
+        assert!(report.conversations.is_empty());
+        assert_eq!(report.total_unread_conversations, 0);
+        assert!(!report.has_more_conversations);
+        assert!(report.threads.has_unreads);
+        assert_eq!(report.threads.mention_count, 4);
+        assert!(conversation_calls.lock().unwrap().is_empty());
+        assert!(history_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_uses_an_explicit_id_fallback_when_discovery_metadata_is_missing() {
+        let mut api = fake_api();
+        api.counts.channels = vec![entry("CMISSING", true, 1)];
+        let history_calls = api.history_calls.clone();
+
+        let report = service(api).inbox(10, 5).await.unwrap();
+
+        let entry = &report.conversations[0];
+        assert_eq!(entry.conversation.id, "CMISSING");
+        assert_eq!(entry.conversation.name, "CMISSING");
+        assert_eq!(entry.conversation.display_name, "CMISSING");
+        assert!(entry.conversation.name_is_fallback);
+        assert!(!entry.conversation.metadata_is_complete);
+        assert_eq!(
+            *history_calls.lock().unwrap(),
+            vec![HistoryCall {
+                channel: "CMISSING".into(),
+                cursor: None,
+                limit: 5,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_rejects_unread_and_discovery_kind_disagreement_before_history() {
+        let mut api = fake_api();
+        api.counts.channels = vec![entry("GTEAM", true, 1)];
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![RawConversation {
+                is_mpim: true,
+                ..raw_conversation("GTEAM", "mpdm-alice--bob-1")
+            }],
+            ..RawConversationsPage::default()
+        }]));
+        let history_calls = api.history_calls.clone();
+
+        assert!(matches!(
+            service(api).inbox(10, 5).await,
+            Err(Error::InvalidResponse {
+                method: "conversations.list"
+            })
+        ));
+        assert!(history_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_rejects_invalid_bounds_before_any_slack_request() {
+        for (conversation_limit, message_limit, field) in [
+            (0, 1, "conversation_limit"),
+            (MAX_INBOX_CONVERSATIONS + 1, 1, "conversation_limit"),
+            (1, 0, "message_limit"),
+            (1, MAX_MESSAGES + 1, "message_limit"),
+        ] {
+            assert!(matches!(
+                service(FailApi)
+                    .inbox(conversation_limit, message_limit)
+                    .await,
+                Err(Error::InvalidInput {
+                    field: actual,
+                    ..
+                }) if actual == field
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1631,7 +2035,7 @@ mod tests {
             }]));
         assert!(matches!(
             service(incomplete_users_api)
-                .read_channel("general", 1)
+                .read_channel("general", None, 1)
                 .await,
             Err(Error::ScanLimit {
                 resource: "Slack conversation",
@@ -1655,7 +2059,7 @@ mod tests {
         incomplete_conversations_api.conversation_pages = Mutex::new(conversation_pages);
         assert!(matches!(
             service(incomplete_conversations_api)
-                .read_channel("general", 1)
+                .read_channel("general", None, 1)
                 .await,
             Err(Error::ScanLimit {
                 resource: "Slack conversation",
@@ -1668,7 +2072,10 @@ mod tests {
     async fn resolves_exact_names_but_keeps_ids_on_the_fast_path() {
         let mut id_api = fake_api();
         id_api.history.messages = vec![raw_message("100.000001", "by id")];
-        let id_page = service(id_api).read_channel("CGENERAL", 1).await.unwrap();
+        let id_page = service(id_api)
+            .read_channel("CGENERAL", None, 1)
+            .await
+            .unwrap();
         assert_eq!(id_page.channel_id, "CGENERAL");
 
         let mut name_api = fake_api();
@@ -1677,7 +2084,10 @@ mod tests {
             channels: vec![raw_conversation("CGENERAL", "general")],
             ..RawConversationsPage::default()
         }]));
-        let name_page = service(name_api).read_channel("#GENERAL", 1).await.unwrap();
+        let name_page = service(name_api)
+            .read_channel("#GENERAL", None, 1)
+            .await
+            .unwrap();
         assert_eq!(name_page.channel_id, "CGENERAL");
         assert_eq!(name_page.messages[0].text, "by name");
     }
@@ -1693,7 +2103,7 @@ mod tests {
             ..RawConversationsPage::default()
         }]));
         assert!(matches!(
-            service(ambiguous_api).read_channel("shared", 1).await,
+            service(ambiguous_api).read_channel("shared", None, 1).await,
             Err(Error::InvalidInput {
                 field: "conversation",
                 ..
@@ -1701,7 +2111,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            service(fake_api()).read_channel("missing", 1).await,
+            service(fake_api()).read_channel("missing", None, 1).await,
             Err(Error::NotFound {
                 resource: "Slack conversation"
             })
@@ -2017,13 +2427,16 @@ mod tests {
         api.replies = api.history.clone();
         let service = service(api);
 
-        let page = service.read_channel("C123", 1).await.unwrap();
+        let page = service.read_channel("C123", None, 1).await.unwrap();
         assert_eq!(page.messages.len(), 1);
         assert_eq!(page.messages[0].text, "first");
         assert!(page.has_more);
         assert_eq!(page.next_cursor.as_deref(), Some("next"));
 
-        let thread = service.read_thread("C123", "100.000001", 2).await.unwrap();
+        let thread = service
+            .read_thread("C123", "100.000001", None, 2)
+            .await
+            .unwrap();
         assert_eq!(thread.messages.len(), 2);
         assert_eq!(thread.thread_ts, "100.000001");
     }
@@ -2038,15 +2451,91 @@ mod tests {
         api.replies = api.history.clone();
         let service = service(api);
 
-        let channel = service.read_channel("C123", 1).await.unwrap();
+        let channel = service.read_channel("C123", None, 1).await.unwrap();
         assert_eq!(channel.messages.len(), 1);
         assert!(channel.has_more);
         assert_eq!(channel.next_cursor, None);
 
-        let thread = service.read_thread("C123", "100.000001", 1).await.unwrap();
+        let thread = service
+            .read_thread("C123", "100.000001", None, 1)
+            .await
+            .unwrap();
         assert_eq!(thread.messages.len(), 1);
         assert!(thread.has_more);
         assert_eq!(thread.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn channel_and_thread_reads_forward_cursors_and_reject_repetition() {
+        let mut api = fake_api();
+        api.history.response_metadata.next_cursor = "channel-next".into();
+        api.replies.response_metadata.next_cursor = "thread-next".into();
+        let history_calls = api.history_calls.clone();
+        let reply_calls = api.reply_calls.clone();
+        let subject = service(api);
+
+        subject
+            .read_channel("C123", Some("channel-current"), 3)
+            .await
+            .unwrap();
+        subject
+            .read_thread("C123", "100.000001", Some("thread-current"), 4)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *history_calls.lock().unwrap(),
+            vec![HistoryCall {
+                channel: "C123".into(),
+                cursor: Some("channel-current".into()),
+                limit: 3,
+            }]
+        );
+        assert_eq!(
+            *reply_calls.lock().unwrap(),
+            vec![ReplyCall {
+                channel: "C123".into(),
+                thread_ts: "100.000001".into(),
+                cursor: Some("thread-current".into()),
+                limit: 4,
+            }]
+        );
+
+        let mut repeated_history = fake_api();
+        repeated_history.history.response_metadata.next_cursor = "same".into();
+        assert!(matches!(
+            service(repeated_history)
+                .read_channel("C123", Some("same"), 1)
+                .await,
+            Err(Error::InvalidResponse {
+                method: "conversations.history"
+            })
+        ));
+
+        let mut repeated_thread = fake_api();
+        repeated_thread.replies.response_metadata.next_cursor = "same".into();
+        assert!(matches!(
+            service(repeated_thread)
+                .read_thread("C123", "100.000001", Some("same"), 1)
+                .await,
+            Err(Error::InvalidResponse {
+                method: "conversations.replies"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn channel_cursor_validation_happens_before_network_io() {
+        let api = fake_api();
+        let history_calls = api.history_calls.clone();
+        assert!(matches!(
+            service(api).read_channel("C123", Some(" \t"), 1).await,
+            Err(Error::InvalidInput {
+                field: "cursor",
+                ..
+            })
+        ));
+        assert!(history_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2194,21 +2683,21 @@ mod tests {
     async fn validates_all_external_inputs() {
         let service = service(fake_api());
         assert!(matches!(
-            service.read_channel("", 1).await,
+            service.read_channel("", None, 1).await,
             Err(Error::InvalidInput {
                 field: "conversation",
                 ..
             })
         ));
         assert!(matches!(
-            service.read_thread("C123", "bad", 1).await,
+            service.read_thread("C123", "bad", None, 1).await,
             Err(Error::InvalidInput {
                 field: "thread_ts",
                 ..
             })
         ));
         assert!(matches!(
-            service.read_channel("C123", 201).await,
+            service.read_channel("C123", None, 201).await,
             Err(Error::InvalidInput { field: "limit", .. })
         ));
         assert!(matches!(
@@ -2244,7 +2733,7 @@ mod tests {
         let mut message_api = fake_api();
         message_api.history.messages = vec![raw_message("", "bad")];
         assert!(matches!(
-            service(message_api).read_channel("C123", 1).await,
+            service(message_api).read_channel("C123", None, 1).await,
             Err(Error::InvalidResponse {
                 method: "conversations.history"
             })

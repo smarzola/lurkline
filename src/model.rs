@@ -259,6 +259,9 @@ pub struct Conversation {
     pub id: String,
     pub name: String,
     pub display_name: String,
+    pub name_is_fallback: bool,
+    /// Whether archive, membership, privacy, and member-count metadata came from Slack discovery.
+    pub metadata_is_complete: bool,
     pub kind: ConversationKind,
     pub is_private: bool,
     pub is_archived: bool,
@@ -310,6 +313,22 @@ pub struct MessageSearchPage {
     pub total: u64,
     pub has_more: bool,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct InboxConversation {
+    pub conversation: Conversation,
+    pub unread: UnreadConversation,
+    pub messages: MessagePage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct InboxReport {
+    pub team_id: String,
+    pub conversations: Vec<InboxConversation>,
+    pub total_unread_conversations: usize,
+    pub has_more_conversations: bool,
+    pub threads: UnreadThreads,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

@@ -10,8 +10,8 @@ use crate::{
     mcp,
     model::{
         Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
-        ConversationSearchTruncationReason, DoctorReport, Message, MessagePage, MessageSearchPage,
-        ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        ConversationSearchTruncationReason, DoctorReport, InboxReport, Message, MessagePage,
+        MessageSearchPage, ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
     service::{MAX_CONVERSATIONS, MAX_USERS, SlackService},
 };
@@ -37,6 +37,18 @@ pub enum Command {
     },
     /// List conversations and thread counts Slack marks unread.
     Unreads {
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a bounded snapshot of conversations Slack explicitly marks unread.
+    Inbox {
+        /// Maximum unread conversations to load.
+        #[arg(long = "conversations", default_value_t = 10)]
+        conversation_limit: usize,
+        /// Maximum recent messages to load per unread conversation.
+        #[arg(long = "messages", default_value_t = 20)]
+        message_limit: usize,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -84,6 +96,9 @@ pub enum ChannelCommand {
         /// Maximum messages to return.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Opaque Slack cursor from a previous channel response.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -101,6 +116,9 @@ pub enum ThreadCommand {
         /// Maximum messages to return.
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Opaque Slack cursor from a previous thread response.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -197,6 +215,14 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Doctor { json } => print_doctor(service.doctor().await?, json),
         Command::Unreads { json } => print_unreads(service.unreads().await?, json),
+        Command::Inbox {
+            conversation_limit,
+            message_limit,
+            json,
+        } => print_inbox(
+            service.inbox(conversation_limit, message_limit).await?,
+            json,
+        ),
         Command::Conversations {
             command:
                 ConversationsCommand::List {
@@ -239,20 +265,29 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             command:
                 ChannelCommand::Read {
                     channel_id,
+                    cursor,
                     limit,
                     json,
                 },
-        } => print_message_page(service.read_channel(&channel_id, limit).await?, json),
+        } => print_message_page(
+            service
+                .read_channel(&channel_id, cursor.as_deref(), limit)
+                .await?,
+            json,
+        ),
         Command::Thread {
             command:
                 ThreadCommand::Read {
                     channel_id,
                     thread_ts,
+                    cursor,
                     limit,
                     json,
                 },
         } => print_thread_page(
-            service.read_thread(&channel_id, &thread_ts, limit).await?,
+            service
+                .read_thread(&channel_id, &thread_ts, cursor.as_deref(), limit)
+                .await?,
             json,
         ),
         Command::Message {
@@ -305,6 +340,48 @@ fn print_unreads(report: UnreadReport, json: bool) -> Result<()> {
             conversation.mention_count,
             escape_human(conversation.last_read.as_deref().unwrap_or("-")),
             escape_human(conversation.latest.as_deref().unwrap_or("-"))
+        );
+    }
+    if report.threads.has_unreads {
+        println!(
+            "threads\tchannels={}\tmentions={}",
+            report.threads.unread_count_by_channel.len(),
+            report.threads.mention_count
+        );
+    }
+    Ok(())
+}
+
+fn print_inbox(report: InboxReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    if report.conversations.is_empty() && !report.threads.has_unreads {
+        println!("Inbox is clear.");
+        return Ok(());
+    }
+    let shown_conversations = report.conversations.len();
+    for entry in report.conversations {
+        println!(
+            "{}\t{}\t{}\tmentions={}",
+            conversation_kind_label(entry.conversation.kind),
+            entry.conversation.id,
+            escape_human(&entry.conversation.display_name),
+            entry.unread.mention_count
+        );
+        print_messages(&entry.messages.messages);
+        if entry.messages.has_more {
+            println!(
+                "more\t{}\t{}",
+                entry.conversation.id,
+                entry.messages.next_cursor.as_deref().unwrap_or("available")
+            );
+        }
+    }
+    if report.has_more_conversations {
+        println!(
+            "more-conversations\tshown={}\ttotal={}",
+            shown_conversations, report.total_unread_conversations
         );
     }
     if report.threads.has_unreads {
@@ -569,6 +646,24 @@ mod tests {
                 .command,
             Command::Unreads { json: false }
         ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "inbox",
+                "--conversations",
+                "4",
+                "--messages",
+                "8",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Inbox {
+                conversation_limit: 4,
+                message_limit: 8,
+                json: true
+            }
+        ));
     }
 
     #[test]
@@ -636,12 +731,21 @@ mod tests {
         ));
         assert!(matches!(
             Cli::try_parse_from([
-                "lurkline", "channel", "read", "C123", "--limit", "12", "--json"
+                "lurkline",
+                "channel",
+                "read",
+                "C123",
+                "--cursor",
+                "channel-next",
+                "--limit",
+                "12",
+                "--json"
             ])
             .unwrap()
             .command,
             Command::Channel {
                 command: ChannelCommand::Read {
+                    cursor: Some(_),
                     limit: 12,
                     json: true,
                     ..
@@ -649,11 +753,23 @@ mod tests {
             }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["lurkline", "thread", "read", "C123", "100.000001"])
-                .unwrap()
-                .command,
+            Cli::try_parse_from([
+                "lurkline",
+                "thread",
+                "read",
+                "C123",
+                "100.000001",
+                "--cursor",
+                "thread-next"
+            ])
+            .unwrap()
+            .command,
             Command::Thread {
-                command: ThreadCommand::Read { limit: 100, .. }
+                command: ThreadCommand::Read {
+                    cursor: Some(_),
+                    limit: 100,
+                    ..
+                }
             }
         ));
         assert!(matches!(
