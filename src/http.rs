@@ -14,7 +14,9 @@ use serde_json::Value;
 use crate::{
     config::Config,
     error::{Error, Result},
-    model::{ClientCountsPayload, RawMessagePage, RawMessagesList, RawUsersPage},
+    model::{
+        ClientCountsPayload, RawConversationsPage, RawMessagePage, RawMessagesList, RawUsersPage,
+    },
     service::SlackApi,
 };
 
@@ -204,6 +206,23 @@ impl SlackApi for SlackHttpClient {
             ],
         )
         .await
+    }
+
+    async fn conversations_list(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawConversationsPage> {
+        let mut fields = vec![
+            ("types", "public_channel,private_channel,mpim,im".into()),
+            ("exclude_archived", "true".into()),
+            ("limit", limit.to_string()),
+        ];
+        if let Some(cursor) = cursor {
+            fields.push(("cursor", cursor.into()));
+        }
+        self.post_form("conversations.list", "conversations-list", &fields)
+            .await
     }
 
     async fn users_list(&self, cursor: Option<&str>, limit: usize) -> Result<RawUsersPage> {
@@ -434,6 +453,20 @@ mod tests {
                 "/api/users.list",
                 vec!["cursor", "next-page", "limit", "200"],
             ),
+            (
+                "conversations",
+                br#"{"ok":true,"channels":[]}"#.as_slice(),
+                "/api/conversations.list",
+                vec![
+                    "cursor",
+                    "next-page",
+                    "limit",
+                    "200",
+                    "public_channel,private_channel,mpim,im",
+                    "exclude_archived",
+                    "true",
+                ],
+            ),
         ];
 
         for (case, response, expected_path, expected_fields) in cases {
@@ -453,6 +486,12 @@ mod tests {
                 }
                 "users" => {
                     client.users_list(Some("next-page"), 200).await.unwrap();
+                }
+                "conversations" => {
+                    client
+                        .conversations_list(Some("next-page"), 200)
+                        .await
+                        .unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -552,6 +591,7 @@ mod tests {
                 "users",
                 br#"{"ok":true,"members":[{"name":"missing-id"}]}"#.as_slice(),
             ),
+            ("conversations", br#"{"ok":true}"#.as_slice()),
         ];
         for (case, body) in cases {
             let (client, _) = server(StatusCode::OK, body.to_vec(), 64 * 1024).await;
@@ -559,6 +599,7 @@ mod tests {
                 "counts" => client.client_counts().await.map(|_| ()),
                 "history" => client.conversation_history("C123", 20).await.map(|_| ()),
                 "users" => client.users_list(None, 200).await.map(|_| ()),
+                "conversations" => client.conversations_list(None, 200).await.map(|_| ()),
                 _ => unreachable!(),
             };
             assert!(matches!(result, Err(Error::InvalidResponse { .. })));

@@ -98,8 +98,10 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         names,
         std::collections::BTreeSet::from([
             "slack_doctor",
+            "slack_find_conversations",
             "slack_find_users",
             "slack_get_message",
+            "slack_list_conversations",
             "slack_list_unreads",
             "slack_read_channel",
             "slack_read_thread",
@@ -114,7 +116,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "method": "tools/call",
             "params": {
                 "name": "slack_read_channel",
-                "arguments": {"channel_id": "bad", "limit": 1}
+                "arguments": {"channel_id": "", "limit": 1}
             }
         }),
     )
@@ -126,7 +128,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         json!({
             "error": {
                 "code": "invalid_input",
-                "message": "invalid channel_id: must be a Slack channel, DM, or group-DM ID"
+                "message": "invalid conversation: must be a Slack conversation ID or a 1 to 128 character name"
             }
         })
     );
@@ -134,7 +136,57 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         invalid["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("invalid channel_id")
+            .contains("invalid conversation")
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_list_conversations",
+                "arguments": {"limit": 0}
+            }
+        }),
+    )
+    .await;
+    let invalid_list = response_with_id(&mut stdout, 4).await;
+    assert_eq!(invalid_list["result"]["isError"], true);
+    assert_eq!(
+        invalid_list["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "invalid_input",
+                "message": "invalid limit: is outside the allowed range"
+            }
+        })
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_find_conversations",
+                "arguments": {"query": "", "limit": 20}
+            }
+        }),
+    )
+    .await;
+    let invalid_find = response_with_id(&mut stdout, 5).await;
+    assert_eq!(invalid_find["result"]["isError"], true);
+    assert_eq!(
+        invalid_find["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "invalid_input",
+                "message": "invalid query: must contain 1 to 128 non-control characters"
+            }
+        })
     );
 
     drop(stdin);

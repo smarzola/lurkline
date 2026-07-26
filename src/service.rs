@@ -1,4 +1,7 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 
@@ -6,15 +9,20 @@ use crate::{
     config::Config,
     error::{Error, Result},
     model::{
-        ClientCountsPayload, ConversationKind, DoctorReport, FileReference, Message, MessagePage,
-        RawMessage, RawMessagePage, RawMessagesList, RawUnread, RawUser, RawUsersPage, Reaction,
-        ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
+        ClientCountsPayload, Conversation, ConversationKind, ConversationPage,
+        ConversationSearchReport, ConversationSearchTruncationReason, DoctorReport, FileReference,
+        Message, MessagePage, RawConversation, RawConversationsPage, RawMessage, RawMessagePage,
+        RawMessagesList, RawUnread, RawUser, RawUsersPage, Reaction, ThreadPage,
+        UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
         UserSearchTruncationReason,
     },
 };
 
 const MAX_MESSAGES: usize = 200;
 pub(crate) const MAX_USERS: usize = 100;
+pub(crate) const MAX_CONVERSATIONS: usize = 100;
+pub(crate) const CONVERSATIONS_PAGE_SIZE: usize = 200;
+const MAX_CONVERSATION_PAGES: usize = 20;
 const USERS_PAGE_SIZE: usize = 200;
 const MAX_USER_PAGES: usize = 20;
 
@@ -29,6 +37,11 @@ pub(crate) trait SlackApi: Send + Sync {
         limit: usize,
     ) -> Result<RawMessagePage>;
     async fn messages_list(&self, channel: &str, message_ts: &str) -> Result<RawMessagesList>;
+    async fn conversations_list(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawConversationsPage>;
     async fn users_list(&self, cursor: Option<&str>, limit: usize) -> Result<RawUsersPage>;
 }
 
@@ -37,6 +50,11 @@ pub(crate) struct SlackService {
     api: Arc<dyn SlackApi>,
     team_id: String,
     workspace_url: String,
+}
+
+struct UserDirectory {
+    users: HashMap<String, User>,
+    complete: bool,
 }
 
 impl SlackService {
@@ -102,15 +120,120 @@ impl SlackService {
         })
     }
 
+    pub(crate) async fn list_conversations(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ConversationPage> {
+        validate_limit("limit", limit, CONVERSATIONS_PAGE_SIZE)?;
+        validate_cursor(cursor)?;
+        let raw = self.api.conversations_list(cursor, limit).await?;
+        if raw.channels.len() > limit {
+            return Err(Error::InvalidResponse {
+                method: "conversations.list",
+            });
+        }
+        let user_directory = if raw.channels.iter().any(|conversation| conversation.is_im) {
+            self.load_user_directory().await?
+        } else {
+            UserDirectory {
+                users: HashMap::new(),
+                complete: true,
+            }
+        };
+        let next_cursor = response_cursor("conversations.list", raw.response_metadata.next_cursor)?;
+        Ok(ConversationPage {
+            conversations: normalize_conversations(raw.channels, &user_directory.users)?,
+            has_more: next_cursor.is_some(),
+            next_cursor,
+        })
+    }
+
+    pub(crate) async fn find_conversations(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<ConversationSearchReport> {
+        let query = validate_query(query)?;
+        validate_limit("limit", limit, MAX_CONVERSATIONS)?;
+        let needle = query.to_lowercase();
+        let user_directory = self.load_user_directory().await?;
+        let mut conversations = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut scanned_conversations = 0;
+
+        for page_index in 0..MAX_CONVERSATION_PAGES {
+            let page = self
+                .api
+                .conversations_list(cursor.as_deref(), CONVERSATIONS_PAGE_SIZE)
+                .await?;
+            if page.channels.len() > CONVERSATIONS_PAGE_SIZE {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+            scanned_conversations += page.channels.len();
+            for conversation in normalize_conversations(page.channels, &user_directory.users)? {
+                if conversation_matches(&conversation, &needle) {
+                    if conversations.len() == limit {
+                        return Ok(ConversationSearchReport {
+                            query,
+                            conversations,
+                            truncated: true,
+                            truncation_reason: Some(
+                                ConversationSearchTruncationReason::ResultLimit,
+                            ),
+                            scanned_conversations,
+                            scan_limit: CONVERSATIONS_PAGE_SIZE * MAX_CONVERSATION_PAGES,
+                        });
+                    }
+                    conversations.push(conversation);
+                }
+            }
+            let next = response_cursor("conversations.list", page.response_metadata.next_cursor)?;
+            let Some(next) = next else {
+                let truncated = !user_directory.complete;
+                return Ok(ConversationSearchReport {
+                    query,
+                    conversations,
+                    truncated,
+                    truncation_reason: truncated
+                        .then_some(ConversationSearchTruncationReason::ScanLimit),
+                    scanned_conversations,
+                    scan_limit: CONVERSATIONS_PAGE_SIZE * MAX_CONVERSATION_PAGES,
+                });
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+            cursor = Some(next);
+            if page_index + 1 == MAX_CONVERSATION_PAGES {
+                return Ok(ConversationSearchReport {
+                    query,
+                    conversations,
+                    truncated: true,
+                    truncation_reason: Some(ConversationSearchTruncationReason::ScanLimit),
+                    scanned_conversations,
+                    scan_limit: CONVERSATIONS_PAGE_SIZE * MAX_CONVERSATION_PAGES,
+                });
+            }
+        }
+        unreachable!("bounded conversation page loop always returns")
+    }
+
     pub(crate) async fn read_channel(&self, channel: &str, limit: usize) -> Result<MessagePage> {
-        validate_channel(channel)?;
         validate_limit("limit", limit, MAX_MESSAGES)?;
-        let raw = self.api.conversation_history(channel, limit).await?;
+        let channel = self.resolve_conversation_id(channel).await?;
+        let raw = self.api.conversation_history(&channel, limit).await?;
         let locally_truncated = raw.messages.len() > limit;
-        let next_cursor = nonempty(raw.response_metadata.next_cursor);
+        let next_cursor =
+            response_cursor("conversations.history", raw.response_metadata.next_cursor)?;
         Ok(MessagePage {
-            channel_id: channel.to_owned(),
-            messages: normalize_messages(channel, raw.messages, limit, "conversations.history")?,
+            channel_id: channel.clone(),
+            messages: normalize_messages(&channel, raw.messages, limit, "conversations.history")?,
             has_more: raw.has_more || next_cursor.is_some() || locally_truncated,
             next_cursor,
         })
@@ -122,30 +245,31 @@ impl SlackService {
         thread_ts: &str,
         limit: usize,
     ) -> Result<ThreadPage> {
-        validate_channel(channel)?;
         validate_timestamp("thread_ts", thread_ts)?;
         validate_limit("limit", limit, MAX_MESSAGES)?;
+        let channel = self.resolve_conversation_id(channel).await?;
         let raw = self
             .api
-            .conversation_replies(channel, thread_ts, limit)
+            .conversation_replies(&channel, thread_ts, limit)
             .await?;
         let locally_truncated = raw.messages.len() > limit;
-        let next_cursor = nonempty(raw.response_metadata.next_cursor);
+        let next_cursor =
+            response_cursor("conversations.replies", raw.response_metadata.next_cursor)?;
         Ok(ThreadPage {
-            channel_id: channel.to_owned(),
+            channel_id: channel.clone(),
             thread_ts: thread_ts.to_owned(),
-            messages: normalize_messages(channel, raw.messages, limit, "conversations.replies")?,
+            messages: normalize_messages(&channel, raw.messages, limit, "conversations.replies")?,
             has_more: raw.has_more || next_cursor.is_some() || locally_truncated,
             next_cursor,
         })
     }
 
     pub(crate) async fn get_message(&self, channel: &str, message_ts: &str) -> Result<Message> {
-        validate_channel(channel)?;
         validate_timestamp("message_ts", message_ts)?;
-        let raw = self.api.messages_list(channel, message_ts).await?;
+        let channel = self.resolve_conversation_id(channel).await?;
+        let raw = self.api.messages_list(&channel, message_ts).await?;
         let mut candidates = raw.messages.into_values().collect::<Vec<_>>();
-        if let Some(channel_messages) = raw.messages_data.get(channel) {
+        if let Some(channel_messages) = raw.messages_data.get(&channel) {
             candidates.extend(channel_messages.messages.iter().cloned());
         }
         if candidates
@@ -159,7 +283,7 @@ impl SlackService {
         candidates
             .into_iter()
             .find(|message| message.ts == message_ts)
-            .map(|message| normalize_message(channel, message))
+            .map(|message| normalize_message(&channel, message))
             .ok_or(Error::NotFound {
                 resource: "Slack message",
             })
@@ -205,7 +329,7 @@ impl SlackService {
                     users.push(normalize_user(raw_user));
                 }
             }
-            let next = nonempty(page.response_metadata.next_cursor);
+            let next = response_cursor("users.list", page.response_metadata.next_cursor)?;
             let Some(next) = next else {
                 return Ok(UserSearchReport {
                     query,
@@ -235,6 +359,208 @@ impl SlackService {
         }
         unreachable!("bounded user page loop always returns")
     }
+
+    async fn resolve_conversation_id(&self, reference: &str) -> Result<String> {
+        if is_valid_any_conversation_id(reference) {
+            return Ok(reference.to_owned());
+        }
+        let needle = validate_conversation_reference(reference)?.to_lowercase();
+        let user_directory = self.load_user_directory().await?;
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut match_id: Option<String> = None;
+
+        for page_index in 0..MAX_CONVERSATION_PAGES {
+            let page = self
+                .api
+                .conversations_list(cursor.as_deref(), CONVERSATIONS_PAGE_SIZE)
+                .await?;
+            if page.channels.len() > CONVERSATIONS_PAGE_SIZE {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+            for conversation in normalize_conversations(page.channels, &user_directory.users)? {
+                if conversation_matches_exactly(&conversation, &needle) {
+                    if match_id.as_deref().is_some_and(|id| id != conversation.id) {
+                        return Err(Error::invalid_input(
+                            "conversation",
+                            "matches more than one Slack conversation; use its ID",
+                        ));
+                    }
+                    match_id = Some(conversation.id);
+                }
+            }
+            let next = response_cursor("conversations.list", page.response_metadata.next_cursor)?;
+            let Some(next) = next else {
+                if !user_directory.complete {
+                    return Err(Error::ScanLimit {
+                        resource: "Slack conversation",
+                        limit: USERS_PAGE_SIZE * MAX_USER_PAGES,
+                    });
+                }
+                return match_id.ok_or(Error::NotFound {
+                    resource: "Slack conversation",
+                });
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+            cursor = Some(next);
+            if page_index + 1 == MAX_CONVERSATION_PAGES {
+                return Err(Error::ScanLimit {
+                    resource: "Slack conversation",
+                    limit: CONVERSATIONS_PAGE_SIZE * MAX_CONVERSATION_PAGES,
+                });
+            }
+        }
+        unreachable!("bounded conversation resolver loop always returns")
+    }
+
+    async fn load_user_directory(&self) -> Result<UserDirectory> {
+        let mut users = HashMap::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+
+        for page_index in 0..MAX_USER_PAGES {
+            let page = self
+                .api
+                .users_list(cursor.as_deref(), USERS_PAGE_SIZE)
+                .await?;
+            if page.members.len() > USERS_PAGE_SIZE {
+                return Err(Error::InvalidResponse {
+                    method: "users.list",
+                });
+            }
+            for raw_user in page.members {
+                if !is_valid_user_id(&raw_user.id) {
+                    return Err(Error::InvalidResponse {
+                        method: "users.list",
+                    });
+                }
+                let user = normalize_user(raw_user);
+                users.insert(user.id.clone(), user);
+            }
+            let next = response_cursor("users.list", page.response_metadata.next_cursor)?;
+            let Some(next) = next else {
+                return Ok(UserDirectory {
+                    users,
+                    complete: true,
+                });
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(Error::InvalidResponse {
+                    method: "users.list",
+                });
+            }
+            cursor = Some(next);
+            if page_index + 1 == MAX_USER_PAGES {
+                return Ok(UserDirectory {
+                    users,
+                    complete: false,
+                });
+            }
+        }
+        unreachable!("bounded user directory loop always returns")
+    }
+}
+
+fn normalize_conversations(
+    conversations: Vec<RawConversation>,
+    users: &HashMap<String, User>,
+) -> Result<Vec<Conversation>> {
+    conversations
+        .into_iter()
+        .map(|raw| {
+            if raw.is_im && raw.is_mpim {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+            let kind = if raw.is_im {
+                ConversationKind::DirectMessage
+            } else if raw.is_mpim {
+                ConversationKind::GroupDirectMessage
+            } else {
+                ConversationKind::Channel
+            };
+            if !is_valid_conversation_id(&raw.id, kind) {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+
+            let (name, display_name, user_id) = if kind == ConversationKind::DirectMessage {
+                let user_id =
+                    raw.user
+                        .filter(|id| is_valid_user_id(id))
+                        .ok_or(Error::InvalidResponse {
+                            method: "conversations.list",
+                        })?;
+                let user = users.get(&user_id);
+                let name = user
+                    .map(|user| user.name.trim())
+                    .filter(|name| is_valid_conversation_name(name))
+                    .unwrap_or(&user_id)
+                    .to_owned();
+                let display_name = user
+                    .and_then(|user| {
+                        [
+                            user.display_name.trim(),
+                            user.real_name.trim(),
+                            user.name.trim(),
+                        ]
+                        .into_iter()
+                        .find(|value| is_valid_conversation_name(value))
+                    })
+                    .unwrap_or(&user_id)
+                    .to_owned();
+                (name, display_name, Some(user_id))
+            } else {
+                let name = raw.name.trim();
+                if !is_valid_conversation_name(name) {
+                    return Err(Error::InvalidResponse {
+                        method: "conversations.list",
+                    });
+                }
+                (name.to_owned(), name.to_owned(), None)
+            };
+
+            Ok(Conversation {
+                id: raw.id,
+                name,
+                display_name,
+                kind,
+                is_private: raw.is_private || kind != ConversationKind::Channel,
+                is_archived: raw.is_archived,
+                is_member: raw.is_member,
+                member_count: raw.num_members,
+                user_id,
+            })
+        })
+        .collect()
+}
+
+fn conversation_matches(conversation: &Conversation, needle: &str) -> bool {
+    [
+        conversation.id.as_str(),
+        conversation.name.as_str(),
+        conversation.display_name.as_str(),
+        conversation.user_id.as_deref().unwrap_or_default(),
+    ]
+    .iter()
+    .any(|candidate| candidate.to_lowercase().contains(needle))
+}
+
+fn conversation_matches_exactly(conversation: &Conversation, needle: &str) -> bool {
+    [
+        conversation.name.as_str(),
+        conversation.display_name.as_str(),
+    ]
+    .iter()
+    .any(|candidate| candidate.to_lowercase() == needle)
 }
 
 fn append_unreads(
@@ -349,14 +675,35 @@ fn user_matches(user: &RawUser, needle: &str) -> bool {
     .any(|candidate| candidate.to_lowercase().contains(needle))
 }
 
-fn validate_channel(channel: &str) -> Result<()> {
-    if !(2..=64).contains(&channel.len())
-        || !matches!(channel.as_bytes().first(), Some(b'C' | b'D' | b'G'))
-        || !channel.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    {
+fn validate_conversation_reference(reference: &str) -> Result<String> {
+    let reference = reference.trim();
+    let reference = reference
+        .strip_prefix('#')
+        .or_else(|| reference.strip_prefix('@'))
+        .unwrap_or(reference)
+        .trim();
+    if !is_valid_conversation_name(reference) {
         return Err(Error::invalid_input(
-            "channel_id",
-            "must be a Slack channel, DM, or group-DM ID",
+            "conversation",
+            "must be a Slack conversation ID or a 1 to 128 character name",
+        ));
+    }
+    Ok(reference.to_owned())
+}
+
+fn is_valid_conversation_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
+}
+
+fn validate_cursor(cursor: Option<&str>) -> Result<()> {
+    if cursor.is_some_and(|cursor| {
+        cursor.is_empty()
+            || cursor.len() > 2048
+            || cursor.chars().any(|character| character.is_control())
+    }) {
+        return Err(Error::invalid_input(
+            "cursor",
+            "must contain 1 to 2048 non-control characters",
         ));
     }
     Ok(())
@@ -426,8 +773,14 @@ fn validate_limit(field: &'static str, limit: usize, maximum: usize) -> Result<(
     Ok(())
 }
 
-fn nonempty(value: String) -> Option<String> {
-    (!value.trim().is_empty()).then_some(value)
+fn response_cursor(method: &'static str, value: String) -> Result<Option<String>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 2048 || value.chars().any(char::is_control) {
+        return Err(Error::InvalidResponse { method });
+    }
+    Ok(Some(value))
 }
 
 #[cfg(test)]
@@ -441,8 +794,8 @@ mod tests {
 
     use super::*;
     use crate::model::{
-        RawChannelMessages, RawFile, RawReaction, RawResponseMetadata, RawThreadCounts, RawUnread,
-        RawUserProfile,
+        RawChannelMessages, RawConversation, RawConversationsPage, RawFile, RawReaction,
+        RawResponseMetadata, RawThreadCounts, RawUnread, RawUserProfile,
     };
 
     struct FakeApi {
@@ -450,6 +803,7 @@ mod tests {
         history: RawMessagePage,
         replies: RawMessagePage,
         message_list: RawMessagesList,
+        conversation_pages: Mutex<VecDeque<RawConversationsPage>>,
         user_pages: Mutex<VecDeque<RawUsersPage>>,
     }
 
@@ -482,6 +836,19 @@ mod tests {
             _message_ts: &str,
         ) -> Result<RawMessagesList> {
             Ok(self.message_list.clone())
+        }
+
+        async fn conversations_list(
+            &self,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<RawConversationsPage> {
+            Ok(self
+                .conversation_pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
         }
 
         async fn users_list(&self, _cursor: Option<&str>, _limit: usize) -> Result<RawUsersPage> {
@@ -527,6 +894,14 @@ mod tests {
             Err(Error::Authentication)
         }
 
+        async fn conversations_list(
+            &self,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<RawConversationsPage> {
+            Err(Error::Authentication)
+        }
+
         async fn users_list(&self, _cursor: Option<&str>, _limit: usize) -> Result<RawUsersPage> {
             Err(Error::Authentication)
         }
@@ -547,6 +922,7 @@ mod tests {
             history: RawMessagePage::default(),
             replies: RawMessagePage::default(),
             message_list: RawMessagesList::default(),
+            conversation_pages: Mutex::new(VecDeque::new()),
             user_pages: Mutex::new(VecDeque::new()),
         }
     }
@@ -598,6 +974,16 @@ mod tests {
                 ..RawUserProfile::default()
             },
             ..RawUser::default()
+        }
+    }
+
+    fn raw_conversation(id: &str, name: &str) -> RawConversation {
+        RawConversation {
+            id: id.into(),
+            name: name.into(),
+            is_member: true,
+            num_members: Some(7),
+            ..RawConversation::default()
         }
     }
 
@@ -700,6 +1086,333 @@ mod tests {
         assert!(matches!(
             service(FailApi).doctor().await,
             Err(Error::Authentication)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lists_and_normalizes_all_conversation_kinds() {
+        let mut api = fake_api();
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                RawConversation {
+                    is_private: true,
+                    ..raw_conversation("CGENERAL", "general")
+                },
+                RawConversation {
+                    id: "DALI".into(),
+                    is_im: true,
+                    user: Some("WALI".into()),
+                    ..RawConversation::default()
+                },
+                RawConversation {
+                    is_mpim: true,
+                    ..raw_conversation("GTEAM", "mpdm-alice--bob-1")
+                },
+            ],
+            response_metadata: RawResponseMetadata {
+                next_cursor: "next-page".into(),
+            },
+        }]));
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("WALI", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
+
+        let page = service(api)
+            .list_conversations(Some("start-page"), 3)
+            .await
+            .unwrap();
+        assert_eq!(page.conversations.len(), 3);
+        assert_eq!(page.conversations[0].name, "general");
+        assert_eq!(page.conversations[1].kind, ConversationKind::DirectMessage);
+        assert_eq!(page.conversations[1].name, "alice");
+        assert_eq!(page.conversations[1].display_name, "Alice Example");
+        assert_eq!(page.conversations[1].user_id.as_deref(), Some("WALI"));
+        assert_eq!(
+            page.conversations[2].kind,
+            ConversationKind::GroupDirectMessage
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
+    }
+
+    #[tokio::test]
+    async fn dm_without_loaded_user_metadata_has_a_stable_fallback() {
+        let mut api = fake_api();
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![RawConversation {
+                id: "DMISSING".into(),
+                is_im: true,
+                user: Some("UMISSING".into()),
+                ..RawConversation::default()
+            }],
+            ..RawConversationsPage::default()
+        }]));
+        let page = service(api).list_conversations(None, 1).await.unwrap();
+        assert_eq!(page.conversations[0].name, "UMISSING");
+        assert_eq!(page.conversations[0].display_name, "UMISSING");
+    }
+
+    #[tokio::test]
+    async fn finds_conversations_across_pages_and_reports_result_truncation() {
+        let mut api = fake_api();
+        api.conversation_pages = Mutex::new(VecDeque::from([
+            RawConversationsPage {
+                channels: vec![raw_conversation("COTHER", "other")],
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "page-2".into(),
+                },
+            },
+            RawConversationsPage {
+                channels: vec![
+                    raw_conversation("CTARGET1", "target-one"),
+                    raw_conversation("CTARGET2", "target-two"),
+                ],
+                ..RawConversationsPage::default()
+            },
+        ]));
+        let report = service(api)
+            .find_conversations(" target ", 1)
+            .await
+            .unwrap();
+        assert_eq!(report.query, "target");
+        assert_eq!(report.conversations[0].id, "CTARGET1");
+        assert!(report.truncated);
+        assert_eq!(
+            report.truncation_reason,
+            Some(ConversationSearchTruncationReason::ResultLimit)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_repeated_conversation_cursors() {
+        let mut api = fake_api();
+        api.conversation_pages = Mutex::new(VecDeque::from([
+            RawConversationsPage {
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "same".into(),
+                },
+                ..RawConversationsPage::default()
+            },
+            RawConversationsPage {
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "same".into(),
+                },
+                ..RawConversationsPage::default()
+            },
+        ]));
+        assert!(matches!(
+            service(api).find_conversations("missing", 10).await,
+            Err(Error::InvalidResponse {
+                method: "conversations.list"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_slack_response_cursors() {
+        let mut list_api = fake_api();
+        list_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            response_metadata: RawResponseMetadata {
+                next_cursor: "bad\ncursor".into(),
+            },
+            ..RawConversationsPage::default()
+        }]));
+        assert!(matches!(
+            service(list_api).list_conversations(None, 10).await,
+            Err(Error::InvalidResponse {
+                method: "conversations.list"
+            })
+        ));
+
+        let mut find_api = fake_api();
+        find_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            response_metadata: RawResponseMetadata {
+                next_cursor: "x".repeat(2049),
+            },
+            ..RawConversationsPage::default()
+        }]));
+        assert!(matches!(
+            service(find_api).find_conversations("missing", 10).await,
+            Err(Error::InvalidResponse {
+                method: "conversations.list"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_user_enrichment_keeps_find_results_truthfully_truncated() {
+        fn incomplete_user_pages() -> VecDeque<RawUsersPage> {
+            (0..MAX_USER_PAGES)
+                .map(|page| RawUsersPage {
+                    response_metadata: RawResponseMetadata {
+                        next_cursor: format!("user-page-{page}"),
+                    },
+                    ..RawUsersPage::default()
+                })
+                .collect()
+        }
+
+        let mut empty_api = fake_api();
+        empty_api.user_pages = Mutex::new(incomplete_user_pages());
+        empty_api.conversation_pages =
+            Mutex::new(VecDeque::from([RawConversationsPage::default()]));
+        let empty = service(empty_api)
+            .find_conversations("missing", 10)
+            .await
+            .unwrap();
+        assert!(empty.conversations.is_empty());
+        assert!(empty.truncated);
+        assert_eq!(
+            empty.truncation_reason,
+            Some(ConversationSearchTruncationReason::ScanLimit)
+        );
+
+        let mut retained_api = fake_api();
+        retained_api.user_pages = Mutex::new(incomplete_user_pages());
+        retained_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("CTARGET", "target")],
+            ..RawConversationsPage::default()
+        }]));
+        let retained = service(retained_api)
+            .find_conversations("target", 10)
+            .await
+            .unwrap();
+        assert_eq!(retained.conversations.len(), 1);
+        assert!(retained.truncated);
+        assert_eq!(
+            retained.truncation_reason,
+            Some(ConversationSearchTruncationReason::ScanLimit)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_never_claims_certainty_past_either_scan_cap() {
+        let mut incomplete_users_api = fake_api();
+        incomplete_users_api.user_pages = Mutex::new(
+            (0..MAX_USER_PAGES)
+                .map(|page| RawUsersPage {
+                    response_metadata: RawResponseMetadata {
+                        next_cursor: format!("user-page-{page}"),
+                    },
+                    ..RawUsersPage::default()
+                })
+                .collect(),
+        );
+        incomplete_users_api.conversation_pages =
+            Mutex::new(VecDeque::from([RawConversationsPage {
+                channels: vec![raw_conversation("CGENERAL", "general")],
+                ..RawConversationsPage::default()
+            }]));
+        assert!(matches!(
+            service(incomplete_users_api)
+                .read_channel("general", 1)
+                .await,
+            Err(Error::ScanLimit {
+                resource: "Slack conversation",
+                ..
+            })
+        ));
+
+        let mut conversation_pages = VecDeque::new();
+        for page in 0..MAX_CONVERSATION_PAGES {
+            conversation_pages.push_back(RawConversationsPage {
+                channels: (page == 0)
+                    .then(|| raw_conversation("CGENERAL", "general"))
+                    .into_iter()
+                    .collect(),
+                response_metadata: RawResponseMetadata {
+                    next_cursor: format!("conversation-page-{page}"),
+                },
+            });
+        }
+        let mut incomplete_conversations_api = fake_api();
+        incomplete_conversations_api.conversation_pages = Mutex::new(conversation_pages);
+        assert!(matches!(
+            service(incomplete_conversations_api)
+                .read_channel("general", 1)
+                .await,
+            Err(Error::ScanLimit {
+                resource: "Slack conversation",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolves_exact_names_but_keeps_ids_on_the_fast_path() {
+        let mut id_api = fake_api();
+        id_api.history.messages = vec![raw_message("100.000001", "by id")];
+        let id_page = service(id_api).read_channel("CGENERAL", 1).await.unwrap();
+        assert_eq!(id_page.channel_id, "CGENERAL");
+
+        let mut name_api = fake_api();
+        name_api.history.messages = vec![raw_message("100.000001", "by name")];
+        name_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("CGENERAL", "general")],
+            ..RawConversationsPage::default()
+        }]));
+        let name_page = service(name_api).read_channel("#GENERAL", 1).await.unwrap();
+        assert_eq!(name_page.channel_id, "CGENERAL");
+        assert_eq!(name_page.messages[0].text, "by name");
+    }
+
+    #[tokio::test]
+    async fn rejects_ambiguous_or_missing_conversation_names() {
+        let mut ambiguous_api = fake_api();
+        ambiguous_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                raw_conversation("CONE", "shared"),
+                raw_conversation("CTWO", "SHARED"),
+            ],
+            ..RawConversationsPage::default()
+        }]));
+        assert!(matches!(
+            service(ambiguous_api).read_channel("shared", 1).await,
+            Err(Error::InvalidInput {
+                field: "conversation",
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            service(fake_api()).read_channel("missing", 1).await,
+            Err(Error::NotFound {
+                resource: "Slack conversation"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn validates_conversation_pages_and_inputs() {
+        let slack_service = service(fake_api());
+        assert!(matches!(
+            slack_service.list_conversations(Some(""), 1).await,
+            Err(Error::InvalidInput {
+                field: "cursor",
+                ..
+            })
+        ));
+        assert!(matches!(
+            slack_service.list_conversations(None, 201).await,
+            Err(Error::InvalidInput { field: "limit", .. })
+        ));
+
+        let mut malformed_api = fake_api();
+        malformed_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![RawConversation {
+                id: "DBAD".into(),
+                is_im: true,
+                user: None,
+                ..RawConversation::default()
+            }],
+            ..RawConversationsPage::default()
+        }]));
+        assert!(matches!(
+            service(malformed_api).list_conversations(None, 1).await,
+            Err(Error::InvalidResponse {
+                method: "conversations.list"
+            })
         ));
     }
 
@@ -896,9 +1609,9 @@ mod tests {
     async fn validates_all_external_inputs() {
         let service = service(fake_api());
         assert!(matches!(
-            service.read_channel("bad", 1).await,
+            service.read_channel("", 1).await,
             Err(Error::InvalidInput {
-                field: "channel_id",
+                field: "conversation",
                 ..
             })
         ));

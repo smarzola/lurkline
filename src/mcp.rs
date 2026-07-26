@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::Error,
-    model::{DoctorReport, Message, MessagePage, ThreadPage, UnreadReport, UserSearchReport},
+    model::{
+        ConversationPage, ConversationSearchReport, DoctorReport, Message, MessagePage, ThreadPage,
+        UnreadReport, UserSearchReport,
+    },
     service::SlackService,
 };
 
@@ -52,6 +55,24 @@ struct FindUsersRequest {
     limit: usize,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListConversationsRequest {
+    /// Opaque Slack cursor from a previous list response.
+    cursor: Option<String>,
+    /// Maximum conversations to return, from 1 through 200.
+    #[serde(default = "default_conversation_list_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FindConversationsRequest {
+    /// Case-insensitive substring matched against conversation IDs and names.
+    query: String,
+    /// Maximum conversations to return, from 1 through 100.
+    #[serde(default = "default_conversation_find_limit")]
+    limit: usize,
+}
+
 const fn default_channel_limit() -> usize {
     50
 }
@@ -61,6 +82,14 @@ const fn default_thread_limit() -> usize {
 }
 
 const fn default_user_limit() -> usize {
+    20
+}
+
+const fn default_conversation_list_limit() -> usize {
+    100
+}
+
+const fn default_conversation_find_limit() -> usize {
     20
 }
 
@@ -120,6 +149,7 @@ fn error_code(error: &Error) -> &'static str {
         Error::Timeout { .. } => "timeout",
         Error::Transport { .. } => "transport",
         Error::NotFound { .. } => "not_found",
+        Error::ScanLimit { .. } => "scan_limit",
         Error::Output => "output_serialization",
         Error::McpTransport => "mcp_transport",
     }
@@ -178,7 +208,53 @@ impl McpServer {
         tool_result(self.service.unreads().await)
     }
 
-    /// Read bounded recent history from one Slack channel, DM, or group DM.
+    /// List a bounded page of Slack channels, DMs, and group DMs with names.
+    #[tool(
+        name = "slack_list_conversations",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ConversationPage>>(),
+        annotations(
+            title = "List Slack conversations",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn list_conversations(
+        &self,
+        Parameters(request): Parameters<ListConversationsRequest>,
+    ) -> CallToolResult {
+        tool_result(
+            self.service
+                .list_conversations(request.cursor.as_deref(), request.limit)
+                .await,
+        )
+    }
+
+    /// Find Slack conversations by a bounded case-insensitive substring search.
+    #[tool(
+        name = "slack_find_conversations",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ConversationSearchReport>>(),
+        annotations(
+            title = "Find Slack conversations",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn find_conversations(
+        &self,
+        Parameters(request): Parameters<FindConversationsRequest>,
+    ) -> CallToolResult {
+        tool_result(
+            self.service
+                .find_conversations(&request.query, request.limit)
+                .await,
+        )
+    }
+
+    /// Read bounded recent history using a Slack conversation ID or exact name.
     #[tool(
         name = "slack_read_channel",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<MessagePage>>(),
@@ -201,7 +277,7 @@ impl McpServer {
         )
     }
 
-    /// Read a bounded Slack thread by its channel ID and root timestamp.
+    /// Read a bounded Slack thread by conversation ID or exact name and root timestamp.
     #[tool(
         name = "slack_read_thread",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ThreadPage>>(),
@@ -224,7 +300,7 @@ impl McpServer {
         )
     }
 
-    /// Fetch one exact Slack message by channel ID and message timestamp.
+    /// Fetch one exact Slack message by conversation ID or exact name and timestamp.
     #[tool(
         name = "slack_get_message",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<Message>>(),
@@ -299,7 +375,8 @@ mod tests {
         config::Config,
         error::Result,
         model::{
-            ClientCountsPayload, RawMessagePage, RawMessagesList, RawThreadCounts, RawUsersPage,
+            ClientCountsPayload, RawConversationsPage, RawMessagePage, RawMessagesList,
+            RawThreadCounts, RawUsersPage,
         },
         service::SlackApi,
     };
@@ -342,8 +419,16 @@ mod tests {
             unreachable!("not called")
         }
 
+        async fn conversations_list(
+            &self,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<RawConversationsPage> {
+            Ok(RawConversationsPage::default())
+        }
+
         async fn users_list(&self, _cursor: Option<&str>, _limit: usize) -> Result<RawUsersPage> {
-            unreachable!("not called")
+            Ok(RawUsersPage::default())
         }
     }
 
@@ -377,8 +462,10 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from([
                 "slack_doctor",
+                "slack_find_conversations",
                 "slack_find_users",
                 "slack_get_message",
+                "slack_list_conversations",
                 "slack_list_unreads",
                 "slack_read_channel",
                 "slack_read_thread",
@@ -391,6 +478,21 @@ mod tests {
                         && annotations.destructive_hint == Some(false)
                 })
         }));
+
+        let conversations = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("slack_list_conversations"))
+            .await
+            .expect("conversation list call");
+        assert_eq!(conversations.is_error, Some(false));
+        assert_eq!(
+            conversations.structured_content,
+            Some(json!({
+                "conversations": [],
+                "has_more": false,
+                "next_cursor": null
+            }))
+        );
 
         let unreads = client
             .peer()
@@ -411,7 +513,7 @@ mod tests {
             }))
         );
 
-        let arguments = json!({"channel_id": "bad", "limit": 1})
+        let arguments = json!({"channel_id": "", "limit": 1})
             .as_object()
             .unwrap()
             .clone();
@@ -426,7 +528,7 @@ mod tests {
             Some(json!({
                 "error": {
                     "code": "invalid_input",
-                    "message": "invalid channel_id: must be a Slack channel, DM, or group-DM ID"
+                    "message": "invalid conversation: must be a Slack conversation ID or a 1 to 128 character name"
                 }
             }))
         );
@@ -435,7 +537,7 @@ mod tests {
             .first()
             .and_then(|content| content.as_text())
             .expect("error text");
-        assert!(invalid_text.text.contains("invalid channel_id"));
+        assert!(invalid_text.text.contains("invalid conversation"));
 
         client.cancel().await.expect("client closes");
         server_task.await.expect("server task");

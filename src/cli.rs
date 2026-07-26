@@ -7,10 +7,11 @@ use crate::{
     http::SlackHttpClient,
     mcp,
     model::{
-        ConversationKind, DoctorReport, Message, MessagePage, ThreadPage, UnreadReport,
-        UserSearchReport, UserSearchTruncationReason,
+        Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
+        ConversationSearchTruncationReason, DoctorReport, Message, MessagePage, ThreadPage,
+        UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
-    service::{MAX_USERS, SlackService},
+    service::{MAX_CONVERSATIONS, MAX_USERS, SlackService},
 };
 
 #[derive(Debug, Parser)]
@@ -37,6 +38,11 @@ pub enum Command {
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Discover channels, DMs, and group DMs by human-readable name.
+    Conversations {
+        #[command(subcommand)]
+        command: ConversationsCommand,
     },
     /// Read messages from a channel, DM, or group DM.
     Channel {
@@ -66,7 +72,7 @@ pub enum Command {
 pub enum ChannelCommand {
     /// Read recent channel history.
     Read {
-        /// Slack channel, DM, or group-DM ID.
+        /// Slack conversation ID or unambiguous exact name.
         channel_id: String,
         /// Maximum messages to return.
         #[arg(long, default_value_t = 50)]
@@ -81,7 +87,7 @@ pub enum ChannelCommand {
 pub enum ThreadCommand {
     /// Read a thread root and its replies.
     Read {
-        /// Slack channel, DM, or group-DM ID.
+        /// Slack conversation ID or unambiguous exact name.
         channel_id: String,
         /// Slack timestamp of the thread root.
         thread_ts: String,
@@ -98,10 +104,37 @@ pub enum ThreadCommand {
 pub enum MessageCommand {
     /// Fetch one message by channel ID and timestamp.
     Get {
-        /// Slack channel, DM, or group-DM ID.
+        /// Slack conversation ID or unambiguous exact name.
         channel_id: String,
         /// Exact Slack message timestamp.
         message_ts: String,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConversationsCommand {
+    /// List one cursor-paginated conversation page.
+    List {
+        /// Opaque Slack cursor from a previous list response.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum conversations to return.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find conversations by ID, name, or DM participant name.
+    Find {
+        /// Case-insensitive substring to find.
+        query: String,
+        /// Maximum conversations to return.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -130,6 +163,20 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Doctor { json } => print_doctor(service.doctor().await?, json),
         Command::Unreads { json } => print_unreads(service.unreads().await?, json),
+        Command::Conversations {
+            command:
+                ConversationsCommand::List {
+                    cursor,
+                    limit,
+                    json,
+                },
+        } => print_conversation_page(
+            service.list_conversations(cursor.as_deref(), limit).await?,
+            json,
+        ),
+        Command::Conversations {
+            command: ConversationsCommand::Find { query, limit, json },
+        } => print_conversations(service.find_conversations(&query, limit).await?, json),
         Command::Channel {
             command:
                 ChannelCommand::Read {
@@ -193,11 +240,7 @@ fn print_unreads(report: UnreadReport, json: bool) -> Result<()> {
         return Ok(());
     }
     for conversation in report.conversations {
-        let kind = match conversation.kind {
-            ConversationKind::Channel => "channel",
-            ConversationKind::DirectMessage => "dm",
-            ConversationKind::GroupDirectMessage => "group-dm",
-        };
+        let kind = conversation_kind_label(conversation.kind);
         println!(
             "{kind}\t{}\tmentions={}\tlast_read={}\tlatest={}",
             conversation.id,
@@ -214,6 +257,83 @@ fn print_unreads(report: UnreadReport, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn print_conversation_page(page: ConversationPage, json: bool) -> Result<()> {
+    if json {
+        return print_json(&page);
+    }
+    print_conversation_rows(&page.conversations);
+    if page.has_more {
+        println!(
+            "more\t{}",
+            page.next_cursor.as_deref().unwrap_or("available")
+        );
+    }
+    Ok(())
+}
+
+fn print_conversations(report: ConversationSearchReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    print_conversation_rows(&report.conversations);
+    if let Some(notice) = conversation_truncation_notice(&report) {
+        println!("{notice}");
+    }
+    Ok(())
+}
+
+fn print_conversation_rows(conversations: &[Conversation]) {
+    if conversations.is_empty() {
+        println!("No conversations matched.");
+        return;
+    }
+    for conversation in conversations {
+        let prefix = match conversation.kind {
+            ConversationKind::Channel => "#",
+            ConversationKind::DirectMessage => "@",
+            ConversationKind::GroupDirectMessage => "",
+        };
+        println!(
+            "{}\t{}\t{}{}\t{}",
+            conversation_kind_label(conversation.kind),
+            conversation.id,
+            prefix,
+            conversation.name,
+            conversation.display_name
+        );
+    }
+}
+
+fn conversation_kind_label(kind: ConversationKind) -> &'static str {
+    match kind {
+        ConversationKind::Channel => "channel",
+        ConversationKind::DirectMessage => "dm",
+        ConversationKind::GroupDirectMessage => "group-dm",
+    }
+}
+
+fn conversation_truncation_notice(report: &ConversationSearchReport) -> Option<String> {
+    match report.truncation_reason {
+        Some(ConversationSearchTruncationReason::ResultLimit)
+            if report.conversations.len() < MAX_CONVERSATIONS =>
+        {
+            Some(format!(
+                "Result limit reached after scanning {} conversations; raise --limit to return more matches.",
+                report.scanned_conversations
+            ))
+        }
+        Some(ConversationSearchTruncationReason::ResultLimit) => Some(format!(
+            "More matches exist after scanning {} conversations; the {}-result maximum was reached.",
+            report.scanned_conversations, MAX_CONVERSATIONS
+        )),
+        Some(ConversationSearchTruncationReason::ScanLimit) => Some(format!(
+            "Search stopped after scanning {} conversations (scan cap {}); matches may exist beyond the scanned pages.",
+            report.scanned_conversations, report.scan_limit
+        )),
+        None => None,
+    }
 }
 
 fn print_message_page(page: MessagePage, json: bool) -> Result<()> {
@@ -336,6 +456,35 @@ mod tests {
 
     #[test]
     fn parses_all_read_commands_and_bounds_flags() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "conversations",
+                "list",
+                "--cursor",
+                "next-page",
+                "--limit",
+                "12",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Conversations {
+                command: ConversationsCommand::List {
+                    cursor: Some(_),
+                    limit: 12,
+                    json: true
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lurkline", "conversations", "find", "general"])
+                .unwrap()
+                .command,
+            Command::Conversations {
+                command: ConversationsCommand::Find { limit: 20, .. }
+            }
+        ));
         assert!(matches!(
             Cli::try_parse_from([
                 "lurkline", "channel", "read", "C123", "--limit", "12", "--json"

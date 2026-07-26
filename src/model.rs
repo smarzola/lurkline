@@ -113,6 +113,34 @@ pub(crate) struct RawUsersPage {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawConversationsPage {
+    pub channels: Vec<RawConversation>,
+    #[serde(default)]
+    pub response_metadata: RawResponseMetadata,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawConversation {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub is_archived: bool,
+    #[serde(default)]
+    pub is_private: bool,
+    #[serde(default)]
+    pub is_member: bool,
+    #[serde(default)]
+    pub is_im: bool,
+    #[serde(default)]
+    pub is_mpim: bool,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub num_members: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawUser {
     pub id: String,
     #[serde(default)]
@@ -178,6 +206,43 @@ pub struct DoctorReport {
     pub authenticated: bool,
     pub team_id: String,
     pub workspace_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Conversation {
+    pub id: String,
+    pub name: String,
+    pub display_name: String,
+    pub kind: ConversationKind,
+    pub is_private: bool,
+    pub is_archived: bool,
+    pub is_member: bool,
+    pub member_count: Option<u64>,
+    pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ConversationPage {
+    pub conversations: Vec<Conversation>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ConversationSearchReport {
+    pub query: String,
+    pub conversations: Vec<Conversation>,
+    pub truncated: bool,
+    pub truncation_reason: Option<ConversationSearchTruncationReason>,
+    pub scanned_conversations: usize,
+    pub scan_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationSearchTruncationReason {
+    ResultLimit,
+    ScanLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
