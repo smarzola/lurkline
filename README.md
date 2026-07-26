@@ -1,9 +1,9 @@
 # lurkline
 
-`lurkline` gives humans and local agents read-only Slack access through a
-signed-in browser session. It provides a command-line interface (CLI) and a
-stdio Model Context Protocol (MCP) server without requiring a Slack app, bot,
-or OAuth flow.
+`lurkline` is for developers and local agent operators who need read-only
+Slack access through a signed-in browser session. It provides a command-line
+interface (CLI) and a stdio Model Context Protocol (MCP) server without
+requiring a Slack app, bot, or OAuth flow.
 
 Use `lurkline` to:
 
@@ -24,12 +24,12 @@ read.
 ## Quick start
 
 You need a signed-in Slack workspace and Chrome or another Chromium-based
-browser.
+browser. [Install `lurkline`](#install-lurkline) before you continue.
 
-1. Open the workspace and then open **Developer Tools > Network**.
+1. Open the workspace, open **Developer Tools**, and select **Network**.
 2. Reload Slack and select a successful `POST` request to
    `/api/client.counts` whose URL or form body contains `slack_route`.
-3. Right-click the request and select **Copy > Copy as cURL (bash)**.
+3. Right-click the request and select **Copy** > **Copy as cURL (bash)**.
 4. Import the copied request into a named profile:
 
    ```sh
@@ -285,7 +285,7 @@ lurkline inbox --conversations 20 --messages 50 --json
 ```
 
 Inbox ordering is deterministic: highest mention count first, then
-conversation ID. The operation:
+conversation ID. The operation does the following:
 
 1. Reads Slack's explicit unread conversation and thread counts.
 2. Selects at most the requested number of unread conversations.
@@ -354,6 +354,8 @@ Example MCP client configuration:
 Omit `--profile work` to use `LURKLINE_PROFILE` or the registry default. The MCP
 server and CLI resolve credentials through the same path.
 
+The following table maps common tasks to CLI commands and MCP tools:
+
 | Task | CLI command | MCP tool |
 | --- | --- | --- |
 | Validate the browser session | `lurkline doctor` | `slack_doctor` |
@@ -372,6 +374,8 @@ stderr. Every tool has a structured output schema and read-only annotation.
 
 ## Limits
 
+The following table lists the primary and auxiliary bounds for each operation:
+
 | Operation | Primary result bound | Auxiliary discovery bound |
 | --- | ---: | --- |
 | Conversation list | One page of 200 | Up to 20 user pages of 200 when the page contains DMs |
@@ -387,7 +391,9 @@ Opaque cursors are limited to 2,048 non-control characters. Repeated response
 cursors fail instead of creating pagination loops. Result JSON reports
 continuation or scan truncation where the underlying operation supports it.
 
-Optional request controls:
+### Optional: Configure request controls
+
+The following environment variables configure request limits:
 
 | Variable | Default | Accepted range |
 | --- | ---: | ---: |
