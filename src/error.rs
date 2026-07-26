@@ -29,6 +29,11 @@ pub enum Error {
     Transport { method: &'static str },
     #[error("{resource} was not found")]
     NotFound { resource: &'static str },
+    #[error("could not resolve {resource} within the {limit}-item scan limit")]
+    ScanLimit {
+        resource: &'static str,
+        limit: usize,
+    },
     #[error("could not serialize output")]
     Output,
     #[error("MCP stdio transport failed")]

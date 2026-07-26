@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
@@ -7,10 +9,11 @@ use crate::{
     http::SlackHttpClient,
     mcp,
     model::{
-        ConversationKind, DoctorReport, Message, MessagePage, ThreadPage, UnreadReport,
-        UserSearchReport, UserSearchTruncationReason,
+        Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
+        ConversationSearchTruncationReason, DoctorReport, InboxReport, Message, MessagePage,
+        MessageSearchPage, ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
-    service::{MAX_USERS, SlackService},
+    service::{MAX_CONVERSATIONS, MAX_USERS, SlackService},
 };
 
 #[derive(Debug, Parser)]
@@ -37,6 +40,28 @@ pub enum Command {
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Read a bounded snapshot of conversations Slack explicitly marks unread.
+    Inbox {
+        /// Maximum unread conversations to load, from 1 through 50.
+        #[arg(long = "conversations", default_value_t = 10)]
+        conversation_limit: usize,
+        /// Maximum recent messages to load per unread conversation, from 1 through 200.
+        #[arg(long = "messages", default_value_t = 20)]
+        message_limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Discover channels, DMs, and group DMs by human-readable name.
+    Conversations {
+        #[command(subcommand)]
+        command: ConversationsCommand,
+    },
+    /// Search workspace messages with bounded filters.
+    Search {
+        #[command(subcommand)]
+        command: SearchCommand,
     },
     /// Read messages from a channel, DM, or group DM.
     Channel {
@@ -66,11 +91,14 @@ pub enum Command {
 pub enum ChannelCommand {
     /// Read recent channel history.
     Read {
-        /// Slack channel, DM, or group-DM ID.
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
         channel_id: String,
-        /// Maximum messages to return.
+        /// Maximum messages to return, from 1 through 200.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Opaque Slack cursor from a previous channel response.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -81,13 +109,16 @@ pub enum ChannelCommand {
 pub enum ThreadCommand {
     /// Read a thread root and its replies.
     Read {
-        /// Slack channel, DM, or group-DM ID.
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
         channel_id: String,
         /// Slack timestamp of the thread root.
         thread_ts: String,
-        /// Maximum messages to return.
+        /// Maximum messages to return, from 1 through 200.
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Opaque Slack cursor from a previous thread response.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -96,12 +127,66 @@ pub enum ThreadCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum MessageCommand {
-    /// Fetch one message by channel ID and timestamp.
+    /// Fetch one message by conversation ID or exact name and timestamp.
     Get {
-        /// Slack channel, DM, or group-DM ID.
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
         channel_id: String,
         /// Exact Slack message timestamp.
         message_ts: String,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConversationsCommand {
+    /// List one cursor-paginated conversation page.
+    List {
+        /// Opaque Slack cursor from a previous list response.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum conversations to return, from 1 through 200.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find conversations by ID, name, or DM participant name.
+    Find {
+        /// Case-insensitive substring to find.
+        query: String,
+        /// Maximum conversations to return, from 1 through 100.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SearchCommand {
+    /// Search messages newest first.
+    Messages {
+        /// Slack search text; standard Slack query modifiers are accepted.
+        query: String,
+        /// Restrict to an ID or exact name; use # or @ to force a colliding name.
+        #[arg(long = "in")]
+        conversation: Option<String>,
+        /// Restrict to messages after this YYYY-MM-DD date.
+        #[arg(long)]
+        after: Option<String>,
+        /// Restrict to messages before this YYYY-MM-DD date.
+        #[arg(long)]
+        before: Option<String>,
+        /// Opaque Slack cursor from a previous search response.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum matching messages to return, from 1 through 100.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -114,7 +199,7 @@ pub enum UsersCommand {
     Find {
         /// Case-insensitive substring to find.
         query: String,
-        /// Maximum users to return.
+        /// Maximum users to return, from 1 through 100.
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Emit stable JSON.
@@ -130,24 +215,79 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Doctor { json } => print_doctor(service.doctor().await?, json),
         Command::Unreads { json } => print_unreads(service.unreads().await?, json),
+        Command::Inbox {
+            conversation_limit,
+            message_limit,
+            json,
+        } => print_inbox(
+            service.inbox(conversation_limit, message_limit).await?,
+            json,
+        ),
+        Command::Conversations {
+            command:
+                ConversationsCommand::List {
+                    cursor,
+                    limit,
+                    json,
+                },
+        } => print_conversation_page(
+            service.list_conversations(cursor.as_deref(), limit).await?,
+            json,
+        ),
+        Command::Conversations {
+            command: ConversationsCommand::Find { query, limit, json },
+        } => print_conversations(service.find_conversations(&query, limit).await?, json),
+        Command::Search {
+            command:
+                SearchCommand::Messages {
+                    query,
+                    conversation,
+                    after,
+                    before,
+                    cursor,
+                    limit,
+                    json,
+                },
+        } => print_message_search(
+            service
+                .search_messages(
+                    &query,
+                    conversation.as_deref(),
+                    after.as_deref(),
+                    before.as_deref(),
+                    cursor.as_deref(),
+                    limit,
+                )
+                .await?,
+            json,
+        ),
         Command::Channel {
             command:
                 ChannelCommand::Read {
                     channel_id,
+                    cursor,
                     limit,
                     json,
                 },
-        } => print_message_page(service.read_channel(&channel_id, limit).await?, json),
+        } => print_message_page(
+            service
+                .read_channel(&channel_id, cursor.as_deref(), limit)
+                .await?,
+            json,
+        ),
         Command::Thread {
             command:
                 ThreadCommand::Read {
                     channel_id,
                     thread_ts,
+                    cursor,
                     limit,
                     json,
                 },
         } => print_thread_page(
-            service.read_thread(&channel_id, &thread_ts, limit).await?,
+            service
+                .read_thread(&channel_id, &thread_ts, cursor.as_deref(), limit)
+                .await?,
             json,
         ),
         Command::Message {
@@ -193,17 +333,13 @@ fn print_unreads(report: UnreadReport, json: bool) -> Result<()> {
         return Ok(());
     }
     for conversation in report.conversations {
-        let kind = match conversation.kind {
-            ConversationKind::Channel => "channel",
-            ConversationKind::DirectMessage => "dm",
-            ConversationKind::GroupDirectMessage => "group-dm",
-        };
+        let kind = conversation_kind_label(conversation.kind);
         println!(
             "{kind}\t{}\tmentions={}\tlast_read={}\tlatest={}",
             conversation.id,
             conversation.mention_count,
-            conversation.last_read.as_deref().unwrap_or("-"),
-            conversation.latest.as_deref().unwrap_or("-")
+            escape_human(conversation.last_read.as_deref().unwrap_or("-")),
+            escape_human(conversation.latest.as_deref().unwrap_or("-"))
         );
     }
     if report.threads.has_unreads {
@@ -211,6 +347,146 @@ fn print_unreads(report: UnreadReport, json: bool) -> Result<()> {
             "threads\tchannels={}\tmentions={}",
             report.threads.unread_count_by_channel.len(),
             report.threads.mention_count
+        );
+    }
+    Ok(())
+}
+
+fn print_inbox(report: InboxReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    if report.conversations.is_empty() && !report.threads.has_unreads {
+        println!("Inbox is clear.");
+        return Ok(());
+    }
+    let shown_conversations = report.conversations.len();
+    for entry in report.conversations {
+        println!(
+            "{}\t{}\t{}\tmentions={}",
+            conversation_kind_label(entry.conversation.kind),
+            entry.conversation.id,
+            escape_human(&entry.conversation.display_name),
+            entry.unread.mention_count
+        );
+        print_messages(&entry.messages.messages);
+        if entry.messages.has_more {
+            println!(
+                "more\t{}\t{}",
+                entry.conversation.id,
+                entry.messages.next_cursor.as_deref().unwrap_or("available")
+            );
+        }
+    }
+    if report.has_more_conversations {
+        println!(
+            "more-conversations\tshown={}\ttotal={}",
+            shown_conversations, report.total_unread_conversations
+        );
+    }
+    if report.threads.has_unreads {
+        println!(
+            "threads\tchannels={}\tmentions={}",
+            report.threads.unread_count_by_channel.len(),
+            report.threads.mention_count
+        );
+    }
+    Ok(())
+}
+
+fn print_conversation_page(page: ConversationPage, json: bool) -> Result<()> {
+    if json {
+        return print_json(&page);
+    }
+    print_conversation_rows(&page.conversations);
+    if page.has_more {
+        println!(
+            "more\t{}",
+            page.next_cursor.as_deref().unwrap_or("available")
+        );
+    }
+    Ok(())
+}
+
+fn print_conversations(report: ConversationSearchReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    print_conversation_rows(&report.conversations);
+    if let Some(notice) = conversation_truncation_notice(&report) {
+        println!("{notice}");
+    }
+    Ok(())
+}
+
+fn print_conversation_rows(conversations: &[Conversation]) {
+    if conversations.is_empty() {
+        println!("No conversations matched.");
+        return;
+    }
+    for conversation in conversations {
+        let prefix = match conversation.kind {
+            ConversationKind::Channel => "#",
+            ConversationKind::DirectMessage => "@",
+            ConversationKind::GroupDirectMessage => "",
+        };
+        println!(
+            "{}\t{}\t{}{}\t{}",
+            conversation_kind_label(conversation.kind),
+            conversation.id,
+            prefix,
+            escape_human(&conversation.name),
+            escape_human(&conversation.display_name)
+        );
+    }
+}
+
+fn conversation_kind_label(kind: ConversationKind) -> &'static str {
+    match kind {
+        ConversationKind::Channel => "channel",
+        ConversationKind::DirectMessage => "dm",
+        ConversationKind::GroupDirectMessage => "group-dm",
+    }
+}
+
+fn conversation_truncation_notice(report: &ConversationSearchReport) -> Option<String> {
+    match report.truncation_reason {
+        Some(ConversationSearchTruncationReason::ResultLimit)
+            if report.conversations.len() < MAX_CONVERSATIONS =>
+        {
+            Some(format!(
+                "Result limit reached after scanning {} conversations; raise --limit to return more matches.",
+                report.scanned_conversations
+            ))
+        }
+        Some(ConversationSearchTruncationReason::ResultLimit) => Some(format!(
+            "More matches exist after scanning {} conversations; the {}-result maximum was reached.",
+            report.scanned_conversations, MAX_CONVERSATIONS
+        )),
+        Some(ConversationSearchTruncationReason::ScanLimit) => Some(format!(
+            "Search stopped after scanning {} conversations (scan cap {}); matches may exist beyond the scanned pages.",
+            report.scanned_conversations, report.scan_limit
+        )),
+        None => None,
+    }
+}
+
+fn print_message_search(page: MessageSearchPage, json: bool) -> Result<()> {
+    if json {
+        return print_json(&page);
+    }
+    if page.matches.is_empty() {
+        println!("No messages matched.");
+    } else {
+        for message in &page.matches {
+            println!("{}", format_search_match(message));
+        }
+    }
+    println!("total\t{}", page.total);
+    if page.has_more {
+        println!(
+            "more\t{}",
+            page.next_cursor.as_deref().unwrap_or("available")
         );
     }
     Ok(())
@@ -259,12 +535,14 @@ fn print_messages(messages: &[Message]) {
         return;
     }
     for message in messages {
-        let author = message
-            .author_id
-            .as_deref()
-            .or(message.author_name.as_deref())
-            .unwrap_or("-");
-        let text = message.text.replace('\n', "\\n").replace('\t', "\\t");
+        let author = escape_human(
+            message
+                .author_id
+                .as_deref()
+                .or(message.author_name.as_deref())
+                .unwrap_or("-"),
+        );
+        let text = escape_human(&message.text);
         println!(
             "{}\t{}\t{}\treplies={}",
             message.ts, author, text, message.reply_count
@@ -282,7 +560,10 @@ fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
         for user in &report.users {
             println!(
                 "{}\t@{}\t{}\t{}",
-                user.id, user.name, user.display_name, user.real_name
+                user.id,
+                escape_human(&user.name),
+                escape_human(&user.display_name),
+                escape_human(&user.real_name)
             );
         }
     }
@@ -290,6 +571,39 @@ fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
         println!("{notice}");
     }
     Ok(())
+}
+
+fn format_search_match(message: &crate::model::MessageSearchMatch) -> String {
+    let author = message
+        .author_id
+        .as_deref()
+        .or(message.author_name.as_deref())
+        .unwrap_or("-");
+    format!(
+        "{}\t{}\t{}\t{}\t{}",
+        escape_human(&message.ts),
+        escape_human(&message.channel_id),
+        escape_human(&message.channel_name),
+        escape_human(author),
+        escape_human(&message.text)
+    )
+}
+
+fn escape_human(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                write!(&mut escaped, "\\u{{{:x}}}", character as u32)
+                    .expect("writing to a String cannot fail");
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn user_truncation_notice(report: &UserSearchReport) -> Option<String> {
@@ -332,18 +646,83 @@ mod tests {
                 .command,
             Command::Unreads { json: false }
         ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "inbox",
+                "--conversations",
+                "4",
+                "--messages",
+                "8",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Inbox {
+                conversation_limit: 4,
+                message_limit: 8,
+                json: true
+            }
+        ));
     }
 
     #[test]
     fn parses_all_read_commands_and_bounds_flags() {
         assert!(matches!(
             Cli::try_parse_from([
-                "lurkline", "channel", "read", "C123", "--limit", "12", "--json"
+                "lurkline",
+                "conversations",
+                "list",
+                "--cursor",
+                "next-page",
+                "--limit",
+                "12",
+                "--json"
             ])
             .unwrap()
             .command,
-            Command::Channel {
-                command: ChannelCommand::Read {
+            Command::Conversations {
+                command: ConversationsCommand::List {
+                    cursor: Some(_),
+                    limit: 12,
+                    json: true
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lurkline", "conversations", "find", "general"])
+                .unwrap()
+                .command,
+            Command::Conversations {
+                command: ConversationsCommand::Find { limit: 20, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "search",
+                "messages",
+                "deploy",
+                "--in",
+                "general",
+                "--after",
+                "2026-01-01",
+                "--before",
+                "2026-02-01",
+                "--cursor",
+                "next",
+                "--limit",
+                "12",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Search {
+                command: SearchCommand::Messages {
+                    conversation: Some(_),
+                    after: Some(_),
+                    before: Some(_),
+                    cursor: Some(_),
                     limit: 12,
                     json: true,
                     ..
@@ -351,11 +730,46 @@ mod tests {
             }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["lurkline", "thread", "read", "C123", "100.000001"])
-                .unwrap()
-                .command,
+            Cli::try_parse_from([
+                "lurkline",
+                "channel",
+                "read",
+                "C123",
+                "--cursor",
+                "channel-next",
+                "--limit",
+                "12",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Channel {
+                command: ChannelCommand::Read {
+                    cursor: Some(_),
+                    limit: 12,
+                    json: true,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "thread",
+                "read",
+                "C123",
+                "100.000001",
+                "--cursor",
+                "thread-next"
+            ])
+            .unwrap()
+            .command,
             Command::Thread {
-                command: ThreadCommand::Read { limit: 100, .. }
+                command: ThreadCommand::Read {
+                    cursor: Some(_),
+                    limit: 100,
+                    ..
+                }
             }
         ));
         assert!(matches!(
@@ -421,5 +835,38 @@ mod tests {
         let notice = user_truncation_notice(&report).unwrap();
         assert!(notice.contains("100-result maximum"));
         assert!(!notice.contains("raise --limit"));
+    }
+
+    #[test]
+    fn escapes_every_control_character_in_human_output() {
+        assert_eq!(
+            escape_human("plain\r\x1b\n\t\u{8}text"),
+            "plain\\r\\u{1b}\\n\\t\\u{8}text"
+        );
+        assert_eq!(escape_human("café 🚀"), "café 🚀");
+    }
+
+    #[test]
+    fn search_locations_render_ids_and_names_without_assuming_channel_kind() {
+        for (id, name) in [
+            ("C123", "general"),
+            ("D123", "U123"),
+            ("G123", "mpdm-alice--bob-1"),
+        ] {
+            let message = crate::model::MessageSearchMatch {
+                channel_id: id.into(),
+                channel_name: name.into(),
+                ts: "100.000001".into(),
+                thread_ts: None,
+                author_id: Some("U456".into()),
+                author_name: None,
+                text: "hello\r\x1b".into(),
+                permalink: None,
+            };
+            assert_eq!(
+                format_search_match(&message),
+                format!("100.000001\t{id}\t{name}\tU456\thello\\r\\u{{1b}}")
+            );
+        }
     }
 }

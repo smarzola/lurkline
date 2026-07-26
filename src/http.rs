@@ -14,7 +14,10 @@ use serde_json::Value;
 use crate::{
     config::Config,
     error::{Error, Result},
-    model::{ClientCountsPayload, RawMessagePage, RawMessagesList, RawUsersPage},
+    model::{
+        ClientCountsPayload, RawConversationsPage, RawMessagePage, RawMessageSearchResponse,
+        RawMessagesList, RawUsersPage,
+    },
     service::SlackApi,
 };
 
@@ -145,23 +148,32 @@ impl SlackApi for SlackHttpClient {
         .await
     }
 
-    async fn conversation_history(&self, channel: &str, limit: usize) -> Result<RawMessagePage> {
+    async fn conversation_history(
+        &self,
+        channel: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawMessagePage> {
+        let mut fields = vec![
+            ("channel", channel.into()),
+            ("limit", limit.to_string()),
+            ("ignore_replies", "true".into()),
+            ("include_pin_count", "true".into()),
+            ("inclusive", "true".into()),
+            ("no_user_profile", "true".into()),
+            ("include_stories", "true".into()),
+            ("include_free_team_extra_messages", "true".into()),
+            ("include_date_joined", "true".into()),
+            ("include_tombstones", "true".into()),
+            ("cached_latest_updates", "{}".into()),
+        ];
+        if let Some(cursor) = cursor {
+            fields.push(("cursor", cursor.into()));
+        }
         self.post_form(
             "conversations.history",
             "message-pane/requestHistory",
-            &[
-                ("channel", channel.into()),
-                ("limit", limit.to_string()),
-                ("ignore_replies", "true".into()),
-                ("include_pin_count", "true".into()),
-                ("inclusive", "true".into()),
-                ("no_user_profile", "true".into()),
-                ("include_stories", "true".into()),
-                ("include_free_team_extra_messages", "true".into()),
-                ("include_date_joined", "true".into()),
-                ("include_tombstones", "true".into()),
-                ("cached_latest_updates", "{}".into()),
-            ],
+            &fields,
         )
         .await
     }
@@ -170,20 +182,25 @@ impl SlackApi for SlackHttpClient {
         &self,
         channel: &str,
         thread_ts: &str,
+        cursor: Option<&str>,
         limit: usize,
     ) -> Result<RawMessagePage> {
+        let mut fields = vec![
+            ("channel", channel.into()),
+            ("ts", thread_ts.into()),
+            ("limit", limit.to_string()),
+            ("inclusive", "true".into()),
+            ("include_stories", "true".into()),
+            ("include_date_joined", "true".into()),
+            ("include_tombstones", "true".into()),
+        ];
+        if let Some(cursor) = cursor {
+            fields.push(("cursor", cursor.into()));
+        }
         self.post_form(
             "conversations.replies",
             "message-pane/requestReplies",
-            &[
-                ("channel", channel.into()),
-                ("ts", thread_ts.into()),
-                ("limit", limit.to_string()),
-                ("inclusive", "true".into()),
-                ("include_stories", "true".into()),
-                ("include_date_joined", "true".into()),
-                ("include_tombstones", "true".into()),
-            ],
+            &fields,
         )
         .await
     }
@@ -201,6 +218,44 @@ impl SlackApi for SlackHttpClient {
                 ("message_ids", message_ids),
                 ("org_wide_aware", "true".into()),
                 ("cached_latest_updates", "{}".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn conversations_list(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawConversationsPage> {
+        let mut fields = vec![
+            ("types", "public_channel,private_channel,mpim,im".into()),
+            ("exclude_archived", "true".into()),
+            ("limit", limit.to_string()),
+        ];
+        if let Some(cursor) = cursor {
+            fields.push(("cursor", cursor.into()));
+        }
+        self.post_form("conversations.list", "conversations-list", &fields)
+            .await
+    }
+
+    async fn search_messages(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawMessageSearchResponse> {
+        self.post_form(
+            "search.messages",
+            "search-messages",
+            &[
+                ("query", query.into()),
+                ("count", limit.to_string()),
+                ("cursor", cursor.unwrap_or("*").into()),
+                ("sort", "timestamp".into()),
+                ("sort_dir", "desc".into()),
+                ("highlight", "false".into()),
             ],
         )
         .await
@@ -414,13 +469,27 @@ mod tests {
                 "history",
                 br#"{"ok":true,"messages":[]}"#.as_slice(),
                 "/api/conversations.history",
-                vec!["C123", "limit", "42", "ignore_replies"],
+                vec![
+                    "C123",
+                    "limit",
+                    "42",
+                    "ignore_replies",
+                    "cursor",
+                    "history-cursor",
+                ],
             ),
             (
                 "replies",
                 br#"{"ok":true,"messages":[]}"#.as_slice(),
                 "/api/conversations.replies",
-                vec!["C123", "100.000001", "limit", "20"],
+                vec![
+                    "C123",
+                    "100.000001",
+                    "limit",
+                    "20",
+                    "cursor",
+                    "replies-cursor",
+                ],
             ),
             (
                 "message",
@@ -434,17 +503,53 @@ mod tests {
                 "/api/users.list",
                 vec!["cursor", "next-page", "limit", "200"],
             ),
+            (
+                "conversations",
+                br#"{"ok":true,"channels":[]}"#.as_slice(),
+                "/api/conversations.list",
+                vec![
+                    "cursor",
+                    "next-page",
+                    "limit",
+                    "200",
+                    "public_channel,private_channel,mpim,im",
+                    "exclude_archived",
+                    "true",
+                ],
+            ),
+            (
+                "search",
+                br#"{"ok":true,"query":"deploy","messages":{"matches":[],"total":0}}"#.as_slice(),
+                "/api/search.messages",
+                vec![
+                    "query",
+                    "deploy",
+                    "count",
+                    "25",
+                    "cursor",
+                    "*",
+                    "sort",
+                    "timestamp",
+                    "sort_dir",
+                    "desc",
+                    "highlight",
+                    "false",
+                ],
+            ),
         ];
 
         for (case, response, expected_path, expected_fields) in cases {
             let (client, capture) = server(StatusCode::OK, response.to_vec(), 64 * 1024).await;
             match case {
                 "history" => {
-                    client.conversation_history("C123", 42).await.unwrap();
+                    client
+                        .conversation_history("C123", Some("history-cursor"), 42)
+                        .await
+                        .unwrap();
                 }
                 "replies" => {
                     client
-                        .conversation_replies("C123", "100.000001", 20)
+                        .conversation_replies("C123", "100.000001", Some("replies-cursor"), 20)
                         .await
                         .unwrap();
                 }
@@ -453,6 +558,15 @@ mod tests {
                 }
                 "users" => {
                     client.users_list(Some("next-page"), 200).await.unwrap();
+                }
+                "conversations" => {
+                    client
+                        .conversations_list(Some("next-page"), 200)
+                        .await
+                        .unwrap();
+                }
+                "search" => {
+                    client.search_messages("deploy", None, 25).await.unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -476,6 +590,32 @@ mod tests {
                     }])
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn omits_history_and_thread_cursors_when_not_supplied() {
+        let calls = [
+            ("history", br#"{"ok":true,"messages":[]}"#.as_slice()),
+            ("replies", br#"{"ok":true,"messages":[]}"#.as_slice()),
+        ];
+        for (method, response) in calls {
+            let (client, capture) = server(StatusCode::OK, response.to_vec(), 64 * 1024).await;
+            if method == "history" {
+                client.conversation_history("C123", None, 20).await.unwrap();
+            } else {
+                client
+                    .conversation_replies("C123", "100.000001", None, 20)
+                    .await
+                    .unwrap();
+            }
+            let guard = capture.request.lock().unwrap();
+            let (_, _, body) = guard.as_ref().unwrap();
+            let body = String::from_utf8_lossy(body);
+            assert!(
+                !body.contains("name=\"cursor\""),
+                "{method} sent an absent cursor"
+            );
         }
     }
 
@@ -552,13 +692,23 @@ mod tests {
                 "users",
                 br#"{"ok":true,"members":[{"name":"missing-id"}]}"#.as_slice(),
             ),
+            ("conversations", br#"{"ok":true}"#.as_slice()),
+            (
+                "search",
+                br#"{"ok":true,"query":"deploy","messages":{}}"#.as_slice(),
+            ),
         ];
         for (case, body) in cases {
             let (client, _) = server(StatusCode::OK, body.to_vec(), 64 * 1024).await;
             let result = match case {
                 "counts" => client.client_counts().await.map(|_| ()),
-                "history" => client.conversation_history("C123", 20).await.map(|_| ()),
+                "history" => client
+                    .conversation_history("C123", None, 20)
+                    .await
+                    .map(|_| ()),
                 "users" => client.users_list(None, 200).await.map(|_| ()),
+                "conversations" => client.conversations_list(None, 200).await.map(|_| ()),
+                "search" => client.search_messages("deploy", None, 20).await.map(|_| ()),
                 _ => unreachable!(),
             };
             assert!(matches!(result, Err(Error::InvalidResponse { .. })));
@@ -574,7 +724,7 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            client.conversation_history("C123", 20).await,
+            client.conversation_history("C123", None, 20).await,
             Err(Error::SlackApi {
                 method: "conversations.history",
                 ref code
