@@ -44,6 +44,10 @@ impl SlackHttpClient {
         })
     }
 
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
     async fn post_form<T>(
         &self,
         method: &'static str,

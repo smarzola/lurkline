@@ -1,6 +1,7 @@
-use std::{env, fmt, time::Duration};
+use std::{fmt, time::Duration};
 
 use url::Url;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{Error, Result};
 
@@ -11,18 +12,22 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MIN_MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Clone)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct Secret(String);
 
 impl Secret {
-    fn parse(name: &'static str, value: String) -> Result<Self> {
-        if value.trim().is_empty() {
+    pub(crate) fn parse(name: &'static str, value: String) -> Result<Self> {
+        Self(value).validate(name)
+    }
+
+    fn validate(self, name: &'static str) -> Result<Self> {
+        if self.0.trim().is_empty() {
             return Err(Error::invalid_config(name, "must not be empty"));
         }
-        if value.contains(['\r', '\n']) {
+        if self.0.contains(['\r', '\n']) {
             return Err(Error::invalid_config(name, "must not contain line breaks"));
         }
-        Ok(Self(value))
+        Ok(self)
     }
 
     pub(crate) fn expose(&self) -> &str {
@@ -36,7 +41,60 @@ impl fmt::Debug for Secret {
     }
 }
 
-#[derive(Clone)]
+pub(crate) struct CredentialBundle {
+    pub base_url: Url,
+    pub team_id: String,
+    pub(crate) token: Secret,
+    pub(crate) cookie: Secret,
+}
+
+impl CredentialBundle {
+    pub(crate) fn parse(
+        base_url: String,
+        team_id: String,
+        token: String,
+        cookie: String,
+    ) -> Result<Self> {
+        let token = Secret::parse("SLACK_TOKEN", token)?;
+        let cookie = Secret::parse("SLACK_COOKIE", cookie)?;
+        let base_url = validate_base_url(&base_url)?;
+        validate_identifier("SLACK_TEAM_ID", &team_id)?;
+        validate_session_cookie(&cookie)?;
+        Ok(Self {
+            base_url,
+            team_id,
+            token,
+            cookie,
+        })
+    }
+
+    #[allow(dead_code, reason = "used by the milestone 2 credential writer")]
+    pub(crate) fn token(&self) -> &str {
+        self.token.expose()
+    }
+
+    #[allow(dead_code, reason = "used by the milestone 2 credential writer")]
+    pub(crate) fn cookie(&self) -> &str {
+        self.cookie.expose()
+    }
+
+    pub(crate) fn workspace_url(&self) -> String {
+        self.base_url.origin().ascii_serialization()
+    }
+}
+
+impl fmt::Debug for CredentialBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialBundle")
+            .field("base_url", &self.base_url)
+            .field("team_id", &self.team_id)
+            .field("token", &self.token)
+            .field("cookie", &self.cookie)
+            .finish()
+    }
+}
+
 pub(crate) struct Config {
     pub base_url: Url,
     pub team_id: String,
@@ -61,29 +119,17 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
-    pub(crate) fn from_env() -> Result<Self> {
-        Self::from_getter(|name| env::var(name).ok())
+    #[cfg(test)]
+    pub(crate) fn from_getter(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        let bundle = credential_bundle_from_getter(&mut get)?
+            .ok_or(Error::MissingConfig("SLACK_BASE_URL"))?;
+        Self::from_bundle_getter(bundle, get)
     }
 
-    pub(crate) fn from_getter(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self> {
-        let base_url = required(&mut get, "SLACK_BASE_URL")?;
-        let team_id = required(&mut get, "SLACK_TEAM_ID")?;
-        let token = Secret::parse("SLACK_TOKEN", required(&mut get, "SLACK_TOKEN")?)?;
-        let cookie = Secret::parse("SLACK_COOKIE", required(&mut get, "SLACK_COOKIE")?)?;
-
-        let base_url = validate_base_url(&base_url)?;
-        validate_identifier("SLACK_TEAM_ID", &team_id)?;
-        if !cookie
-            .expose()
-            .split(';')
-            .any(|part| part.trim().starts_with("d="))
-        {
-            return Err(Error::invalid_config(
-                "SLACK_COOKIE",
-                "must include the Slack d session cookie",
-            ));
-        }
-
+    pub(crate) fn from_bundle_getter(
+        bundle: CredentialBundle,
+        mut get: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self> {
         let timeout_ms = bounded_number(
             &mut get,
             "LURKLINE_TIMEOUT_MS",
@@ -100,10 +146,10 @@ impl Config {
         )? as usize;
 
         Ok(Self {
-            base_url,
-            team_id,
-            token,
-            cookie,
+            base_url: bundle.base_url,
+            team_id: bundle.team_id,
+            token: bundle.token,
+            cookie: bundle.cookie,
             timeout: Duration::from_millis(timeout_ms),
             max_response_bytes,
         })
@@ -122,11 +168,36 @@ impl Config {
     }
 }
 
-fn required(get: &mut impl FnMut(&str) -> Option<String>, name: &'static str) -> Result<String> {
-    get(name).ok_or(Error::MissingConfig(name))
+pub(crate) fn credential_bundle_from_getter(
+    get: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<Option<CredentialBundle>> {
+    let base_url = get("SLACK_BASE_URL");
+    let team_id = get("SLACK_TEAM_ID");
+    let token = get("SLACK_TOKEN").map(Secret);
+    let cookie = get("SLACK_COOKIE").map(Secret);
+    if base_url.is_none() && team_id.is_none() && token.is_none() && cookie.is_none() {
+        return Ok(None);
+    }
+    let base_url = base_url.ok_or(Error::MissingConfig("SLACK_BASE_URL"))?;
+    let team_id = team_id.ok_or(Error::MissingConfig("SLACK_TEAM_ID"))?;
+    let token = token
+        .ok_or(Error::MissingConfig("SLACK_TOKEN"))?
+        .validate("SLACK_TOKEN")?;
+    let cookie = cookie
+        .ok_or(Error::MissingConfig("SLACK_COOKIE"))?
+        .validate("SLACK_COOKIE")?;
+    let base_url = validate_base_url(&base_url)?;
+    validate_identifier("SLACK_TEAM_ID", &team_id)?;
+    validate_session_cookie(&cookie)?;
+    Ok(Some(CredentialBundle {
+        base_url,
+        team_id,
+        token,
+        cookie,
+    }))
 }
 
-fn validate_base_url(raw: &str) -> Result<Url> {
+pub(crate) fn validate_base_url(raw: &str) -> Result<Url> {
     let url =
         Url::parse(raw).map_err(|_| Error::invalid_config("SLACK_BASE_URL", "must be a URL"))?;
     if url.scheme() != "https" {
@@ -160,7 +231,7 @@ fn validate_base_url(raw: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn validate_identifier(name: &'static str, value: &str) -> Result<()> {
+pub(crate) fn validate_identifier(name: &'static str, value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 64
         || !value
@@ -173,6 +244,20 @@ fn validate_identifier(name: &'static str, value: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_session_cookie(cookie: &Secret) -> Result<()> {
+    if cookie
+        .expose()
+        .split(';')
+        .any(|part| part.trim().starts_with("d="))
+    {
+        return Ok(());
+    }
+    Err(Error::invalid_config(
+        "SLACK_COOKIE",
+        "must include the Slack d session cookie",
+    ))
 }
 
 fn bounded_number(
@@ -225,6 +310,31 @@ mod tests {
         bad.insert("LURKLINE_TIMEOUT_MS", "xoxc-super-secret".into());
         let error = Config::from_getter(|name| bad.get(name).cloned()).unwrap_err();
         assert!(!error.to_string().contains("super-secret"));
+    }
+
+    #[test]
+    fn secret_ownership_covers_partial_and_early_validation_failures() {
+        let partial = HashMap::from([
+            ("SLACK_TOKEN", "xoxc-partial-secret".into()),
+            ("SLACK_COOKIE", "d=xoxd-partial-secret".into()),
+        ]);
+        let error =
+            Config::from_getter(|name| partial.get(name).cloned()).expect_err("partial bundle");
+        let rendered = error.to_string();
+        assert!(matches!(error, Error::MissingConfig("SLACK_BASE_URL")));
+        assert!(!rendered.contains("partial-secret"));
+
+        let mut invalid_origin = valid();
+        invalid_origin.insert("SLACK_BASE_URL", "https://not-slack.example".into());
+        invalid_origin.insert("SLACK_TOKEN", "xoxc-origin-secret".into());
+        invalid_origin.insert("SLACK_COOKIE", "d=xoxd-origin-secret".into());
+        let error = Config::from_getter(|name| invalid_origin.get(name).cloned())
+            .expect_err("invalid origin");
+        assert!(!error.to_string().contains("origin-secret"));
+
+        let mut secret = Secret::parse("SLACK_TOKEN", "xoxc-zeroized".into()).unwrap();
+        secret.zeroize();
+        assert!(secret.expose().is_empty());
     }
 
     #[test]

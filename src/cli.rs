@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::{
-    config::Config,
+    auth::resolve_config,
     error::{Error, Result},
     http::SlackHttpClient,
     mcp,
@@ -23,6 +23,9 @@ use crate::{
     about = "Read-only Slack access through an existing browser session"
 )]
 pub struct Cli {
+    /// Use a named credential profile. LURKLINE_PROFILE is the fallback.
+    #[arg(long, global = true)]
+    pub profile: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -209,9 +212,9 @@ pub enum UsersCommand {
 }
 
 pub async fn run_cli(cli: Cli) -> Result<()> {
-    let config = Config::from_env()?;
-    let client = SlackHttpClient::new(config.clone())?;
-    let service = SlackService::new(client, &config);
+    let config = resolve_config(cli.profile.as_deref())?;
+    let client = SlackHttpClient::new(config)?;
+    let service = SlackService::new(client.clone(), client.config());
     match cli.command {
         Command::Doctor { json } => print_doctor(service.doctor().await?, json),
         Command::Unreads { json } => print_unreads(service.unreads().await?, json),
