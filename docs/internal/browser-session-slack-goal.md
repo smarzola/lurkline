@@ -220,7 +220,7 @@ tools/list, and one validation-error tool call rather than left running.
 
 - [x] 2026-07-26: selected globally unused name `lurkline`.
 - [x] 2026-07-26: created staging repository and typed goal branch from baseline.
-- [ ] Milestone 1 implemented, reviewed, verified, and committed.
+- [x] 2026-07-26: Milestone 1 implemented, reviewed, and verified (13 tests).
 - [ ] Milestone 2 implemented, reviewed, verified, and committed.
 - [ ] Milestone 3 implemented, reviewed, verified, and committed.
 - [ ] Independent final audit passed.
@@ -243,3 +243,13 @@ tools/list, and one validation-error tool call rather than left running.
 Record reviewer readiness, milestone findings, repairs, re-checks, and the final
 independent audit here before marking the goal complete.
 
+- 2026-07-26 readiness: `READY`; reviewer locked real `doctor` probing, explicit
+  Slack unread flags, stable JSON fixtures, redirect handling, streaming bounds,
+  and secret non-disclosure into the review criteria.
+- 2026-07-26 Milestone 1 review: blocking arbitrary-origin credential egress;
+  high non-JSON/login-string misclassification; medium untyped thread-count JSON.
+- 2026-07-26 Milestone 1 repair: production origins restricted to root HTTPS
+  single-label `*.slack.com`; JSON parsed before envelope classification;
+  arbitrary non-JSON treated as authentication failure; thread counts typed as
+  `BTreeMap<String, u64>` with an exact serialized-schema regression.
+- 2026-07-26 Milestone 1 re-check: `CLEAN`.
