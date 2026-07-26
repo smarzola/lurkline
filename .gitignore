@@ -1,0 +1,6 @@
+/target
+/.env
+/.env.*
+*.har
+*.har.gz
+
