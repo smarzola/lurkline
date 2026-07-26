@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::Error,
     model::{
-        ConversationPage, ConversationSearchReport, DoctorReport, Message, MessagePage, ThreadPage,
-        UnreadReport, UserSearchReport,
+        ConversationPage, ConversationSearchReport, DoctorReport, Message, MessagePage,
+        MessageSearchPage, ThreadPage, UnreadReport, UserSearchReport,
     },
     service::SlackService,
 };
@@ -73,6 +73,23 @@ struct FindConversationsRequest {
     limit: usize,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SearchMessagesRequest {
+    /// Slack search text; standard Slack query modifiers are also accepted.
+    query: String,
+    /// Optional Slack conversation ID or unambiguous exact name.
+    conversation: Option<String>,
+    /// Optional exclusive lower date bound in YYYY-MM-DD format.
+    after: Option<String>,
+    /// Optional exclusive upper date bound in YYYY-MM-DD format.
+    before: Option<String>,
+    /// Opaque Slack cursor from a previous search response.
+    cursor: Option<String>,
+    /// Maximum matching messages to return, from 1 through 100.
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
 const fn default_channel_limit() -> usize {
     50
 }
@@ -90,6 +107,10 @@ const fn default_conversation_list_limit() -> usize {
 }
 
 const fn default_conversation_find_limit() -> usize {
+    20
+}
+
+const fn default_search_limit() -> usize {
     20
 }
 
@@ -254,6 +275,36 @@ impl McpServer {
         )
     }
 
+    /// Search Slack messages with optional conversation, date, and cursor filters.
+    #[tool(
+        name = "slack_search_messages",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<MessageSearchPage>>(),
+        annotations(
+            title = "Search Slack messages",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn search_messages(
+        &self,
+        Parameters(request): Parameters<SearchMessagesRequest>,
+    ) -> CallToolResult {
+        tool_result(
+            self.service
+                .search_messages(
+                    &request.query,
+                    request.conversation.as_deref(),
+                    request.after.as_deref(),
+                    request.before.as_deref(),
+                    request.cursor.as_deref(),
+                    request.limit,
+                )
+                .await,
+        )
+    }
+
     /// Read bounded recent history using a Slack conversation ID or exact name.
     #[tool(
         name = "slack_read_channel",
@@ -375,8 +426,8 @@ mod tests {
         config::Config,
         error::Result,
         model::{
-            ClientCountsPayload, RawConversationsPage, RawMessagePage, RawMessagesList,
-            RawThreadCounts, RawUsersPage,
+            ClientCountsPayload, RawConversationsPage, RawMessagePage, RawMessageSearchMatches,
+            RawMessageSearchResponse, RawMessagesList, RawThreadCounts, RawUsersPage,
         },
         service::SlackApi,
     };
@@ -427,6 +478,22 @@ mod tests {
             Ok(RawConversationsPage::default())
         }
 
+        async fn search_messages(
+            &self,
+            _query: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<RawMessageSearchResponse> {
+            Ok(RawMessageSearchResponse {
+                messages: RawMessageSearchMatches {
+                    matches: vec![],
+                    total: 0,
+                    ..RawMessageSearchMatches::default()
+                },
+                ..RawMessageSearchResponse::default()
+            })
+        }
+
         async fn users_list(&self, _cursor: Option<&str>, _limit: usize) -> Result<RawUsersPage> {
             Ok(RawUsersPage::default())
         }
@@ -469,6 +536,7 @@ mod tests {
                 "slack_list_unreads",
                 "slack_read_channel",
                 "slack_read_thread",
+                "slack_search_messages",
             ])
         );
         assert!(tools.tools.iter().all(|tool| {
@@ -491,6 +559,29 @@ mod tests {
                 "conversations": [],
                 "has_more": false,
                 "next_cursor": null
+            }))
+        );
+
+        let search_arguments = json!({"query": "", "limit": 20})
+            .as_object()
+            .unwrap()
+            .clone();
+        let invalid_search = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("slack_search_messages")
+                    .with_arguments(search_arguments),
+            )
+            .await
+            .expect("search validation call");
+        assert_eq!(invalid_search.is_error, Some(true));
+        assert_eq!(
+            invalid_search.structured_content,
+            Some(json!({
+                "error": {
+                    "code": "invalid_input",
+                    "message": "invalid query: must contain 1 to 512 non-control characters"
+                }
             }))
         );
 

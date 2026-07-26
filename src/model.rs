@@ -141,6 +141,52 @@ pub(crate) struct RawConversation {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawMessageSearchResponse {
+    #[serde(default)]
+    pub query: String,
+    pub messages: RawMessageSearchMatches,
+    #[serde(default)]
+    pub response_metadata: RawResponseMetadata,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawMessageSearchMatches {
+    pub matches: Vec<RawMessageSearchMatch>,
+    pub total: u64,
+    #[serde(default)]
+    pub pagination: RawMessageSearchPagination,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawMessageSearchPagination {
+    #[serde(default)]
+    pub next_cursor: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawMessageSearchMatch {
+    pub channel: RawMessageSearchChannel,
+    pub ts: String,
+    #[serde(default)]
+    pub thread_ts: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub permalink: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawMessageSearchChannel {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawUser {
     pub id: String,
     #[serde(default)]
@@ -243,6 +289,27 @@ pub struct ConversationSearchReport {
 pub enum ConversationSearchTruncationReason {
     ResultLimit,
     ScanLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct MessageSearchMatch {
+    pub channel_id: String,
+    pub channel_name: String,
+    pub ts: String,
+    pub thread_ts: Option<String>,
+    pub author_id: Option<String>,
+    pub author_name: Option<String>,
+    pub text: String,
+    pub permalink: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct MessageSearchPage {
+    pub query: String,
+    pub matches: Vec<MessageSearchMatch>,
+    pub total: u64,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

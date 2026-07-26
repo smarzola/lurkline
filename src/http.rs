@@ -15,7 +15,8 @@ use crate::{
     config::Config,
     error::{Error, Result},
     model::{
-        ClientCountsPayload, RawConversationsPage, RawMessagePage, RawMessagesList, RawUsersPage,
+        ClientCountsPayload, RawConversationsPage, RawMessagePage, RawMessageSearchResponse,
+        RawMessagesList, RawUsersPage,
     },
     service::SlackApi,
 };
@@ -223,6 +224,27 @@ impl SlackApi for SlackHttpClient {
         }
         self.post_form("conversations.list", "conversations-list", &fields)
             .await
+    }
+
+    async fn search_messages(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawMessageSearchResponse> {
+        self.post_form(
+            "search.messages",
+            "search-messages",
+            &[
+                ("query", query.into()),
+                ("count", limit.to_string()),
+                ("cursor", cursor.unwrap_or("*").into()),
+                ("sort", "timestamp".into()),
+                ("sort_dir", "desc".into()),
+                ("highlight", "false".into()),
+            ],
+        )
+        .await
     }
 
     async fn users_list(&self, cursor: Option<&str>, limit: usize) -> Result<RawUsersPage> {
@@ -467,6 +489,25 @@ mod tests {
                     "true",
                 ],
             ),
+            (
+                "search",
+                br#"{"ok":true,"query":"deploy","messages":{"matches":[],"total":0}}"#.as_slice(),
+                "/api/search.messages",
+                vec![
+                    "query",
+                    "deploy",
+                    "count",
+                    "25",
+                    "cursor",
+                    "*",
+                    "sort",
+                    "timestamp",
+                    "sort_dir",
+                    "desc",
+                    "highlight",
+                    "false",
+                ],
+            ),
         ];
 
         for (case, response, expected_path, expected_fields) in cases {
@@ -492,6 +533,9 @@ mod tests {
                         .conversations_list(Some("next-page"), 200)
                         .await
                         .unwrap();
+                }
+                "search" => {
+                    client.search_messages("deploy", None, 25).await.unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -592,6 +636,10 @@ mod tests {
                 br#"{"ok":true,"members":[{"name":"missing-id"}]}"#.as_slice(),
             ),
             ("conversations", br#"{"ok":true}"#.as_slice()),
+            (
+                "search",
+                br#"{"ok":true,"query":"deploy","messages":{}}"#.as_slice(),
+            ),
         ];
         for (case, body) in cases {
             let (client, _) = server(StatusCode::OK, body.to_vec(), 64 * 1024).await;
@@ -600,6 +648,7 @@ mod tests {
                 "history" => client.conversation_history("C123", 20).await.map(|_| ()),
                 "users" => client.users_list(None, 200).await.map(|_| ()),
                 "conversations" => client.conversations_list(None, 200).await.map(|_| ()),
+                "search" => client.search_messages("deploy", None, 20).await.map(|_| ()),
                 _ => unreachable!(),
             };
             assert!(matches!(result, Err(Error::InvalidResponse { .. })));

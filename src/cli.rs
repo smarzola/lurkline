@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
@@ -8,8 +10,8 @@ use crate::{
     mcp,
     model::{
         Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
-        ConversationSearchTruncationReason, DoctorReport, Message, MessagePage, ThreadPage,
-        UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        ConversationSearchTruncationReason, DoctorReport, Message, MessagePage, MessageSearchPage,
+        ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
     service::{MAX_CONVERSATIONS, MAX_USERS, SlackService},
 };
@@ -43,6 +45,11 @@ pub enum Command {
     Conversations {
         #[command(subcommand)]
         command: ConversationsCommand,
+    },
+    /// Search workspace messages with bounded filters.
+    Search {
+        #[command(subcommand)]
+        command: SearchCommand,
     },
     /// Read messages from a channel, DM, or group DM.
     Channel {
@@ -142,6 +149,33 @@ pub enum ConversationsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum SearchCommand {
+    /// Search messages newest first.
+    Messages {
+        /// Slack search text; standard Slack query modifiers are accepted.
+        query: String,
+        /// Restrict to a conversation ID or unambiguous exact name.
+        #[arg(long = "in")]
+        conversation: Option<String>,
+        /// Restrict to messages after this YYYY-MM-DD date.
+        #[arg(long)]
+        after: Option<String>,
+        /// Restrict to messages before this YYYY-MM-DD date.
+        #[arg(long)]
+        before: Option<String>,
+        /// Opaque Slack cursor from a previous search response.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum matching messages to return.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum UsersCommand {
     /// Find users by ID, handle, name, display name, or title.
     Find {
@@ -177,6 +211,30 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
         Command::Conversations {
             command: ConversationsCommand::Find { query, limit, json },
         } => print_conversations(service.find_conversations(&query, limit).await?, json),
+        Command::Search {
+            command:
+                SearchCommand::Messages {
+                    query,
+                    conversation,
+                    after,
+                    before,
+                    cursor,
+                    limit,
+                    json,
+                },
+        } => print_message_search(
+            service
+                .search_messages(
+                    &query,
+                    conversation.as_deref(),
+                    after.as_deref(),
+                    before.as_deref(),
+                    cursor.as_deref(),
+                    limit,
+                )
+                .await?,
+            json,
+        ),
         Command::Channel {
             command:
                 ChannelCommand::Read {
@@ -245,8 +303,8 @@ fn print_unreads(report: UnreadReport, json: bool) -> Result<()> {
             "{kind}\t{}\tmentions={}\tlast_read={}\tlatest={}",
             conversation.id,
             conversation.mention_count,
-            conversation.last_read.as_deref().unwrap_or("-"),
-            conversation.latest.as_deref().unwrap_or("-")
+            escape_human(conversation.last_read.as_deref().unwrap_or("-")),
+            escape_human(conversation.latest.as_deref().unwrap_or("-"))
         );
     }
     if report.threads.has_unreads {
@@ -300,8 +358,8 @@ fn print_conversation_rows(conversations: &[Conversation]) {
             conversation_kind_label(conversation.kind),
             conversation.id,
             prefix,
-            conversation.name,
-            conversation.display_name
+            escape_human(&conversation.name),
+            escape_human(&conversation.display_name)
         );
     }
 }
@@ -334,6 +392,27 @@ fn conversation_truncation_notice(report: &ConversationSearchReport) -> Option<S
         )),
         None => None,
     }
+}
+
+fn print_message_search(page: MessageSearchPage, json: bool) -> Result<()> {
+    if json {
+        return print_json(&page);
+    }
+    if page.matches.is_empty() {
+        println!("No messages matched.");
+    } else {
+        for message in &page.matches {
+            println!("{}", format_search_match(message));
+        }
+    }
+    println!("total\t{}", page.total);
+    if page.has_more {
+        println!(
+            "more\t{}",
+            page.next_cursor.as_deref().unwrap_or("available")
+        );
+    }
+    Ok(())
 }
 
 fn print_message_page(page: MessagePage, json: bool) -> Result<()> {
@@ -379,12 +458,14 @@ fn print_messages(messages: &[Message]) {
         return;
     }
     for message in messages {
-        let author = message
-            .author_id
-            .as_deref()
-            .or(message.author_name.as_deref())
-            .unwrap_or("-");
-        let text = message.text.replace('\n', "\\n").replace('\t', "\\t");
+        let author = escape_human(
+            message
+                .author_id
+                .as_deref()
+                .or(message.author_name.as_deref())
+                .unwrap_or("-"),
+        );
+        let text = escape_human(&message.text);
         println!(
             "{}\t{}\t{}\treplies={}",
             message.ts, author, text, message.reply_count
@@ -402,7 +483,10 @@ fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
         for user in &report.users {
             println!(
                 "{}\t@{}\t{}\t{}",
-                user.id, user.name, user.display_name, user.real_name
+                user.id,
+                escape_human(&user.name),
+                escape_human(&user.display_name),
+                escape_human(&user.real_name)
             );
         }
     }
@@ -410,6 +494,39 @@ fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
         println!("{notice}");
     }
     Ok(())
+}
+
+fn format_search_match(message: &crate::model::MessageSearchMatch) -> String {
+    let author = message
+        .author_id
+        .as_deref()
+        .or(message.author_name.as_deref())
+        .unwrap_or("-");
+    format!(
+        "{}\t{}\t{}\t{}\t{}",
+        escape_human(&message.ts),
+        escape_human(&message.channel_id),
+        escape_human(&message.channel_name),
+        escape_human(author),
+        escape_human(&message.text)
+    )
+}
+
+fn escape_human(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                write!(&mut escaped, "\\u{{{:x}}}", character as u32)
+                    .expect("writing to a String cannot fail");
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn user_truncation_notice(report: &UserSearchReport) -> Option<String> {
@@ -483,6 +600,38 @@ mod tests {
                 .command,
             Command::Conversations {
                 command: ConversationsCommand::Find { limit: 20, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "search",
+                "messages",
+                "deploy",
+                "--in",
+                "general",
+                "--after",
+                "2026-01-01",
+                "--before",
+                "2026-02-01",
+                "--cursor",
+                "next",
+                "--limit",
+                "12",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Search {
+                command: SearchCommand::Messages {
+                    conversation: Some(_),
+                    after: Some(_),
+                    before: Some(_),
+                    cursor: Some(_),
+                    limit: 12,
+                    json: true,
+                    ..
+                }
             }
         ));
         assert!(matches!(
@@ -570,5 +719,38 @@ mod tests {
         let notice = user_truncation_notice(&report).unwrap();
         assert!(notice.contains("100-result maximum"));
         assert!(!notice.contains("raise --limit"));
+    }
+
+    #[test]
+    fn escapes_every_control_character_in_human_output() {
+        assert_eq!(
+            escape_human("plain\r\x1b\n\t\u{8}text"),
+            "plain\\r\\u{1b}\\n\\t\\u{8}text"
+        );
+        assert_eq!(escape_human("café 🚀"), "café 🚀");
+    }
+
+    #[test]
+    fn search_locations_render_ids_and_names_without_assuming_channel_kind() {
+        for (id, name) in [
+            ("C123", "general"),
+            ("D123", "U123"),
+            ("G123", "mpdm-alice--bob-1"),
+        ] {
+            let message = crate::model::MessageSearchMatch {
+                channel_id: id.into(),
+                channel_name: name.into(),
+                ts: "100.000001".into(),
+                thread_ts: None,
+                author_id: Some("U456".into()),
+                author_name: None,
+                text: "hello\r\x1b".into(),
+                permalink: None,
+            };
+            assert_eq!(
+                format_search_match(&message),
+                format!("100.000001\t{id}\t{name}\tU456\thello\\r\\u{{1b}}")
+            );
+        }
     }
 }
