@@ -91,7 +91,7 @@ pub enum Command {
 pub enum ChannelCommand {
     /// Read recent channel history.
     Read {
-        /// Slack conversation ID or unambiguous exact name.
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
         channel_id: String,
         /// Maximum messages to return, from 1 through 200.
         #[arg(long, default_value_t = 50)]
@@ -109,7 +109,7 @@ pub enum ChannelCommand {
 pub enum ThreadCommand {
     /// Read a thread root and its replies.
     Read {
-        /// Slack conversation ID or unambiguous exact name.
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
         channel_id: String,
         /// Slack timestamp of the thread root.
         thread_ts: String,
@@ -129,7 +129,7 @@ pub enum ThreadCommand {
 pub enum MessageCommand {
     /// Fetch one message by conversation ID or exact name and timestamp.
     Get {
-        /// Slack conversation ID or unambiguous exact name.
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
         channel_id: String,
         /// Exact Slack message timestamp.
         message_ts: String,
@@ -172,7 +172,7 @@ pub enum SearchCommand {
     Messages {
         /// Slack search text; standard Slack query modifiers are accepted.
         query: String,
-        /// Restrict to a conversation ID or unambiguous exact name.
+        /// Restrict to an ID or exact name; use # or @ to force a colliding name.
         #[arg(long = "in")]
         conversation: Option<String>,
         /// Restrict to messages after this YYYY-MM-DD date.

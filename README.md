@@ -124,9 +124,14 @@ bounded user directory when available. JSON output sets `name_is_fallback` when
 the participant name is unavailable.
 
 Channel, thread, and exact-message reads accept either a Slack conversation ID
-or an unambiguous exact name. Name matching is case-insensitive and accepts one
-optional leading `#` or `@`. Missing or ambiguous names fail instead of
-guessing. Supplying an ID to these read commands skips discovery.
+or an exact name. Name matching is case-insensitive. Missing or ambiguous names
+fail instead of guessing. Supplying an ID to these read commands skips
+discovery.
+
+Raw uppercase alphanumeric values beginning with `C`, `D`, or `G` take ID
+precedence. If an exact name has that shape after case folding, add `#` or `@`
+to force name resolution. For example, use `#GENERAL2` to distinguish that name
+from the ID-shaped value `GENERAL2`.
 
 ## Search messages
 
@@ -157,6 +162,7 @@ exact name before applying the conversation filter. Dates must be valid
 `YYYY-MM-DD` values, and `--after` cannot be later than `--before`.
 Search resolves even an ID through bounded conversation discovery because Slack
 uses different `in:` modifiers for DMs and other conversation kinds.
+The same ID-precedence rule applies; add `#` or `@` to force a colliding name.
 
 Search JSON contains normalized conversation, timestamp, thread, author, text,
 permalink, total, and cursor fields. The reported total is Slack's workspace

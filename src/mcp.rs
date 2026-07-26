@@ -20,7 +20,7 @@ use crate::{
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReadChannelRequest {
-    /// Slack conversation ID or unambiguous exact name.
+    /// Slack conversation ID or exact name; prefix # or @ to force a colliding name.
     channel_id: String,
     /// Opaque Slack cursor from a previous channel response.
     cursor: Option<String>,
@@ -31,7 +31,7 @@ struct ReadChannelRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReadThreadRequest {
-    /// Slack conversation ID or unambiguous exact name.
+    /// Slack conversation ID or exact name; prefix # or @ to force a colliding name.
     channel_id: String,
     /// Slack timestamp of the thread root.
     thread_ts: String,
@@ -54,7 +54,7 @@ struct ReadInboxRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetMessageRequest {
-    /// Slack conversation ID or unambiguous exact name.
+    /// Slack conversation ID or exact name; prefix # or @ to force a colliding name.
     channel_id: String,
     /// Exact Slack message timestamp.
     message_ts: String,
@@ -91,7 +91,7 @@ struct FindConversationsRequest {
 struct SearchMessagesRequest {
     /// Slack search text; standard Slack query modifiers are also accepted.
     query: String,
-    /// Optional Slack conversation ID or unambiguous exact name.
+    /// Optional ID or exact name; prefix # or @ to force a colliding name.
     conversation: Option<String>,
     /// Optional exclusive lower date bound in YYYY-MM-DD format.
     after: Option<String>,

@@ -173,7 +173,9 @@ impl SlackService {
                     method: "conversations.list",
                 });
             }
-            let messages = self.read_channel(&unread.id, None, message_limit).await?;
+            let messages = self
+                .read_channel_by_id(&unread.id, None, message_limit)
+                .await?;
             conversations.push(InboxConversation {
                 conversation,
                 unread,
@@ -211,6 +213,7 @@ impl SlackService {
             }
         };
         let next_cursor = response_cursor("conversations.list", raw.response_metadata.next_cursor)?;
+        reject_repeated_cursor("conversations.list", cursor, next_cursor.as_deref())?;
         Ok(ConversationPage {
             conversations: normalize_conversations(raw.channels, &user_directory.users)?,
             has_more: next_cursor.is_some(),
@@ -407,17 +410,26 @@ impl SlackService {
         validate_limit("limit", limit, MAX_MESSAGES)?;
         validate_cursor(cursor)?;
         let channel = self.resolve_conversation_id(channel).await?;
+        self.read_channel_by_id(&channel, cursor, limit).await
+    }
+
+    async fn read_channel_by_id(
+        &self,
+        channel: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<MessagePage> {
         let raw = self
             .api
-            .conversation_history(&channel, cursor, limit)
+            .conversation_history(channel, cursor, limit)
             .await?;
         let locally_truncated = raw.messages.len() > limit;
         let next_cursor =
             response_cursor("conversations.history", raw.response_metadata.next_cursor)?;
         reject_repeated_cursor("conversations.history", cursor, next_cursor.as_deref())?;
         Ok(MessagePage {
-            channel_id: channel.clone(),
-            messages: normalize_messages(&channel, raw.messages, limit, "conversations.history")?,
+            channel_id: channel.to_owned(),
+            messages: normalize_messages(channel, raw.messages, limit, "conversations.history")?,
             has_more: raw.has_more || next_cursor.is_some() || locally_truncated,
             next_cursor,
         })
@@ -548,14 +560,14 @@ impl SlackService {
     }
 
     async fn resolve_conversation_id(&self, reference: &str) -> Result<String> {
-        if is_valid_any_conversation_id(reference) {
+        if is_slack_shaped_conversation_id(reference) {
             return Ok(reference.to_owned());
         }
         Ok(self.resolve_named_conversation(reference).await?.id)
     }
 
     async fn resolve_search_conversation(&self, reference: &str) -> Result<Conversation> {
-        if is_valid_any_conversation_id(reference) {
+        if is_slack_shaped_conversation_id(reference) {
             return self.find_conversation_by_id(reference).await;
         }
         self.resolve_named_conversation(reference).await
@@ -1141,6 +1153,14 @@ fn is_valid_any_conversation_id(id: &str) -> bool {
     matches!(id.as_bytes().first(), Some(b'C' | b'D' | b'G'))
         && (2..=64).contains(&id.len())
         && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn is_slack_shaped_conversation_id(id: &str) -> bool {
+    is_valid_any_conversation_id(id)
+        && id
+            .bytes()
+            .skip(1)
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
 fn validate_query(query: &str) -> Result<String> {
@@ -1939,6 +1959,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_conversations_rejects_the_supplied_cursor_as_its_continuation() {
+        let mut api = fake_api();
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            response_metadata: RawResponseMetadata {
+                next_cursor: "same".into(),
+            },
+            ..RawConversationsPage::default()
+        }]));
+        assert!(matches!(
+            service(api).list_conversations(Some("same"), 10).await,
+            Err(Error::InvalidResponse {
+                method: "conversations.list"
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn rejects_malformed_slack_response_cursors() {
         let mut list_api = fake_api();
         list_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
@@ -2073,10 +2110,10 @@ mod tests {
         let mut id_api = fake_api();
         id_api.history.messages = vec![raw_message("100.000001", "by id")];
         let id_page = service(id_api)
-            .read_channel("CGENERAL", None, 1)
+            .read_channel("CABCDEFGH", None, 1)
             .await
             .unwrap();
-        assert_eq!(id_page.channel_id, "CGENERAL");
+        assert_eq!(id_page.channel_id, "CABCDEFGH");
 
         let mut name_api = fake_api();
         name_api.history.messages = vec![raw_message("100.000001", "by name")];
@@ -2090,6 +2127,75 @@ mod tests {
             .unwrap();
         assert_eq!(name_page.channel_id, "CGENERAL");
         assert_eq!(name_page.messages[0].text, "by name");
+    }
+
+    #[tokio::test]
+    async fn unprefixed_case_variants_resolve_across_reads_and_search() {
+        let mut channel_api = fake_api();
+        channel_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C00000001", "general")],
+            ..RawConversationsPage::default()
+        }]));
+        let channel = service(channel_api)
+            .read_channel("General", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(channel.channel_id, "C00000001");
+
+        let mut thread_api = fake_api();
+        thread_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C00000002", "design")],
+            ..RawConversationsPage::default()
+        }]));
+        let thread = service(thread_api)
+            .read_thread("Design", "100.000001", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(thread.channel_id, "C00000002");
+
+        let mut message_api = fake_api();
+        message_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C00000003", "customersuccess")],
+            ..RawConversationsPage::default()
+        }]));
+        message_api.message_list.messages =
+            BTreeMap::from([("target".into(), raw_message("100.000001", "by exact name"))]);
+        let message = service(message_api)
+            .get_message("CustomerSuccess", "100.000001")
+            .await
+            .unwrap();
+        assert_eq!(message.channel_id, "C00000003");
+
+        let mut search_api = fake_api();
+        search_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C00000004", "general")],
+            ..RawConversationsPage::default()
+        }]));
+        let search = service(search_api)
+            .search_messages("deploy", Some("General"), None, None, None, 20)
+            .await
+            .unwrap();
+        assert_eq!(search.query, "deploy in:general");
+    }
+
+    #[tokio::test]
+    async fn slack_shaped_inputs_take_id_precedence_and_prefixes_force_names() {
+        let id_page = service(fake_api())
+            .read_channel("GENERAL2", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(id_page.channel_id, "GENERAL2");
+
+        let mut name_api = fake_api();
+        name_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C00000005", "general2")],
+            ..RawConversationsPage::default()
+        }]));
+        let name_page = service(name_api)
+            .read_channel("#GENERAL2", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(name_page.channel_id, "C00000005");
     }
 
     #[tokio::test]
@@ -2220,7 +2326,7 @@ mod tests {
         let mut api = fake_api();
         api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
             channels: vec![RawConversation {
-                id: "DALI".into(),
+                id: "D01234567".into(),
                 is_im: true,
                 user: Some("UALI".into()),
                 ..RawConversation::default()
@@ -2228,7 +2334,7 @@ mod tests {
             ..RawConversationsPage::default()
         }]));
         let page = service(api)
-            .search_messages("incident", Some("DALI"), None, None, None, 20)
+            .search_messages("incident", Some("D01234567"), None, None, None, 20)
             .await
             .unwrap();
         assert_eq!(page.query, "incident in:<@UALI>");

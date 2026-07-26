@@ -54,19 +54,20 @@ fn version_and_help_expose_the_complete_v020_cli_without_configuration() {
         assert!(search.contains(option), "search help omitted {option}");
     }
     assert!(search.contains("from 1 through 100"));
+    assert!(search.contains("use # or @ to force a colliding name"));
 
     let channel = stdout(&["channel", "read", "--help"]);
     assert!(channel.contains("--cursor"));
-    assert!(channel.contains("conversation ID or unambiguous exact name"));
+    assert!(channel.contains("use # or @ to force a colliding name"));
     assert!(channel.contains("from 1 through 200"));
     let thread = stdout(&["thread", "read", "--help"]);
     assert!(thread.contains("--cursor"));
-    assert!(thread.contains("conversation ID or unambiguous exact name"));
+    assert!(thread.contains("use # or @ to force a colliding name"));
     assert!(thread.contains("from 1 through 200"));
 
     let message = stdout(&["message", "get", "--help"]);
     assert!(message.contains("conversation ID or exact name"));
-    assert!(message.contains("conversation ID or unambiguous exact name"));
+    assert!(message.contains("use # or @ to force a colliding name"));
 
     let list = stdout(&["conversations", "list", "--help"]);
     assert!(list.contains("from 1 through 200"));
