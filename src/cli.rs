@@ -5,6 +5,7 @@ use crate::{
     config::Config,
     error::{Error, Result},
     http::SlackHttpClient,
+    mcp,
     model::{
         ConversationKind, DoctorReport, Message, MessagePage, ThreadPage, UnreadReport,
         UserSearchReport,
@@ -57,6 +58,8 @@ pub enum Command {
         #[command(subcommand)]
         command: UsersCommand,
     },
+    /// Run the read-only MCP server over stdin/stdout.
+    Mcp,
 }
 
 #[derive(Debug, Subcommand)]
@@ -158,6 +161,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
         Command::Users {
             command: UsersCommand::Find { query, limit, json },
         } => print_users(service.find_users(&query, limit).await?, json),
+        Command::Mcp => mcp::serve_stdio(service).await,
     }
 }
 
@@ -347,6 +351,10 @@ mod tests {
             Command::Users {
                 command: UsersCommand::Find { limit: 3, .. }
             }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lurkline", "mcp"]).unwrap().command,
+            Command::Mcp
         ));
     }
 }

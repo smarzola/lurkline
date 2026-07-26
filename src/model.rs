@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,7 +147,7 @@ pub(crate) struct RawUserProfile {
     pub image_72: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationKind {
     Channel,
@@ -154,7 +155,7 @@ pub enum ConversationKind {
     GroupDirectMessage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct UnreadConversation {
     pub id: String,
     pub kind: ConversationKind,
@@ -164,28 +165,28 @@ pub struct UnreadConversation {
     pub latest: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct UnreadThreads {
     pub has_unreads: bool,
     pub mention_count: u64,
     pub unread_count_by_channel: BTreeMap<String, u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct UnreadReport {
     pub team_id: String,
     pub conversations: Vec<UnreadConversation>,
     pub threads: UnreadThreads,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct DoctorReport {
     pub authenticated: bool,
     pub team_id: String,
     pub workspace_url: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Message {
     pub channel_id: String,
     pub ts: String,
@@ -199,13 +200,13 @@ pub struct Message {
     pub files: Vec<FileReference>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Reaction {
     pub name: String,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct FileReference {
     pub id: String,
     pub name: String,
@@ -214,7 +215,7 @@ pub struct FileReference {
     pub download_url: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct MessagePage {
     pub channel_id: String,
     pub messages: Vec<Message>,
@@ -222,7 +223,7 @@ pub struct MessagePage {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ThreadPage {
     pub channel_id: String,
     pub thread_ts: String,
@@ -231,7 +232,7 @@ pub struct ThreadPage {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct User {
     pub id: String,
     pub name: String,
@@ -244,7 +245,7 @@ pub struct User {
     pub image_url: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct UserSearchReport {
     pub query: String,
     pub users: Vec<User>,

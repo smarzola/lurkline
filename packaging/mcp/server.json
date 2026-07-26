@@ -1,0 +1,19 @@
+{
+  "name": "lurkline",
+  "version": "0.1.0",
+  "transport": {
+    "type": "stdio",
+    "command": "lurkline",
+    "args": [
+      "mcp"
+    ]
+  },
+  "policy": "read-only",
+  "required_env": [
+    "SLACK_BASE_URL",
+    "SLACK_TEAM_ID",
+    "SLACK_TOKEN",
+    "SLACK_COOKIE"
+  ]
+}
+

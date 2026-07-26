@@ -1,0 +1,140 @@
+use std::{process::Stdio, time::Duration};
+
+use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{ChildStdin, Command},
+    time::timeout,
+};
+
+async fn send(stdin: &mut ChildStdin, message: Value) {
+    let mut encoded = serde_json::to_vec(&message).unwrap();
+    encoded.push(b'\n');
+    stdin.write_all(&encoded).await.unwrap();
+    stdin.flush().await.unwrap();
+}
+
+async fn response_with_id(
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+    expected_id: u64,
+) -> Value {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let bytes = stdout.read_line(&mut line).await.unwrap();
+            assert_ne!(bytes, 0, "MCP server closed before response {expected_id}");
+            let value: Value = serde_json::from_str(&line).expect("stdout must be JSONL only");
+            if value["id"] == expected_id {
+                return value;
+            }
+        }
+    })
+    .await
+    .expect("MCP response timeout")
+}
+
+#[tokio::test]
+async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lurkline"))
+        .arg("mcp")
+        .env("SLACK_BASE_URL", "https://example.slack.com")
+        .env("SLACK_TEAM_ID", "T000TEST")
+        .env("SLACK_TOKEN", "xoxc-mcp-test-secret")
+        .env("SLACK_COOKIE", "d=xoxd-mcp-test-secret; b=test")
+        .env_remove("LURKLINE_TIMEOUT_MS")
+        .env_remove("LURKLINE_MAX_RESPONSE_BYTES")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = child.stderr.take().unwrap();
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "raw-test", "version": "1.0"}
+            }
+        }),
+    )
+    .await;
+    let initialized = response_with_id(&mut stdout, 1).await;
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "lurkline");
+    assert_eq!(
+        initialized["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }),
+    )
+    .await;
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    let tools = response_with_id(&mut stdout, 2).await;
+    let names = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from([
+            "slack_doctor",
+            "slack_find_users",
+            "slack_get_message",
+            "slack_list_unreads",
+            "slack_read_channel",
+            "slack_read_thread",
+        ])
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_read_channel",
+                "arguments": {"channel_id": "bad", "limit": 1}
+            }
+        }),
+    )
+    .await;
+    let invalid = response_with_id(&mut stdout, 3).await;
+    assert_eq!(invalid["result"]["isError"], true);
+    assert!(
+        invalid["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("invalid channel_id")
+    );
+
+    drop(stdin);
+    let status = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("MCP server did not stop on EOF")
+        .unwrap();
+    assert!(status.success());
+    let mut diagnostics = String::new();
+    stderr.read_to_string(&mut diagnostics).await.unwrap();
+    assert!(diagnostics.is_empty(), "unexpected stderr: {diagnostics}");
+}

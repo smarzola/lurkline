@@ -31,6 +31,8 @@ pub enum Error {
     NotFound { resource: &'static str },
     #[error("could not serialize output")]
     Output,
+    #[error("MCP stdio transport failed")]
+    McpTransport,
 }
 
 impl Error {

@@ -2,6 +2,7 @@ pub mod cli;
 mod config;
 mod error;
 mod http;
+mod mcp;
 mod model;
 mod service;
 

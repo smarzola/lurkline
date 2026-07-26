@@ -176,18 +176,18 @@ Verification:
 
 ## Definition of Done
 
-- [ ] All target CLI commands exist and share one typed service layer.
-- [ ] All target MCP tools exist and return structured, bounded results.
-- [ ] No write-capable Slack method or automatic credential extraction exists.
-- [ ] Real secrets, HARs, workspace data, and user data are absent from Git history.
-- [ ] Configuration and runtime errors cannot reveal token or cookie values.
-- [ ] Synthetic tests exercise request shape, parsing, bounds, authentication
+- [x] All target CLI commands exist and share one typed service layer.
+- [x] All target MCP tools exist and return structured, bounded results.
+- [x] No write-capable Slack method or automatic credential extraction exists.
+- [x] Real secrets, HARs, workspace data, and user data are absent from Git history.
+- [x] Configuration and runtime errors cannot reveal token or cookie values.
+- [x] Synthetic tests exercise request shape, parsing, bounds, authentication
       expiry, non-JSON, oversized responses, and Slack API errors.
 - [ ] Formatting, lint, all tests, locked release build, CLI smoke, and raw MCP
       smoke pass from the final path.
-- [ ] README documents installation, configuration, security model, commands, MCP
+- [x] README documents installation, configuration, security model, commands, MCP
       setup, limitations, and recovery from expired credentials.
-- [ ] Goal branch has Conventional Commit checkpoints and an adversarial review
+- [x] Goal branch has Conventional Commit checkpoints and an adversarial review
       trail.
 - [ ] Final audited branch is fast-forwarded into local `main`.
 - [ ] `/Users/smarzola/projects/lurkline` exists and is the verified Git root.
@@ -222,7 +222,7 @@ tools/list, and one validation-error tool call rather than left running.
 - [x] 2026-07-26: created staging repository and typed goal branch from baseline.
 - [x] 2026-07-26: Milestone 1 implemented, reviewed, and verified (13 tests).
 - [x] 2026-07-26: Milestone 2 implemented, reviewed, and verified (26 tests).
-- [ ] Milestone 3 implemented, reviewed, verified, and committed.
+- [x] 2026-07-26: Milestone 3 implemented, reviewed, and verified (29 tests).
 - [ ] Independent final audit passed.
 - [ ] Final path, local main, GitHub repository, push, and read-back verified.
 
@@ -264,3 +264,6 @@ independent audit here before marking the goal complete.
   regression caused by assuming every Slack user ID starts with `U`; added `W`
   enterprise-user coverage.
 - 2026-07-26 Milestone 2 final re-check: `CLEAN`.
+- 2026-07-26 Milestone 3 review: `CLEAN`; six read-only MCP tools, in-process
+  and process-level protocol coverage, stdout/stderr separation, operator docs,
+  packaging metadata, dependency lock, license, and credential hygiene accepted.
