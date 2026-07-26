@@ -1664,26 +1664,61 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "writes one synthetic macOS Keychain entry and removes it immediately"]
+    #[ignore = "writes one synthetic temporary macOS Keychain entry and removes it immediately"]
     fn native_keyring_round_trip() {
-        struct Cleanup(ProfileName);
+        use security_framework::os::macos::{
+            keychain::{CreateOptions, SecKeychain},
+            passwords::find_generic_password,
+        };
 
-        impl Drop for Cleanup {
+        struct Cleanup<'a> {
+            keychain: &'a SecKeychain,
+            account: &'a str,
+        }
+
+        impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
-                let _ = NativeCredentialStore.delete(&self.0);
+                if let Ok((_, item)) = find_generic_password(
+                    Some(std::slice::from_ref(self.keychain)),
+                    KEYRING_SERVICE,
+                    self.account,
+                ) {
+                    item.delete();
+                }
             }
         }
 
+        let directory = TestDirectory::new("native-keychain");
+        fs::create_dir_all(&directory.0).unwrap();
+        let keychain = CreateOptions::new()
+            .password("synthetic-keychain-password")
+            .create(directory.0.join("lurkline-smoke.keychain"))
+            .unwrap();
         let profile = ProfileName::parse(&format!("native-smoke-{}", std::process::id())).unwrap();
-        let _cleanup = Cleanup(profile.clone());
-        let store = NativeCredentialStore;
-        let _ = store.delete(&profile);
+        let _cleanup = Cleanup {
+            keychain: &keychain,
+            account: profile.as_str(),
+        };
         let encoded = encode_bundle(&bundle("example", "TTEST", "xoxc-test-token")).unwrap();
-        store.set(&profile, &encoded).unwrap();
-        let loaded = store.get(&profile).unwrap().unwrap();
+        keychain
+            .set_generic_password(KEYRING_SERVICE, profile.as_str(), &encoded)
+            .unwrap();
+        let (loaded, item) = find_generic_password(
+            Some(std::slice::from_ref(&keychain)),
+            KEYRING_SERVICE,
+            profile.as_str(),
+        )
+        .unwrap();
         let decoded = decode_bundle(&profile, &loaded).unwrap();
         assert_eq!(decoded.team_id, "TTEST");
-        assert!(store.delete(&profile).unwrap());
-        assert!(store.get(&profile).unwrap().is_none());
+        item.delete();
+        assert!(
+            find_generic_password(
+                Some(std::slice::from_ref(&keychain)),
+                KEYRING_SERVICE,
+                profile.as_str(),
+            )
+            .is_err()
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "lurkline"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Read-only Slack CLI and MCP over an existing browser session"
@@ -26,3 +26,6 @@ zeroize = { version = "1.9", features = ["derive"] }
 [dev-dependencies]
 axum = "0.8"
 rmcp = { version = "2.2", features = ["client"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+security-framework = "3.7"

@@ -53,7 +53,7 @@ fn stdout(args: &[&str]) -> String {
 }
 
 #[test]
-fn version_and_help_expose_the_complete_v020_cli_without_configuration() {
+fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
     assert_eq!(
         stdout(&["--version"]).trim(),
         format!("lurkline {}", env!("CARGO_PKG_VERSION"))
@@ -72,6 +72,26 @@ fn version_and_help_expose_the_complete_v020_cli_without_configuration() {
         assert!(root.contains(command), "root help omitted {command}");
     }
     assert!(root.contains("--profile"));
+
+    let auth = stdout(&["auth", "--help"]);
+    for command in ["import-curl", "list", "status", "remove"] {
+        assert!(auth.contains(command), "auth help omitted {command}");
+    }
+
+    let import = stdout(&["auth", "import-curl", "--help"]);
+    assert!(import.contains("standard input"));
+    assert!(import.contains("--replace-workspace"));
+    assert!(import.contains("--profile"));
+    assert!(import.contains("--json"));
+
+    for command in ["list", "status", "remove"] {
+        let help = stdout(&["auth", command, "--help"]);
+        assert!(
+            help.contains("--profile"),
+            "{command} help omitted --profile"
+        );
+        assert!(help.contains("--json"), "{command} help omitted --json");
+    }
 
     let inbox = stdout(&["inbox", "--help"]);
     assert!(inbox.contains("--conversations"));
