@@ -1,10 +1,16 @@
-use std::fmt::Write as _;
+use std::{env, fmt::Write as _, io::Read};
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use crate::{
+    auth::{
+        AuthImportReport, AuthListReport, AuthRemoveReport, AuthStatusReport, ProfileName,
+        list_profiles, profile_status, remove_profile, resolve_config, store_profile,
+    },
     config::Config,
+    curl_import::{MAX_CURL_BYTES, parse_copy_as_curl},
     error::{Error, Result},
     http::SlackHttpClient,
     mcp,
@@ -23,12 +29,20 @@ use crate::{
     about = "Read-only Slack access through an existing browser session"
 )]
 pub struct Cli {
+    /// Use a named credential profile. LURKLINE_PROFILE is the fallback.
+    #[arg(long, global = true)]
+    pub profile: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Import and manage secure browser-session credential profiles.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Validate configuration and probe the Slack browser session.
     Doctor {
         /// Emit stable JSON.
@@ -85,6 +99,37 @@ pub enum Command {
     },
     /// Run the read-only MCP server over stdin/stdout.
     Mcp,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Import a Chrome Copy-as-cURL request from standard input.
+    ImportCurl {
+        /// Allow an existing profile to change Slack workspace.
+        #[arg(long)]
+        replace_workspace: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List registered credential profiles without reading their secrets.
+    List {
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show non-secret metadata and credential presence for one profile.
+    Status {
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one profile from the OS credential store and local registry.
+    Remove {
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -209,10 +254,55 @@ pub enum UsersCommand {
 }
 
 pub async fn run_cli(cli: Cli) -> Result<()> {
-    let config = Config::from_env()?;
-    let client = SlackHttpClient::new(config.clone())?;
-    let service = SlackService::new(client, &config);
     match cli.command {
+        Command::Auth { command } => run_auth(command, cli.profile.as_deref()).await,
+        command => run_slack_command(command, cli.profile.as_deref()).await,
+    }
+}
+
+async fn run_auth(command: AuthCommand, profile: Option<&str>) -> Result<()> {
+    match command {
+        AuthCommand::ImportCurl {
+            replace_workspace,
+            json,
+        } => {
+            let profile = profile
+                .ok_or_else(|| Error::invalid_input("profile", "is required for cURL import"))
+                .and_then(ProfileName::parse)?;
+            let bundle = {
+                let input = read_curl_stdin()?;
+                parse_copy_as_curl(&input)?
+            };
+            let config = Config::from_bundle_getter(bundle, |name| env::var(name).ok())?;
+            let client = SlackHttpClient::new(config)?;
+            let bundle = client.validate_session().await?.into_bundle();
+            print_auth_import(store_profile(&profile, bundle, replace_workspace)?, json)
+        }
+        AuthCommand::List { json } => print_auth_list(list_profiles()?, json),
+        AuthCommand::Status { json } => print_auth_status(profile_status(profile)?, json),
+        AuthCommand::Remove { json } => print_auth_remove(remove_profile(profile)?, json),
+    }
+}
+
+fn read_curl_stdin() -> Result<Zeroizing<Vec<u8>>> {
+    let mut input = Zeroizing::new(Vec::new());
+    std::io::stdin()
+        .lock()
+        .take((MAX_CURL_BYTES + 1) as u64)
+        .read_to_end(&mut input)
+        .map_err(|_| Error::InputRead)?;
+    if input.len() > MAX_CURL_BYTES {
+        return Err(Error::invalid_input("curl", "is larger than 256 KiB"));
+    }
+    Ok(input)
+}
+
+async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()> {
+    let config = resolve_config(profile)?;
+    let client = SlackHttpClient::new(config)?;
+    let service = SlackService::new(client.clone(), client.config());
+    match command {
+        Command::Auth { .. } => unreachable!("authentication commands are dispatched first"),
         Command::Doctor { json } => print_doctor(service.doctor().await?, json),
         Command::Unreads { json } => print_unreads(service.unreads().await?, json),
         Command::Inbox {
@@ -309,6 +399,66 @@ fn print_json(value: &impl Serialize) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(value).map_err(|_| Error::Output)?
+    );
+    Ok(())
+}
+
+fn print_auth_import(report: AuthImportReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    println!(
+        "stored\t{}\nworkspace\t{}\nteam\t{}\ndefault\t{}\nreplaced_workspace\t{}",
+        report.profile,
+        report.workspace_url,
+        report.team_id,
+        report.default,
+        report.replaced_workspace
+    );
+    Ok(())
+}
+
+fn print_auth_list(report: AuthListReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    if report.profiles.is_empty() {
+        println!("No credential profiles.");
+        return Ok(());
+    }
+    for profile in report.profiles {
+        let marker = if profile.default { "*" } else { " " };
+        println!(
+            "{marker}\t{}\t{}\tteam={}",
+            profile.profile, profile.workspace_url, profile.team_id
+        );
+    }
+    Ok(())
+}
+
+fn print_auth_status(report: AuthStatusReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    println!(
+        "profile\t{}\nworkspace\t{}\nteam\t{}\ndefault\t{}\ncredential_present\t{}",
+        report.profile,
+        report.workspace_url,
+        report.team_id,
+        report.default,
+        report.credential_present
+    );
+    Ok(())
+}
+
+fn print_auth_remove(report: AuthRemoveReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    println!(
+        "removed\t{}\ndefault\t{}",
+        report.profile,
+        report.default_profile.as_deref().unwrap_or("-")
     );
     Ok(())
 }
@@ -664,6 +814,38 @@ mod tests {
                 json: true
             }
         ));
+    }
+
+    #[test]
+    fn parses_auth_commands_with_profile_at_any_depth() {
+        let cli = Cli::try_parse_from([
+            "lurkline",
+            "auth",
+            "import-curl",
+            "--replace-workspace",
+            "--json",
+            "--profile",
+            "sferait",
+        ])
+        .unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("sferait"));
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::ImportCurl {
+                    replace_workspace: true,
+                    json: true
+                }
+            }
+        ));
+
+        for command in ["list", "status", "remove"] {
+            let cli =
+                Cli::try_parse_from(["lurkline", "--profile", "work", "auth", command, "--json"])
+                    .unwrap();
+            assert_eq!(cli.profile.as_deref(), Some("work"));
+            assert!(matches!(cli.command, Command::Auth { .. }));
+        }
     }
 
     #[test]

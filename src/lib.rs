@@ -1,5 +1,7 @@
+mod auth;
 pub mod cli;
 mod config;
+mod curl_import;
 mod error;
 mod http;
 mod mcp;

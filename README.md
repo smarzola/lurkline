@@ -1,15 +1,15 @@
 # lurkline
 
-`lurkline` provides read-only Slack access for humans and local agents. It
-includes a command-line interface (CLI) and a stdio Model Context Protocol
-(MCP) server. Both use credentials from an existing Slack browser session, so
-you don't need to create a Slack app, install a bot, or complete an OAuth flow.
+`lurkline` is for developers and local agent operators who need read-only
+Slack access through a signed-in browser session. It provides a command-line
+interface (CLI) and a stdio Model Context Protocol (MCP) server without
+requiring a Slack app, bot, or OAuth flow.
 
 Use `lurkline` to:
 
 - Discover channels, direct messages (DMs), and group DMs by name.
 - Search messages by text, conversation, and date.
-- Read a bounded inbox snapshot based on Slack's explicit unread state.
+- Read a bounded snapshot of Slack's explicit unread state.
 - Read paginated conversation history and threads.
 - Fetch an exact message or find workspace users.
 
@@ -21,14 +21,52 @@ read.
 > notice. A browser token and session cookie grant the same access as the
 > signed-in user. Handle them like a password.
 
-## Before you begin
+## Quick start
 
-You need:
+You need a signed-in Slack workspace and Chrome or another Chromium-based
+browser. [Install `lurkline`](#install-lurkline) before you continue.
 
-- A signed-in Slack workspace session.
-- Access to your browser's developer tools.
-- A local secret manager or another safe way to inject environment variables.
+1. Open the workspace, open **Developer Tools**, and select **Network**.
+2. Reload Slack and select a successful `POST` request to
+   `/api/client.counts` whose URL or form body contains `slack_route`.
+3. Right-click the request and select **Copy** > **Copy as cURL (bash)**.
+4. Import the copied request into a named profile:
+
+   ```sh
+   pbpaste | lurkline auth import-curl --profile work
+   ```
+
+   On Linux, use your trusted clipboard reader in place of `pbpaste`, for
+   example:
+
+   ```sh
+   wl-paste | lurkline auth import-curl --profile work
+   ```
+
+5. Validate and use the profile:
+
+   ```sh
+   lurkline --profile work doctor
+   lurkline --profile work inbox
+   ```
+
+The importer treats standard input as data. It never runs the copied command
+or invokes a shell or `curl`. It accepts at most 256 KiB, verifies the Slack
+origin and browser credential shape, makes one bounded read-only
+`client.counts` request, and stores only the normalized session fields.
+
+Clear the copied command from your clipboard and clipboard history after a
+successful import. Do not save it in a file, shell history, issue, or chat.
+
+## Requirements
+
+- macOS with an available Keychain, or Linux with an available and unlocked
+  Secret Service collection.
+- A signed-in Slack browser session.
 - Rust 1.88 or later if you build from source.
+
+There is no plaintext credential fallback. On a headless Linux host without
+Secret Service, use the non-persistent environment override described below.
 
 ## Install lurkline
 
@@ -41,9 +79,9 @@ provide binaries for Linux x86-64, Linux ARM64, and macOS ARM64.
 For example, verify and install the macOS ARM64 archive:
 
 ```sh
-shasum -a 256 -c lurkline-v0.2.0-macos-aarch64.tar.gz.sha256
-tar -xzf lurkline-v0.2.0-macos-aarch64.tar.gz
-sudo install lurkline-v0.2.0-macos-aarch64/lurkline /usr/local/bin/lurkline
+shasum -a 256 -c lurkline-v0.3.0-macos-aarch64.tar.gz.sha256
+tar -xzf lurkline-v0.3.0-macos-aarch64.tar.gz
+sudo install lurkline-v0.3.0-macos-aarch64/lurkline /usr/local/bin/lurkline
 lurkline --version
 ```
 
@@ -56,53 +94,118 @@ cargo install --locked --path .
 lurkline --version
 ```
 
-## Configure a browser session
+## Manage credential profiles
 
-### Capture the required values
+### Select a profile
 
-Use one successful Slack request as a temporary source:
+Pass `--profile` before or after a command:
 
-1. Open the signed-in Slack workspace.
-2. Open the browser's developer tools and select **Network**.
-3. Reload Slack.
-4. Select a successful `POST` request to `/api/client.counts`.
-5. Copy the request as cURL.
-6. Extract these values:
-   - `SLACK_BASE_URL`: The request origin, such as
-     `https://workspace.slack.com`.
-   - `SLACK_TEAM_ID`: The team ID from the Slack client URL or request
-     context.
-   - `SLACK_TOKEN`: The multipart `token` value.
-   - `SLACK_COOKIE`: The complete `Cookie` request header.
-7. Delete the copied command from clipboard history and any scratch files.
+```sh
+lurkline --profile work conversations list
+lurkline conversations list --profile work
+```
 
-The cookie must contain Slack's `d=` session cookie. Keep the complete header
-because Slack might depend on other browser cookies.
+You can also set a default selector for the process:
 
-### Inject the values
+```sh
+export LURKLINE_PROFILE='work'
+lurkline doctor
+```
 
-The following example shows the required variable names. Replace the
-placeholders through your local secret-injection mechanism:
+Stored-profile selection uses this precedence:
+
+1. `--profile`
+2. `LURKLINE_PROFILE`
+3. The registry default
+
+The first imported profile becomes the default. Later imports preserve that
+default.
+
+Profile names must contain 1 through 64 ASCII letters, digits, `.`, `_`, or
+`-`.
+
+### List and inspect profiles
+
+These commands never display tokens or cookies:
+
+```sh
+lurkline auth list
+lurkline auth status --profile work
+lurkline auth list --json
+```
+
+The status command reports the non-secret workspace metadata and whether the
+matching operating-system credential entry is present.
+
+### Rotate or replace a profile
+
+Copy a fresh browser request and repeat the import to rotate a session for the
+same workspace:
+
+```sh
+pbpaste | lurkline auth import-curl --profile work
+```
+
+Changing an existing profile to a different workspace or team requires
+explicit confirmation:
+
+```sh
+pbpaste | lurkline auth import-curl --profile work --replace-workspace
+```
+
+The new session is validated before any stored value changes. Registry and
+credential-store updates are serialized across processes and use rollback
+where possible.
+
+### Remove a profile
+
+```sh
+lurkline auth remove --profile work
+```
+
+Removing the default selects the lexicographically first remaining profile.
+Removing the last profile clears the default.
+
+### Storage locations
+
+Secret material is stored as one versioned entry per profile:
+
+- macOS: Keychain
+- Linux: Secret Service
+
+The keyring service name is `me.smarzola.lurkline.slack-session`; the account
+name is the profile name.
+
+A separate registry contains only profile names, workspace origins, team IDs,
+and the default selection:
+
+- macOS: `~/Library/Application Support/lurkline/profiles.json`
+- Linux: `$XDG_CONFIG_HOME/lurkline/profiles.json`, or
+  `~/.config/lurkline/profiles.json`
+
+Registry and lock files are owner-only on Unix and contain no token or cookie.
+
+## Use a non-persistent environment override
+
+Existing automation can provide all four Slack session variables instead of a
+stored profile:
 
 ```sh
 export SLACK_BASE_URL='https://workspace.slack.com'
 export SLACK_TEAM_ID='T_WORKSPACE_ID'
 export SLACK_TOKEN='<browser-session-token>'
 export SLACK_COOKIE='<complete-cookie-header>'
-```
-
-Don't store real values in shell history, committed files, MCP configuration,
-or issue reports.
-
-### Verify access
-
-```sh
 lurkline doctor
 ```
 
-This command makes one bounded `client.counts` request. It doesn't display
-credentials. Capture fresh values if Slack reports an expired or invalid
-session.
+Use a trusted secret-injection mechanism for real values. Do not put them in
+committed configuration or command arguments.
+
+The four variables are atomic: if any one is set, all four are required. A
+complete environment bundle has higher priority than stored profiles, and
+environment and stored fields are never combined. Authentication-management
+commands ignore these four variables so you can inspect or repair stored
+profiles independently.
 
 ## Discover conversations
 
@@ -129,9 +232,8 @@ fail instead of guessing. Supplying an ID to these read commands skips
 discovery.
 
 Raw uppercase alphanumeric values beginning with `C`, `D`, or `G` take ID
-precedence. If an exact name has that shape after case folding, add `#` or `@`
-to force name resolution. For example, use `#GENERAL2` to distinguish that name
-from the ID-shaped value `GENERAL2`.
+precedence. Add `#` or `@` to force a colliding exact name, for example
+`#GENERAL2`.
 
 ## Search messages
 
@@ -160,9 +262,9 @@ lurkline search messages deploy --cursor '<next-cursor>' --limit 20
 The query can contain standard Slack search modifiers. `--in` resolves an ID or
 exact name before applying the conversation filter. Dates must be valid
 `YYYY-MM-DD` values, and `--after` cannot be later than `--before`.
-Search resolves even an ID through bounded conversation discovery because Slack
-uses different `in:` modifiers for DMs and other conversation kinds.
-The same ID-precedence rule applies; add `#` or `@` to force a colliding name.
+Search resolves even an ID through bounded conversation discovery because
+Slack uses different `in:` modifiers for DMs and other conversation kinds. The
+same ID-precedence rule applies; add `#` or `@` to force a colliding name.
 
 Search JSON contains normalized conversation, timestamp, thread, author, text,
 permalink, total, and cursor fields. The reported total is Slack's workspace
@@ -183,15 +285,15 @@ lurkline inbox --conversations 20 --messages 50 --json
 ```
 
 Inbox ordering is deterministic: highest mention count first, then
-conversation ID. The operation:
+conversation ID. The operation does the following:
 
 1. Reads Slack's explicit unread conversation and thread counts.
 2. Selects at most the requested number of unread conversations.
 3. Resolves bounded conversation metadata.
 4. Reads at most the requested recent messages for each selection.
 
-Inbox does not infer exact unread message boundaries, fetch unread thread roots,
-or mark anything read. JSON reports `total_unread_conversations`,
+Inbox does not infer exact unread message boundaries, fetch unread thread
+roots, or mark anything read. JSON reports `total_unread_conversations`,
 `has_more_conversations`, and Slack's unread-thread summary. If bounded
 discovery cannot find a selected conversation, `metadata_is_complete` is
 `false`; archive, membership, privacy, and member-count fields must then be
@@ -215,51 +317,44 @@ lurkline thread read C0123456789 1712345678.000100 \
   --limit 100
 ```
 
-Fetch one exact message:
+Fetch one exact message or find users:
 
 ```sh
 lurkline message get platform 1712345678.000100
-```
-
-Find users:
-
-```sh
 lurkline users find alice --limit 20
 ```
 
 Message results normalize author, thread, reaction, and file-reference fields.
-File references can include private download URLs. `lurkline` doesn't download
+File references can include private download URLs. `lurkline` does not download
 the files.
 
 Add `--json` to any data-returning command for structured JSON.
 
 ## Use the MCP server
 
-Start the stdio server:
+Start the stdio server with a stored profile:
 
 ```sh
-lurkline mcp
+lurkline --profile work mcp
 ```
 
-Configure an MCP client to start the binary and inherit the required
-environment variables:
+Example MCP client configuration:
 
 ```json
 {
   "mcpServers": {
     "lurkline": {
       "command": "lurkline",
-      "args": ["mcp"]
+      "args": ["--profile", "work", "mcp"]
     }
   }
 }
 ```
 
-If your client doesn't inherit the shell environment, use its secret-injection
-feature or a permission-restricted local launcher. Don't embed Slack
-credentials in committed MCP configuration.
+Omit `--profile work` to use `LURKLINE_PROFILE` or the registry default. The MCP
+server and CLI resolve credentials through the same path.
 
-The CLI and MCP server use the same typed service behavior:
+The following table maps common tasks to CLI commands and MCP tools:
 
 | Task | CLI command | MCP tool |
 | --- | --- | --- |
@@ -279,6 +374,8 @@ stderr. Every tool has a structured output schema and read-only annotation.
 
 ## Limits
 
+The following table lists the primary and auxiliary bounds for each operation:
+
 | Operation | Primary result bound | Auxiliary discovery bound |
 | --- | ---: | --- |
 | Conversation list | One page of 200 | Up to 20 user pages of 200 when the page contains DMs |
@@ -294,7 +391,9 @@ Opaque cursors are limited to 2,048 non-control characters. Repeated response
 cursors fail instead of creating pagination loops. Result JSON reports
 continuation or scan truncation where the underlying operation supports it.
 
-Optional request controls:
+### Optional: Configure request controls
+
+The following environment variables configure request limits:
 
 | Variable | Default | Accepted range |
 | --- | ---: | ---: |
@@ -305,11 +404,12 @@ Optional request controls:
 
 The browser token and `d=` cookie carry your Slack user authority. `lurkline`:
 
-- Reads credentials only from environment variables.
-- Doesn't persist or intentionally print credentials.
+- Persists credentials only in macOS Keychain or Linux Secret Service.
+- Stores only normalized credential fields, never the copied cURL request.
+- Zeroizes owned secret buffers where practical and redacts diagnostics.
 - Sends credentials only to a root HTTPS origin for a single-label
   `*.slack.com` workspace.
-- Rejects redirects and limits response sizes.
+- Rejects redirects and limits request input and response output sizes.
 - Exposes no Slack write operation.
 - Escapes control characters in human-readable output.
 - Keeps MCP protocol output separate from diagnostics.
@@ -326,15 +426,17 @@ messages, or user data. The repository ignores `*.har`, `.env`, and `.env.*`.
 
 ## Unsupported behavior
 
-`lurkline` doesn't provide:
+`lurkline` does not provide:
 
 - Slack write operations.
 - Automatic browser credential extraction or refresh.
+- Bot or OAuth authentication.
+- Plaintext credential storage.
 - Local caching, unread-state persistence, or background synchronization.
 - A stability guarantee for Slack's private browser endpoints.
 
 Conversation discovery and message search follow Slack's documented method
-shapes because the captured browser traffic used during development didn't
+shapes because the captured browser traffic used during development did not
 contain those requests. Synthetic fixtures cover protocol behavior without
 committing real workspace data.
 
@@ -347,6 +449,7 @@ cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo build --release --locked
+python3 scripts/check-no-secrets.py
 ```
 
 ## License

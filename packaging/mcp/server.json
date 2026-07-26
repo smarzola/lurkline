@@ -1,6 +1,6 @@
 {
   "name": "lurkline",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "transport": {
     "type": "stdio",
     "command": "lurkline",
@@ -9,10 +9,14 @@
     ]
   },
   "policy": "read-only",
-  "required_env": [
+  "required_env": [],
+  "optional_env": [
+    "LURKLINE_PROFILE",
     "SLACK_BASE_URL",
     "SLACK_TEAM_ID",
     "SLACK_TOKEN",
-    "SLACK_COOKIE"
+    "SLACK_COOKIE",
+    "LURKLINE_TIMEOUT_MS",
+    "LURKLINE_MAX_RESPONSE_BYTES"
   ]
 }
