@@ -102,9 +102,9 @@ For example, run the following commands to verify and install the macOS ARM64
 archive:
 
 ```sh
-shasum -a 256 -c lurkline-v0.4.0-macos-aarch64.tar.gz.sha256
-tar -xzf lurkline-v0.4.0-macos-aarch64.tar.gz
-sudo install lurkline-v0.4.0-macos-aarch64/lurkline /usr/local/bin/lurkline
+shasum -a 256 -c lurkline-v0.4.1-macos-aarch64.tar.gz.sha256
+tar -xzf lurkline-v0.4.1-macos-aarch64.tar.gz
+sudo install lurkline-v0.4.1-macos-aarch64/lurkline /usr/local/bin/lurkline
 lurkline --version
 ```
 
@@ -399,7 +399,7 @@ lurkline drafts get DR123 --json
 Create a root-message draft from standard input:
 
 ```sh
-printf '%s\n' 'Review **release 0.4.0**.' \
+printf '%s\n' 'Review **release 0.4.1**.' \
   | lurkline drafts create platform
 ```
 
@@ -434,10 +434,11 @@ lurkline drafts send DR123 --confirm --json
 Draft pagination uses private Slack timestamps. Pass the returned `next_ts` to
 `--next-ts`.
 
-Lurkline mutates or publishes only drafts with one root or thread destination,
+Lurkline supports a draft only when it has one root or thread destination,
 Slack `rich_text` blocks, and no files, attachments, sent state, deleted state,
-or unknown destination fields. It marks other drafts as unsupported and
-doesn't modify them.
+or unrecognized destination fields. For DM destinations, Lurkline validates
+Slack's `user_ids` participant metadata but routes only by `channel_id`.
+Lurkline leaves unsupported drafts unchanged.
 
 Slack's draft methods are private and more likely to change than documented
 Slack methods. Refresh Lurkline or the browser credentials if Slack changes
@@ -448,7 +449,7 @@ their contract.
 Send a root message from standard input:
 
 ```sh
-printf '%s\n' 'Release **0.4.0** is ready.' \
+printf '%s\n' 'Release **0.4.1** is ready.' \
   | lurkline message send platform --confirm --json
 ```
 
