@@ -1373,7 +1373,7 @@ fn normalize_draft(raw: RawDraft, method: &'static str) -> Result<Draft> {
                 .is_some_and(|thread_ts| !is_valid_timestamp(thread_ts))
             || (destination.broadcast && destination.thread_ts.is_none())
             || destination.user_ids.as_ref().is_some_and(|user_ids| {
-                user_ids.len() > MAX_DRAFT_DESTINATION_USERS
+                !(1..=MAX_DRAFT_DESTINATION_USERS).contains(&user_ids.len())
                     || user_ids.iter().any(|user_id| !is_valid_user_id(user_id))
             })
         {
@@ -2635,6 +2635,7 @@ mod tests {
         );
 
         for user_ids in [
+            Vec::new(),
             vec!["invalid-user".into()],
             (0..=MAX_DRAFT_DESTINATION_USERS)
                 .map(|index| format!("U{index:03}"))
@@ -2649,6 +2650,25 @@ mod tests {
                 })
             ));
         }
+
+        let empty_user_ids = serde_json::from_value::<RawDraftResponse>(json!({
+            "draft": {
+                "id": "DR-empty-users",
+                "last_updated_ts": "1000",
+                "blocks": [{"type": "rich_text", "elements": []}],
+                "destinations": [{
+                    "channel_id": "D123",
+                    "user_ids": []
+                }]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            normalize_draft(empty_user_ids.draft, "drafts.info"),
+            Err(Error::InvalidResponse {
+                method: "drafts.info"
+            })
+        ));
 
         for malformed_user_ids in [json!("U123"), json!(null)] {
             assert!(
