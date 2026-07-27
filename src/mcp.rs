@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::Error,
+    markdown::render_markdown,
     model::{
         ConversationPage, ConversationSearchReport, DoctorReport, InboxReport, Message,
-        MessagePage, MessageSearchPage, ThreadPage, UnreadReport, UserSearchReport,
+        MessagePage, MessageSearchPage, RenderedMessage, ThreadPage, UnreadReport,
+        UserSearchReport,
     },
     service::SlackService,
 };
@@ -102,6 +104,12 @@ struct SearchMessagesRequest {
     /// Maximum matching messages to return, from 1 through 100.
     #[serde(default = "default_search_limit")]
     limit: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RenderMarkdownRequest {
+    /// Bounded CommonMark source to convert to Slack rich text.
+    markdown: String,
 }
 
 const fn default_channel_limit() -> usize {
@@ -198,6 +206,7 @@ fn error_code(error: &Error) -> &'static str {
         | Error::CredentialProfileMismatch { .. }
         | Error::CredentialReconciliation { .. } => "invalid_stored_credential",
         Error::InputRead => "input_read",
+        Error::MarkdownInputRead => "input_read",
         Error::Authentication => "authentication",
         Error::SlackApi { .. } => "slack_api",
         Error::HttpStatus { .. } => "http_status",
@@ -247,6 +256,25 @@ impl McpServer {
     )]
     async fn doctor(&self) -> CallToolResult {
         tool_result(self.service.doctor().await)
+    }
+
+    /// Convert bounded CommonMark to Slack rich-text blocks without contacting Slack.
+    #[tool(
+        name = "slack_render_markdown",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<RenderedMessage>>(),
+        annotations(
+            title = "Render Markdown as Slack rich text",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn render_markdown(
+        &self,
+        Parameters(request): Parameters<RenderMarkdownRequest>,
+    ) -> CallToolResult {
+        tool_result(render_markdown(&request.markdown))
     }
 
     /// List channels, DMs, group DMs, and thread counts Slack explicitly marks unread.
@@ -607,6 +635,7 @@ mod tests {
                 "slack_read_channel",
                 "slack_read_inbox",
                 "slack_read_thread",
+                "slack_render_markdown",
                 "slack_search_messages",
             ])
         );

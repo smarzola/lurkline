@@ -106,6 +106,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_read_channel",
             "slack_read_inbox",
             "slack_read_thread",
+            "slack_render_markdown",
             "slack_search_messages",
         ])
     );
@@ -139,6 +140,27 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             .as_str()
             .unwrap()
             .contains("force a colliding name")
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_render_markdown",
+                "arguments": {"markdown": "**hello**"}
+            }
+        }),
+    )
+    .await;
+    let rendered = response_with_id(&mut stdout, 20).await;
+    assert_eq!(rendered["result"]["isError"], false);
+    assert_eq!(rendered["result"]["structuredContent"]["text"], "hello");
+    assert_eq!(
+        rendered["result"]["structuredContent"]["blocks"][0]["type"],
+        "rich_text"
     );
 
     send(

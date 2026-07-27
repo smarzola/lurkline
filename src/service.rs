@@ -963,6 +963,7 @@ fn normalize_search_matches(
                 author_id,
                 author_name,
                 text: raw.text,
+                blocks: raw.blocks,
                 permalink,
             })
         })
@@ -1022,6 +1023,7 @@ fn normalize_message(channel: &str, message: RawMessage) -> Message {
         author_id: message.user.or(message.bot_id),
         author_name: message.username,
         text: message.text,
+        blocks: message.blocks,
         reply_count: message.reply_count,
         latest_reply: message.latest_reply,
         reactions: message
@@ -1263,6 +1265,7 @@ mod tests {
         sync::Mutex,
     };
 
+    use serde_json::json;
     use url::Url;
 
     use super::*;
@@ -2633,6 +2636,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lossless_rich_text_reads_preserve_unknown_missing_and_empty_blocks() {
+        let unknown_blocks = vec![json!({
+            "type": "rich_text",
+            "block_id": "synthetic",
+            "future_top_level": {"keep": [true, 7, null]},
+            "elements": [{
+                "type": "rich_text_section",
+                "future_element": "retained",
+                "elements": [{
+                    "type": "text",
+                    "text": "hello",
+                    "style": {"bold": true, "future_style": "kept"}
+                }]
+            }]
+        })];
+        let mut first = raw_message("100.000001", "fallback");
+        first.blocks = Some(unknown_blocks.clone());
+        let mut second = raw_message("100.000002", "explicitly empty");
+        second.blocks = Some(vec![]);
+        let third = raw_message("100.000003", "omitted");
+
+        let mut api = fake_api();
+        api.history.messages = vec![first, second, third];
+        api.search = RawMessageSearchResponse {
+            query: "fallback".into(),
+            messages: RawMessageSearchMatches {
+                matches: vec![RawMessageSearchMatch {
+                    channel: RawMessageSearchChannel {
+                        id: "C123".into(),
+                        name: "general".into(),
+                    },
+                    ts: "100.000001".into(),
+                    text: "fallback".into(),
+                    blocks: Some(unknown_blocks.clone()),
+                    ..RawMessageSearchMatch::default()
+                }],
+                total: 1,
+                ..RawMessageSearchMatches::default()
+            },
+            ..RawMessageSearchResponse::default()
+        };
+        let service = service(api);
+
+        let history = service.read_channel("C123", None, 3).await.unwrap();
+        assert_eq!(history.messages[0].blocks, Some(unknown_blocks.clone()));
+        assert_eq!(history.messages[1].blocks, Some(vec![]));
+        assert_eq!(history.messages[2].blocks, None);
+
+        let search = service
+            .search_messages("fallback", None, None, None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(search.matches[0].blocks, Some(unknown_blocks));
+    }
+
+    #[tokio::test]
     async fn local_message_truncation_always_sets_has_more() {
         let mut api = fake_api();
         api.history.messages = vec![
@@ -2755,6 +2814,7 @@ mod tests {
                 "author_id": "U123",
                 "author_name": null,
                 "text": "target",
+                "blocks": null,
                 "reply_count": 0,
                 "latest_reply": null,
                 "reactions": [{"name": "eyes", "count": 2}],

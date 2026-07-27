@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ClientCountsPayload {
@@ -73,6 +74,8 @@ pub(crate) struct RawMessage {
     pub username: Option<String>,
     #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub blocks: Option<Vec<Value>>,
     #[serde(default)]
     pub reply_count: u64,
     #[serde(default)]
@@ -175,6 +178,8 @@ pub(crate) struct RawMessageSearchMatch {
     pub username: Option<String>,
     #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub blocks: Option<Vec<Value>>,
     #[serde(default)]
     pub permalink: Option<String>,
 }
@@ -303,6 +308,9 @@ pub struct MessageSearchMatch {
     pub author_id: Option<String>,
     pub author_name: Option<String>,
     pub text: String,
+    /// Raw Slack Block Kit JSON. `None` means Slack omitted `blocks`; an empty
+    /// vector means Slack explicitly returned an empty array.
+    pub blocks: Option<Vec<Value>>,
     pub permalink: Option<String>,
 }
 
@@ -313,6 +321,14 @@ pub struct MessageSearchPage {
     pub total: u64,
     pub has_more: bool,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct RenderedMessage {
+    /// Plain-text fallback used for notifications and accessibility.
+    pub text: String,
+    /// Slack `rich_text` blocks generated from the Markdown source.
+    pub blocks: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -339,6 +355,8 @@ pub struct Message {
     pub author_id: Option<String>,
     pub author_name: Option<String>,
     pub text: String,
+    /// Raw Slack Block Kit JSON. Unknown block and element fields are retained.
+    pub blocks: Option<Vec<Value>>,
     pub reply_count: u64,
     pub latest_reply: Option<String>,
     pub reactions: Vec<Reaction>,

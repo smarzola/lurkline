@@ -13,11 +13,13 @@ use crate::{
     curl_import::{MAX_CURL_BYTES, parse_copy_as_curl},
     error::{Error, Result},
     http::SlackHttpClient,
+    markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     mcp,
     model::{
         Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
         ConversationSearchTruncationReason, DoctorReport, InboxReport, Message, MessagePage,
-        MessageSearchPage, ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        MessageSearchPage, RenderedMessage, ThreadPage, UnreadReport, UserSearchReport,
+        UserSearchTruncationReason,
     },
     service::{MAX_CONVERSATIONS, MAX_USERS, SlackService},
 };
@@ -182,6 +184,12 @@ pub enum MessageCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Render bounded Markdown from standard input as Slack rich text.
+    Render {
+        /// Emit the plain-text fallback and Slack blocks as stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -256,6 +264,9 @@ pub enum UsersCommand {
 pub async fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Auth { command } => run_auth(command, cli.profile.as_deref()).await,
+        Command::Message {
+            command: MessageCommand::Render { json },
+        } => print_rendered(render_markdown(&read_markdown_stdin()?)?, json),
         command => run_slack_command(command, cli.profile.as_deref()).await,
     }
 }
@@ -295,6 +306,22 @@ fn read_curl_stdin() -> Result<Zeroizing<Vec<u8>>> {
         return Err(Error::invalid_input("curl", "is larger than 256 KiB"));
     }
     Ok(input)
+}
+
+fn read_markdown_stdin() -> Result<String> {
+    let mut input = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take((MAX_MARKDOWN_BYTES + 1) as u64)
+        .read_to_end(&mut input)
+        .map_err(|_| Error::MarkdownInputRead)?;
+    if input.len() > MAX_MARKDOWN_BYTES {
+        return Err(Error::invalid_input(
+            "markdown",
+            "is larger than 40000 bytes",
+        ));
+    }
+    String::from_utf8(input).map_err(|_| Error::invalid_input("markdown", "must be valid UTF-8"))
 }
 
 async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()> {
@@ -388,10 +415,22 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                     json,
                 },
         } => print_message(service.get_message(&channel_id, &message_ts).await?, json),
+        Command::Message {
+            command: MessageCommand::Render { .. },
+        } => unreachable!("local Markdown rendering is dispatched before Slack configuration"),
         Command::Users {
             command: UsersCommand::Find { query, limit, json },
         } => print_users(service.find_users(&query, limit).await?, json),
         Command::Mcp => mcp::serve_stdio(service).await,
+    }
+}
+
+fn print_rendered(rendered: RenderedMessage, json: bool) -> Result<()> {
+    if json {
+        print_json(&rendered)
+    } else {
+        println!("{}", rendered.text);
+        Ok(())
     }
 }
 
@@ -961,6 +1000,14 @@ mod tests {
             Command::Message { .. }
         ));
         assert!(matches!(
+            Cli::try_parse_from(["lurkline", "message", "render", "--json"])
+                .unwrap()
+                .command,
+            Command::Message {
+                command: MessageCommand::Render { json: true }
+            }
+        ));
+        assert!(matches!(
             Cli::try_parse_from(["lurkline", "users", "find", "alice", "--limit", "3"])
                 .unwrap()
                 .command,
@@ -1043,6 +1090,7 @@ mod tests {
                 author_id: Some("U456".into()),
                 author_name: None,
                 text: "hello\r\x1b".into(),
+                blocks: None,
                 permalink: None,
             };
             assert_eq!(

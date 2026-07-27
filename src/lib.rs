@@ -4,6 +4,7 @@ mod config;
 mod curl_import;
 mod error;
 mod http;
+mod markdown;
 mod mcp;
 mod model;
 mod service;

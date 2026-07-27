@@ -51,6 +51,8 @@ pub enum Error {
     CredentialReconciliation { profile: String },
     #[error("could not read cURL input from standard input")]
     InputRead,
+    #[error("could not read Markdown input from standard input")]
+    MarkdownInputRead,
     #[error("Slack browser session is expired or invalid; copy fresh browser credentials")]
     Authentication,
     #[error("Slack method {method} failed: {code}")]
