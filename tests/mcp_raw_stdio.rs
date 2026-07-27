@@ -98,15 +98,23 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         names,
         std::collections::BTreeSet::from([
             "slack_doctor",
+            "slack_create_draft",
+            "slack_delete_draft",
             "slack_find_conversations",
             "slack_find_users",
+            "slack_get_draft",
             "slack_get_message",
             "slack_list_conversations",
+            "slack_list_drafts",
             "slack_list_unreads",
             "slack_read_channel",
             "slack_read_inbox",
             "slack_read_thread",
+            "slack_render_markdown",
             "slack_search_messages",
+            "slack_send_draft",
+            "slack_send_message",
+            "slack_update_draft",
         ])
     );
     for tool_name in [
@@ -139,6 +147,131 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             .as_str()
             .unwrap()
             .contains("force a colliding name")
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_render_markdown",
+                "arguments": {"markdown": "**hello**"}
+            }
+        }),
+    )
+    .await;
+    let rendered = response_with_id(&mut stdout, 20).await;
+    assert_eq!(rendered["result"]["isError"], false);
+    assert_eq!(rendered["result"]["structuredContent"]["text"], "hello");
+    assert_eq!(
+        rendered["result"]["structuredContent"]["blocks"][0]["type"],
+        "rich_text"
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 23,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_render_markdown",
+                "arguments": {
+                    "markdown": format!("{}visible\n", "> ".repeat(256))
+                }
+            }
+        }),
+    )
+    .await;
+    let nested = response_with_id(&mut stdout, 23).await;
+    assert_eq!(nested["result"]["isError"], true);
+    assert_eq!(
+        nested["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "invalid_input",
+                "message": "invalid markdown: nesting exceeds 64 levels"
+            }
+        })
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_render_markdown",
+                "arguments": {"markdown": "still alive"}
+            }
+        }),
+    )
+    .await;
+    let after_nested = response_with_id(&mut stdout, 24).await;
+    assert_eq!(after_nested["result"]["isError"], false);
+    assert_eq!(
+        after_nested["result"]["structuredContent"]["text"],
+        "still alive"
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_create_draft",
+                "arguments": {
+                    "conversation": "C123",
+                    "markdown": "must not reach Slack"
+                }
+            }
+        }),
+    )
+    .await;
+    let write_disabled = response_with_id(&mut stdout, 21).await;
+    assert_eq!(write_disabled["result"]["isError"], true);
+    assert_eq!(
+        write_disabled["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "write_not_allowed",
+                "message": "Slack writes are disabled; start the MCP server with --allow-write"
+            }
+        })
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_send_message",
+                "arguments": {
+                    "conversation": "C123",
+                    "markdown": "must not reach Slack",
+                    "confirm": true
+                }
+            }
+        }),
+    )
+    .await;
+    let send_disabled = response_with_id(&mut stdout, 22).await;
+    assert_eq!(send_disabled["result"]["isError"], true);
+    assert_eq!(
+        send_disabled["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "write_not_allowed",
+                "message": "Slack writes are disabled; start the MCP server with --allow-write"
+            }
+        })
     );
 
     send(

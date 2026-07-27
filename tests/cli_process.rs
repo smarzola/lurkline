@@ -53,13 +53,14 @@ fn stdout(args: &[&str]) -> String {
 }
 
 #[test]
-fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
+fn version_and_help_expose_the_complete_v040_cli_without_configuration() {
     assert_eq!(
         stdout(&["--version"]).trim(),
         format!("lurkline {}", env!("CARGO_PKG_VERSION"))
     );
 
     let root = stdout(&["--help"]);
+    assert!(root.contains("guarded rich-text authoring"));
     for command in [
         "auth",
         "inbox",
@@ -67,6 +68,7 @@ fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
         "search",
         "channel",
         "thread",
+        "drafts",
         "mcp",
     ] {
         assert!(root.contains(command), "root help omitted {command}");
@@ -121,11 +123,113 @@ fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
     let message = stdout(&["message", "get", "--help"]);
     assert!(message.contains("conversation ID or exact name"));
     assert!(message.contains("use # or @ to force a colliding name"));
+    let render = stdout(&["message", "render", "--help"]);
+    assert!(render.contains("standard input"));
+    assert!(render.contains("--json"));
+    let message_group = stdout(&["message", "--help"]);
+    for command in ["get", "render", "send"] {
+        assert!(
+            message_group.contains(command),
+            "message help omitted {command}"
+        );
+    }
+    let thread_group = stdout(&["thread", "--help"]);
+    for command in ["read", "reply"] {
+        assert!(
+            thread_group.contains(command),
+            "thread help omitted {command}"
+        );
+    }
 
     let list = stdout(&["conversations", "list", "--help"]);
     assert!(list.contains("from 1 through 200"));
     let find = stdout(&["conversations", "find", "--help"]);
     assert!(find.contains("from 1 through 100"));
+
+    let drafts = stdout(&["drafts", "--help"]);
+    for command in ["list", "get", "create", "update", "delete", "send"] {
+        assert!(drafts.contains(command), "draft help omitted {command}");
+    }
+    let draft_create = stdout(&["drafts", "create", "--help"]);
+    for option in ["--thread-ts", "--broadcast", "--json"] {
+        assert!(
+            draft_create.contains(option),
+            "draft create help omitted {option}"
+        );
+    }
+    assert!(draft_create.contains("standard input"));
+    let draft_delete = stdout(&["drafts", "delete", "--help"]);
+    assert!(draft_delete.contains("--confirm"));
+
+    let mcp = stdout(&["mcp", "--help"]);
+    assert!(mcp.contains("--allow-write"));
+}
+
+#[test]
+fn authoring_help_exposes_confirmed_root_reply_and_draft_publication() {
+    let message = stdout(&["message", "send", "--help"]);
+    assert!(message.contains("standard input"));
+    assert!(message.contains("--confirm"));
+    assert!(message.contains("--json"));
+
+    let reply = stdout(&["thread", "reply", "--help"]);
+    assert!(reply.contains("standard input"));
+    assert!(reply.contains("--broadcast"));
+    assert!(reply.contains("--confirm"));
+    assert!(reply.contains("--json"));
+
+    let draft = stdout(&["drafts", "send", "--help"]);
+    assert!(draft.contains("--confirm"));
+    assert!(draft.contains("--json"));
+}
+
+#[test]
+fn markdown_render_is_local_bounded_and_emits_stable_rich_text() {
+    let output = run_with_stdin(
+        &["message", "render", "--json"],
+        b"Hello **world** from [docs](https://example.com).",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let rendered: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        rendered["text"],
+        "Hello world from docs (https://example.com)."
+    );
+    assert_eq!(rendered["blocks"][0]["type"], "rich_text");
+    assert_eq!(
+        rendered["blocks"][0]["elements"][0]["elements"][1]["style"]["bold"],
+        true
+    );
+
+    let invalid_utf8 = run_with_stdin(&["message", "render"], &[0xff]);
+    assert!(!invalid_utf8.status.success());
+    assert_eq!(
+        String::from_utf8(invalid_utf8.stderr).unwrap(),
+        "error: invalid markdown: must be valid UTF-8\n"
+    );
+
+    let oversized = run_with_stdin(
+        &["message", "render"],
+        &vec![b'x'; 40_000_usize.saturating_add(1)],
+    );
+    assert!(!oversized.status.success());
+    assert_eq!(
+        String::from_utf8(oversized.stderr).unwrap(),
+        "error: invalid markdown: is larger than 40000 bytes\n"
+    );
+
+    let deeply_nested_quote = format!("{}visible\n", "> ".repeat(256));
+    let nested = run_with_stdin(&["message", "render"], deeply_nested_quote.as_bytes());
+    assert_eq!(nested.status.code(), Some(1), "renderer process aborted");
+    assert_eq!(
+        String::from_utf8(nested.stderr).unwrap(),
+        "error: invalid markdown: nesting exceeds 64 levels\n"
+    );
 }
 
 #[test]

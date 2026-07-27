@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ClientCountsPayload {
@@ -73,6 +74,8 @@ pub(crate) struct RawMessage {
     pub username: Option<String>,
     #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub blocks: Option<Vec<Value>>,
     #[serde(default)]
     pub reply_count: u64,
     #[serde(default)]
@@ -176,6 +179,8 @@ pub(crate) struct RawMessageSearchMatch {
     #[serde(default)]
     pub text: String,
     #[serde(default)]
+    pub blocks: Option<Vec<Value>>,
+    #[serde(default)]
     pub permalink: Option<String>,
 }
 
@@ -184,6 +189,66 @@ pub(crate) struct RawMessageSearchChannel {
     pub id: String,
     #[serde(default)]
     pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawDraftsPage {
+    #[serde(default)]
+    pub drafts: Vec<RawDraft>,
+    #[serde(default)]
+    pub files: Vec<Value>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawDraftResponse {
+    pub draft: RawDraft,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawMutationResponse {}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawPostMessageResponse {
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub ts: String,
+    pub message: RawMessage,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawDraft {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub client_msg_id: Option<String>,
+    #[serde(default)]
+    pub last_updated_ts: Option<RawDraftRevision>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub blocks: Option<Vec<Value>>,
+    #[serde(default)]
+    pub destinations: Vec<DraftDestination>,
+    #[serde(default)]
+    pub file_ids: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<Value>,
+    #[serde(default)]
+    pub is_from_composer: bool,
+    #[serde(default)]
+    pub is_deleted: bool,
+    #[serde(default)]
+    pub is_sent: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RawDraftRevision {
+    String(String),
+    Number(serde_json::Number),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -303,6 +368,9 @@ pub struct MessageSearchMatch {
     pub author_id: Option<String>,
     pub author_name: Option<String>,
     pub text: String,
+    /// Raw Slack Block Kit JSON. `None` means Slack omitted `blocks`; an empty
+    /// vector means Slack explicitly returned an empty array.
+    pub blocks: Option<Vec<Value>>,
     pub permalink: Option<String>,
 }
 
@@ -313,6 +381,90 @@ pub struct MessageSearchPage {
     pub total: u64,
     pub has_more: bool,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct RenderedMessage {
+    /// Plain-text fallback used for notifications and accessibility.
+    pub text: String,
+    /// Slack `rich_text` blocks generated from the Markdown source.
+    pub blocks: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct DraftDestination {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_ts: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub broadcast: bool,
+    /// Unknown private-API destination fields are retained for diagnostics but
+    /// make the draft unsupported for mutation or publication.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Draft {
+    pub id: String,
+    pub client_msg_id: Option<String>,
+    /// Slack's server revision, used as the drafts.list continuation cursor.
+    pub last_updated_ts: String,
+    /// Browser-compatible timestamp derived from the server revision for deletion.
+    pub client_last_updated_ts: String,
+    pub text: String,
+    pub blocks: Option<Vec<Value>>,
+    pub destinations: Vec<DraftDestination>,
+    pub file_ids: Vec<String>,
+    pub attachments: Vec<Value>,
+    pub is_from_composer: bool,
+    /// Whether Lurkline can safely update, delete, or publish this draft.
+    pub is_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftPage {
+    pub drafts: Vec<Draft>,
+    pub has_more: bool,
+    /// Pass this private-API timestamp to the next list request.
+    pub next_ts: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftDeleteReport {
+    pub id: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SentMessage {
+    /// Client-generated UUID v4 used to make the publication identifiable.
+    pub client_msg_id: String,
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftCleanupWarning {
+    /// Draft that remains after the message was acknowledged by Slack.
+    pub draft_id: String,
+    /// Server revision observed immediately before publication.
+    pub last_updated_ts: String,
+    /// Secret-safe reason the post-success cleanup failed.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftSendReport {
+    pub sent: SentMessage,
+    pub draft_id: String,
+    pub draft_deleted: bool,
+    /// Present only when Slack acknowledged the message but draft deletion failed.
+    pub cleanup_warning: Option<DraftCleanupWarning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -339,6 +491,8 @@ pub struct Message {
     pub author_id: Option<String>,
     pub author_name: Option<String>,
     pub text: String,
+    /// Raw Slack Block Kit JSON. Unknown block and element fields are retained.
+    pub blocks: Option<Vec<Value>>,
     pub reply_count: u64,
     pub latest_reply: Option<String>,
     pub reactions: Vec<Reaction>,

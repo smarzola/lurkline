@@ -1,21 +1,26 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use crate::{
     config::Config,
     error::{Error, Result},
+    markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     model::{
         ClientCountsPayload, Conversation, ConversationKind, ConversationPage,
-        ConversationSearchReport, ConversationSearchTruncationReason, DoctorReport, FileReference,
-        InboxConversation, InboxReport, Message, MessagePage, MessageSearchMatch,
-        MessageSearchPage, RawConversation, RawConversationsPage, RawMessage, RawMessagePage,
-        RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList, RawUnread, RawUser,
-        RawUsersPage, Reaction, ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User,
-        UserSearchReport, UserSearchTruncationReason,
+        ConversationSearchReport, ConversationSearchTruncationReason, DoctorReport, Draft,
+        DraftCleanupWarning, DraftDeleteReport, DraftDestination, DraftPage, DraftSendReport,
+        FileReference, InboxConversation, InboxReport, Message, MessagePage, MessageSearchMatch,
+        MessageSearchPage, RawConversation, RawConversationsPage, RawDraft, RawDraftResponse,
+        RawDraftRevision, RawDraftsPage, RawMessage, RawMessagePage, RawMessageSearchMatch,
+        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
+        RawUnread, RawUser, RawUsersPage, Reaction, SentMessage, ThreadPage, UnreadConversation,
+        UnreadReport, UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
     },
 };
 
@@ -28,6 +33,7 @@ pub(crate) const MAX_SEARCH_MESSAGES: usize = 100;
 const MAX_CONVERSATION_PAGES: usize = 20;
 const USERS_PAGE_SIZE: usize = 200;
 const MAX_USER_PAGES: usize = 20;
+pub(crate) const MAX_DRAFTS: usize = 100;
 
 #[async_trait]
 pub(crate) trait SlackApi: Send + Sync {
@@ -58,6 +64,65 @@ pub(crate) trait SlackApi: Send + Sync {
         limit: usize,
     ) -> Result<RawMessageSearchResponse>;
     async fn users_list(&self, cursor: Option<&str>, limit: usize) -> Result<RawUsersPage>;
+    async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
+        let _ = (next_ts, limit);
+        Err(Error::InvalidResponse {
+            method: "drafts.list",
+        })
+    }
+    async fn drafts_info(&self, draft_id: &str) -> Result<RawDraftResponse> {
+        let _ = draft_id;
+        Err(Error::InvalidResponse {
+            method: "drafts.info",
+        })
+    }
+    async fn drafts_create(
+        &self,
+        client_msg_id: &str,
+        destinations: &[DraftDestination],
+        blocks: &[serde_json::Value],
+    ) -> Result<RawDraftResponse> {
+        let _ = (client_msg_id, destinations, blocks);
+        Err(Error::InvalidResponse {
+            method: "drafts.create",
+        })
+    }
+    async fn drafts_update(
+        &self,
+        draft_id: &str,
+        last_updated_ts: &str,
+        destinations: &[DraftDestination],
+        blocks: &[serde_json::Value],
+    ) -> Result<RawDraftResponse> {
+        let _ = (draft_id, last_updated_ts, destinations, blocks);
+        Err(Error::InvalidResponse {
+            method: "drafts.update",
+        })
+    }
+    async fn drafts_delete(
+        &self,
+        draft_id: &str,
+        last_updated_ts: &str,
+    ) -> Result<RawMutationResponse> {
+        let _ = (draft_id, last_updated_ts);
+        Err(Error::InvalidResponse {
+            method: "drafts.delete",
+        })
+    }
+    async fn chat_post_message(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        broadcast: bool,
+        client_msg_id: &str,
+        text: &str,
+        blocks: &[serde_json::Value],
+    ) -> Result<RawPostMessageResponse> {
+        let _ = (channel, thread_ts, broadcast, client_msg_id, text, blocks);
+        Err(Error::InvalidResponse {
+            method: "chat.postMessage",
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -65,6 +130,7 @@ pub(crate) struct SlackService {
     api: Arc<dyn SlackApi>,
     team_id: String,
     workspace_url: String,
+    now_millis: fn() -> Result<String>,
 }
 
 struct UserDirectory {
@@ -78,6 +144,7 @@ impl SlackService {
             api: Arc::new(api),
             team_id: config.team_id.clone(),
             workspace_url: config.base_url.origin().ascii_serialization(),
+            now_millis: system_unix_milliseconds,
         }
     }
 
@@ -88,6 +155,258 @@ impl SlackService {
             team_id: self.team_id.clone(),
             workspace_url: self.workspace_url.clone(),
         })
+    }
+
+    pub(crate) async fn list_drafts(
+        &self,
+        next_ts: Option<&str>,
+        limit: usize,
+    ) -> Result<DraftPage> {
+        validate_limit("limit", limit, MAX_DRAFTS)?;
+        validate_draft_revision_input("next_ts", next_ts)?;
+        let raw = self.api.drafts_list(next_ts, limit).await?;
+        if raw.drafts.len() > limit || raw.files.len() > 1_000 {
+            return Err(Error::InvalidResponse {
+                method: "drafts.list",
+            });
+        }
+        let drafts = raw
+            .drafts
+            .into_iter()
+            .map(|draft| normalize_draft(draft, "drafts.list"))
+            .collect::<Result<Vec<_>>>()?;
+        let continuation = raw
+            .has_more
+            .then(|| {
+                drafts
+                    .last()
+                    .map(|draft| draft.last_updated_ts.clone())
+                    .ok_or(Error::InvalidResponse {
+                        method: "drafts.list",
+                    })
+            })
+            .transpose()?;
+        if continuation
+            .as_deref()
+            .zip(next_ts)
+            .is_some_and(|(continuation, current)| continuation == current)
+        {
+            return Err(Error::InvalidResponse {
+                method: "drafts.list",
+            });
+        }
+        Ok(DraftPage {
+            drafts,
+            has_more: raw.has_more,
+            next_ts: continuation,
+        })
+    }
+
+    pub(crate) async fn get_draft(&self, draft_id: &str) -> Result<Draft> {
+        validate_draft_id(draft_id)?;
+        let draft = normalize_draft(self.api.drafts_info(draft_id).await?.draft, "drafts.info")?;
+        if draft.id != draft_id {
+            return Err(Error::InvalidResponse {
+                method: "drafts.info",
+            });
+        }
+        Ok(draft)
+    }
+
+    pub(crate) async fn create_draft(
+        &self,
+        conversation: &str,
+        thread_ts: Option<&str>,
+        broadcast: bool,
+        markdown: &str,
+    ) -> Result<Draft> {
+        let rendered = render_markdown(markdown)?;
+        validate_draft_destination(thread_ts, broadcast)?;
+        let channel_id = self.resolve_conversation_id(conversation).await?;
+        let destination = DraftDestination {
+            channel_id: Some(channel_id),
+            thread_ts: thread_ts.map(str::to_owned),
+            broadcast,
+            ..DraftDestination::default()
+        };
+        let response = self
+            .api
+            .drafts_create(
+                &Uuid::new_v4().to_string(),
+                std::slice::from_ref(&destination),
+                &rendered.blocks,
+            )
+            .await?;
+        let draft = normalize_draft(response.draft, "drafts.create")?;
+        require_supported_draft(&draft)?;
+        if draft.destinations != [destination] {
+            return Err(Error::InvalidResponse {
+                method: "drafts.create",
+            });
+        }
+        Ok(draft)
+    }
+
+    pub(crate) async fn update_draft(&self, draft_id: &str, markdown: &str) -> Result<Draft> {
+        validate_draft_id(draft_id)?;
+        let rendered = render_markdown(markdown)?;
+        let current = self.get_draft(draft_id).await?;
+        require_supported_draft(&current)?;
+        let client_last_updated_ts = (self.now_millis)()?;
+        let response = self
+            .api
+            .drafts_update(
+                &current.id,
+                &client_last_updated_ts,
+                &current.destinations,
+                &rendered.blocks,
+            )
+            .await?;
+        let updated = normalize_draft(response.draft, "drafts.update")?;
+        require_supported_draft(&updated)?;
+        if updated.id != current.id || updated.destinations != current.destinations {
+            return Err(Error::InvalidResponse {
+                method: "drafts.update",
+            });
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn delete_draft(
+        &self,
+        draft_id: &str,
+        confirmed: bool,
+    ) -> Result<DraftDeleteReport> {
+        require_confirmation("draft deletion", confirmed)?;
+        validate_draft_id(draft_id)?;
+        let current = self.get_draft(draft_id).await?;
+        require_supported_draft(&current)?;
+        self.api
+            .drafts_delete(&current.id, &current.client_last_updated_ts)
+            .await?;
+        Ok(DraftDeleteReport {
+            id: current.id,
+            deleted: true,
+        })
+    }
+
+    pub(crate) async fn send_message(
+        &self,
+        conversation: &str,
+        thread_ts: Option<&str>,
+        broadcast: bool,
+        markdown: &str,
+        confirmed: bool,
+    ) -> Result<SentMessage> {
+        require_confirmation("message publication", confirmed)?;
+        validate_draft_destination(thread_ts, broadcast)?;
+        let rendered = render_markdown(markdown)?;
+        let channel_id = self.resolve_conversation_id(conversation).await?;
+        self.post_rich_message(
+            &channel_id,
+            thread_ts,
+            broadcast,
+            &rendered.text,
+            &rendered.blocks,
+        )
+        .await
+    }
+
+    pub(crate) async fn send_draft(
+        &self,
+        draft_id: &str,
+        confirmed: bool,
+    ) -> Result<DraftSendReport> {
+        require_confirmation("draft publication", confirmed)?;
+        validate_draft_id(draft_id)?;
+        let draft = self.get_draft(draft_id).await?;
+        require_supported_draft(&draft)?;
+        let destination = draft.destinations.first().ok_or(Error::InvalidResponse {
+            method: "drafts.info",
+        })?;
+        let channel_id = destination
+            .channel_id
+            .as_deref()
+            .ok_or(Error::InvalidResponse {
+                method: "drafts.info",
+            })?;
+        let blocks = draft.blocks.as_deref().ok_or(Error::InvalidResponse {
+            method: "drafts.info",
+        })?;
+        let fallback = if is_valid_message_fallback(&draft.text) {
+            draft.text.clone()
+        } else {
+            rich_text_fallback(blocks).ok_or_else(|| {
+                Error::invalid_input(
+                    "draft",
+                    "does not contain publishable bounded Slack rich text",
+                )
+            })?
+        };
+        let sent = self
+            .post_rich_message(
+                channel_id,
+                destination.thread_ts.as_deref(),
+                destination.broadcast,
+                &fallback,
+                blocks,
+            )
+            .await?;
+
+        match self
+            .api
+            .drafts_delete(&draft.id, &draft.client_last_updated_ts)
+            .await
+        {
+            Ok(_) => Ok(DraftSendReport {
+                sent,
+                draft_id: draft.id,
+                draft_deleted: true,
+                cleanup_warning: None,
+            }),
+            Err(error) => Ok(DraftSendReport {
+                sent,
+                draft_id: draft.id.clone(),
+                draft_deleted: false,
+                cleanup_warning: Some(DraftCleanupWarning {
+                    draft_id: draft.id,
+                    last_updated_ts: draft.last_updated_ts,
+                    reason: error.to_string(),
+                }),
+            }),
+        }
+    }
+
+    async fn post_rich_message(
+        &self,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        broadcast: bool,
+        text: &str,
+        blocks: &[serde_json::Value],
+    ) -> Result<SentMessage> {
+        validate_draft_destination(thread_ts, broadcast)?;
+        if !is_valid_message_fallback(text) || blocks.is_empty() {
+            return Err(Error::invalid_input(
+                "message",
+                "must include bounded non-empty text and rich-text blocks",
+            ));
+        }
+        let client_msg_id = Uuid::new_v4().to_string();
+        let response = self
+            .api
+            .chat_post_message(
+                channel_id,
+                thread_ts,
+                broadcast,
+                &client_msg_id,
+                text,
+                blocks,
+            )
+            .await
+            .map_err(|error| classify_publication_error(&client_msg_id, error))?;
+        normalize_sent_message(channel_id, thread_ts, client_msg_id.clone(), response)
+            .map_err(|_| Error::PublicationUncertain { client_msg_id })
     }
 
     pub(crate) async fn unreads(&self) -> Result<UnreadReport> {
@@ -963,6 +1282,7 @@ fn normalize_search_matches(
                 author_id,
                 author_name,
                 text: raw.text,
+                blocks: raw.blocks,
                 permalink,
             })
         })
@@ -1014,6 +1334,265 @@ fn normalize_messages(
         .collect())
 }
 
+fn normalize_draft(raw: RawDraft, method: &'static str) -> Result<Draft> {
+    if !is_valid_draft_id(&raw.id) {
+        return Err(Error::InvalidResponse { method });
+    }
+    let last_updated_ts = raw
+        .last_updated_ts
+        .map(|revision| match revision {
+            RawDraftRevision::String(value) => value,
+            RawDraftRevision::Number(value) => value.to_string(),
+        })
+        .filter(|revision| is_valid_draft_revision(revision))
+        .ok_or(Error::InvalidResponse { method })?;
+    let client_last_updated_ts = server_revision_to_client_timestamp(&last_updated_ts)
+        .ok_or(Error::InvalidResponse { method })?;
+    if raw.client_msg_id.as_deref().is_some_and(|client_msg_id| {
+        client_msg_id.is_empty()
+            || client_msg_id.len() > 128
+            || client_msg_id.chars().any(char::is_control)
+    }) || raw.file_ids.iter().any(|file_id| {
+        file_id.is_empty() || file_id.len() > 128 || file_id.chars().any(char::is_control)
+    }) {
+        return Err(Error::InvalidResponse { method });
+    }
+    for destination in &raw.destinations {
+        if destination
+            .channel_id
+            .as_deref()
+            .is_some_and(|channel_id| !is_valid_any_conversation_id(channel_id))
+            || destination
+                .thread_ts
+                .as_deref()
+                .is_some_and(|thread_ts| !is_valid_timestamp(thread_ts))
+            || (destination.broadcast && destination.thread_ts.is_none())
+        {
+            return Err(Error::InvalidResponse { method });
+        }
+    }
+    let is_supported = raw.destinations.len() == 1
+        && raw.destinations[0].channel_id.is_some()
+        && raw.destinations[0].extra.is_empty()
+        && raw.file_ids.is_empty()
+        && raw.attachments.is_empty()
+        && !raw.is_deleted
+        && !raw.is_sent
+        && raw
+            .blocks
+            .as_ref()
+            .is_some_and(|blocks| is_rich_text_blocks(blocks));
+    Ok(Draft {
+        id: raw.id,
+        client_msg_id: raw.client_msg_id,
+        last_updated_ts,
+        client_last_updated_ts,
+        text: raw.text,
+        blocks: raw.blocks,
+        destinations: raw.destinations,
+        file_ids: raw.file_ids,
+        attachments: raw.attachments,
+        is_from_composer: raw.is_from_composer,
+        is_supported,
+    })
+}
+
+fn normalize_sent_message(
+    channel_id: &str,
+    thread_ts: Option<&str>,
+    client_msg_id: String,
+    response: RawPostMessageResponse,
+) -> Result<SentMessage> {
+    if response.channel != channel_id
+        || !is_valid_timestamp(&response.ts)
+        || response.message.ts != response.ts
+        || response.message.thread_ts.as_deref() != thread_ts
+    {
+        return Err(Error::InvalidResponse {
+            method: "chat.postMessage",
+        });
+    }
+    Ok(SentMessage {
+        client_msg_id,
+        message: normalize_message(channel_id, response.message),
+    })
+}
+
+fn is_valid_message_fallback(text: &str) -> bool {
+    !text.trim().is_empty()
+        && text.len() <= MAX_MARKDOWN_BYTES
+        && !text.chars().any(|character| character == '\0')
+}
+
+fn is_rich_text_blocks(blocks: &[serde_json::Value]) -> bool {
+    !blocks.is_empty()
+        && blocks.iter().all(|block| {
+            block
+                .as_object()
+                .and_then(|object| object.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("rich_text")
+        })
+}
+
+fn rich_text_fallback(blocks: &[serde_json::Value]) -> Option<String> {
+    if !is_rich_text_blocks(blocks) {
+        return None;
+    }
+    let mut output = String::new();
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 && !push_bounded(&mut output, "\n") {
+            return None;
+        }
+        if !append_rich_text_node(block, &mut output, 0) {
+            return None;
+        }
+    }
+    let output = output.trim().to_owned();
+    is_valid_message_fallback(&output).then_some(output)
+}
+
+fn append_rich_text_node(node: &serde_json::Value, output: &mut String, depth: usize) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    let kind = node.get("type").and_then(serde_json::Value::as_str);
+    match kind {
+        Some("text") => node
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| push_bounded(output, text)),
+        Some("link") => node
+            .get("text")
+            .or_else(|| node.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| push_bounded(output, text)),
+        Some("emoji") => node
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| push_bounded(output, &format!(":{name}:"))),
+        Some("user") => node
+            .get("user_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| push_bounded(output, &format!("<@{id}>"))),
+        Some("channel") => node
+            .get("channel_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| push_bounded(output, &format!("<#{id}>"))),
+        Some("usergroup") => node
+            .get("usergroup_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| push_bounded(output, &format!("<!subteam^{id}>"))),
+        Some("broadcast") => node
+            .get("range")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|range| push_bounded(output, &format!("@{range}"))),
+        Some("date") => node
+            .get("fallback")
+            .or_else(|| node.get("timestamp"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| push_bounded(output, text)),
+        Some("color") => node
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| push_bounded(output, text)),
+        Some("rich_text_list") => {
+            let Some(elements) = node.get("elements").and_then(serde_json::Value::as_array) else {
+                return false;
+            };
+            let ordered = node.get("style").and_then(serde_json::Value::as_str) == Some("ordered");
+            let indent = node
+                .get("indent")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(8) as usize;
+            for (index, element) in elements.iter().enumerate() {
+                if index > 0 && !push_bounded(output, "\n") {
+                    return false;
+                }
+                if !push_bounded(output, &"  ".repeat(indent)) {
+                    return false;
+                }
+                let marker = if ordered {
+                    format!("{}. ", index + 1)
+                } else {
+                    "- ".into()
+                };
+                if !push_bounded(output, &marker)
+                    || !append_rich_text_node(element, output, depth + 1)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        Some("rich_text") => append_rich_text_children(node, output, depth, "\n"),
+        Some("rich_text_section" | "rich_text_quote" | "rich_text_preformatted") => {
+            append_rich_text_children(node, output, depth, "")
+        }
+        _ => {
+            if let Some(text) = node.get("text").and_then(serde_json::Value::as_str) {
+                push_bounded(output, text)
+            } else {
+                append_rich_text_children(node, output, depth, "")
+            }
+        }
+    }
+}
+
+fn append_rich_text_children(
+    node: &serde_json::Value,
+    output: &mut String,
+    depth: usize,
+    separator: &str,
+) -> bool {
+    let Some(elements) = node.get("elements").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    for (index, element) in elements.iter().enumerate() {
+        if index > 0 && !separator.is_empty() && !push_bounded(output, separator) {
+            return false;
+        }
+        if !append_rich_text_node(element, output, depth + 1) {
+            return false;
+        }
+    }
+    true
+}
+
+fn push_bounded(output: &mut String, value: &str) -> bool {
+    if output.len().saturating_add(value.len()) > MAX_MARKDOWN_BYTES {
+        false
+    } else {
+        output.push_str(value);
+        true
+    }
+}
+
+fn classify_publication_error(client_msg_id: &str, error: Error) -> Error {
+    match error {
+        Error::HttpStatus { .. }
+        | Error::ResponseTooLarge { .. }
+        | Error::InvalidResponse { .. }
+        | Error::Timeout { .. }
+        | Error::Transport { .. } => Error::PublicationUncertain {
+            client_msg_id: client_msg_id.to_owned(),
+        },
+        definitive => definitive,
+    }
+}
+
+fn require_supported_draft(draft: &Draft) -> Result<()> {
+    if draft.is_supported {
+        Ok(())
+    } else {
+        Err(Error::invalid_input(
+            "draft",
+            "uses unsupported destinations, files, attachments, or content",
+        ))
+    }
+}
+
 fn normalize_message(channel: &str, message: RawMessage) -> Message {
     Message {
         channel_id: channel.to_owned(),
@@ -1022,6 +1601,7 @@ fn normalize_message(channel: &str, message: RawMessage) -> Message {
         author_id: message.user.or(message.bot_id),
         author_name: message.username,
         text: message.text,
+        blocks: message.blocks,
         reply_count: message.reply_count,
         latest_reply: message.latest_reply,
         reactions: message
@@ -1120,6 +1700,102 @@ fn validate_timestamp(field: &'static str, timestamp: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_draft_destination(thread_ts: Option<&str>, broadcast: bool) -> Result<()> {
+    if let Some(thread_ts) = thread_ts {
+        validate_timestamp("thread_ts", thread_ts)?;
+    }
+    if broadcast && thread_ts.is_none() {
+        return Err(Error::invalid_input(
+            "broadcast",
+            "is valid only for a thread reply",
+        ));
+    }
+    Ok(())
+}
+
+fn require_confirmation(action: &'static str, confirmed: bool) -> Result<()> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err(Error::ConfirmationRequired { action })
+    }
+}
+
+fn system_unix_milliseconds() -> Result<String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .map_err(|_| Error::SystemClock)
+}
+
+fn validate_draft_id(draft_id: &str) -> Result<()> {
+    if is_valid_draft_id(draft_id) {
+        Ok(())
+    } else {
+        Err(Error::invalid_input(
+            "draft_id",
+            "must contain 1 to 128 safe identifier characters",
+        ))
+    }
+}
+
+fn is_valid_draft_id(draft_id: &str) -> bool {
+    (1..=128).contains(&draft_id.len())
+        && draft_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn validate_draft_revision_input(field: &'static str, revision: Option<&str>) -> Result<()> {
+    if revision.is_some_and(|revision| !is_valid_draft_revision(revision)) {
+        Err(Error::invalid_input(
+            field,
+            "must be a Slack draft revision timestamp",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn is_valid_draft_revision(revision: &str) -> bool {
+    let mut decimal_points = 0;
+    !revision.is_empty()
+        && revision.len() <= 32
+        && revision.bytes().all(|byte| {
+            if byte == b'.' {
+                decimal_points += 1;
+                decimal_points == 1
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+        && revision.bytes().any(|byte| byte.is_ascii_digit())
+        && !revision.starts_with('.')
+        && !revision.ends_with('.')
+}
+
+/// Slack's web client turns the server's seconds revision into milliseconds
+/// before sending it back as `client_last_updated_ts`.
+fn server_revision_to_client_timestamp(revision: &str) -> Option<String> {
+    if !is_valid_draft_revision(revision) {
+        return None;
+    }
+    let (whole, fraction) = revision.split_once('.').unwrap_or((revision, ""));
+    let milliseconds_len = fraction.len().min(3);
+    let mut integer = String::with_capacity(whole.len() + 3);
+    integer.push_str(whole);
+    integer.push_str(&fraction[..milliseconds_len]);
+    integer.extend(std::iter::repeat_n('0', 3 - milliseconds_len));
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    let remainder = fraction[milliseconds_len..].trim_end_matches('0');
+    if remainder.is_empty() {
+        Some(integer.to_owned())
+    } else {
+        Some(format!("{integer}.{remainder}"))
+    }
 }
 
 fn is_valid_timestamp(timestamp: &str) -> bool {
@@ -1263,6 +1939,7 @@ mod tests {
         sync::Mutex,
     };
 
+    use serde_json::json;
     use url::Url;
 
     use super::*;
@@ -1285,6 +1962,15 @@ mod tests {
         conversation_calls: Arc<Mutex<Vec<ConversationCall>>>,
         conversation_pages: Mutex<VecDeque<RawConversationsPage>>,
         user_pages: Mutex<VecDeque<RawUsersPage>>,
+        drafts_page: RawDraftsPage,
+        draft_info: RawDraftResponse,
+        draft_create: RawDraftResponse,
+        draft_update: RawDraftResponse,
+        draft_delete_error: bool,
+        draft_calls: Arc<Mutex<Vec<DraftCall>>>,
+        post_response: Option<RawPostMessageResponse>,
+        post_error: Option<String>,
+        post_calls: Arc<Mutex<Vec<PostCall>>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1313,6 +1999,42 @@ mod tests {
     struct ConversationCall {
         cursor: Option<String>,
         limit: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum DraftCall {
+        List {
+            next_ts: Option<String>,
+            limit: usize,
+        },
+        Info {
+            draft_id: String,
+        },
+        Create {
+            client_msg_id: String,
+            destinations: Vec<DraftDestination>,
+            blocks: Vec<serde_json::Value>,
+        },
+        Update {
+            draft_id: String,
+            last_updated_ts: String,
+            destinations: Vec<DraftDestination>,
+            blocks: Vec<serde_json::Value>,
+        },
+        Delete {
+            draft_id: String,
+            last_updated_ts: String,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PostCall {
+        channel: String,
+        thread_ts: Option<String>,
+        broadcast: bool,
+        client_msg_id: String,
+        text: String,
+        blocks: Vec<serde_json::Value>,
     }
 
     #[async_trait]
@@ -1400,6 +2122,109 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_default())
+        }
+
+        async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
+            self.draft_calls.lock().unwrap().push(DraftCall::List {
+                next_ts: next_ts.map(str::to_owned),
+                limit,
+            });
+            Ok(self.drafts_page.clone())
+        }
+
+        async fn drafts_info(&self, draft_id: &str) -> Result<RawDraftResponse> {
+            self.draft_calls.lock().unwrap().push(DraftCall::Info {
+                draft_id: draft_id.into(),
+            });
+            Ok(self.draft_info.clone())
+        }
+
+        async fn drafts_create(
+            &self,
+            client_msg_id: &str,
+            destinations: &[DraftDestination],
+            blocks: &[serde_json::Value],
+        ) -> Result<RawDraftResponse> {
+            self.draft_calls.lock().unwrap().push(DraftCall::Create {
+                client_msg_id: client_msg_id.into(),
+                destinations: destinations.to_vec(),
+                blocks: blocks.to_vec(),
+            });
+            Ok(self.draft_create.clone())
+        }
+
+        async fn drafts_update(
+            &self,
+            draft_id: &str,
+            last_updated_ts: &str,
+            destinations: &[DraftDestination],
+            blocks: &[serde_json::Value],
+        ) -> Result<RawDraftResponse> {
+            self.draft_calls.lock().unwrap().push(DraftCall::Update {
+                draft_id: draft_id.into(),
+                last_updated_ts: last_updated_ts.into(),
+                destinations: destinations.to_vec(),
+                blocks: blocks.to_vec(),
+            });
+            Ok(self.draft_update.clone())
+        }
+
+        async fn drafts_delete(
+            &self,
+            draft_id: &str,
+            last_updated_ts: &str,
+        ) -> Result<RawMutationResponse> {
+            self.draft_calls.lock().unwrap().push(DraftCall::Delete {
+                draft_id: draft_id.into(),
+                last_updated_ts: last_updated_ts.into(),
+            });
+            if self.draft_delete_error {
+                Err(Error::SlackApi {
+                    method: "drafts.delete",
+                    code: "draft_conflict".into(),
+                })
+            } else {
+                Ok(RawMutationResponse::default())
+            }
+        }
+
+        async fn chat_post_message(
+            &self,
+            channel: &str,
+            thread_ts: Option<&str>,
+            broadcast: bool,
+            client_msg_id: &str,
+            text: &str,
+            blocks: &[serde_json::Value],
+        ) -> Result<RawPostMessageResponse> {
+            self.post_calls.lock().unwrap().push(PostCall {
+                channel: channel.into(),
+                thread_ts: thread_ts.map(str::to_owned),
+                broadcast,
+                client_msg_id: client_msg_id.into(),
+                text: text.into(),
+                blocks: blocks.to_vec(),
+            });
+            if let Some(code) = &self.post_error {
+                return Err(Error::SlackApi {
+                    method: "chat.postMessage",
+                    code: code.clone(),
+                });
+            }
+            Ok(self
+                .post_response
+                .clone()
+                .unwrap_or_else(|| RawPostMessageResponse {
+                    channel: channel.into(),
+                    ts: "7000.000001".into(),
+                    message: RawMessage {
+                        ts: "7000.000001".into(),
+                        thread_ts: thread_ts.map(str::to_owned),
+                        text: text.into(),
+                        blocks: Some(blocks.to_vec()),
+                        ..RawMessage::default()
+                    },
+                }))
         }
     }
 
@@ -1489,12 +2314,23 @@ mod tests {
             conversation_calls: Arc::new(Mutex::new(Vec::new())),
             conversation_pages: Mutex::new(VecDeque::new()),
             user_pages: Mutex::new(VecDeque::new()),
+            drafts_page: RawDraftsPage::default(),
+            draft_info: RawDraftResponse::default(),
+            draft_create: RawDraftResponse::default(),
+            draft_update: RawDraftResponse::default(),
+            draft_delete_error: false,
+            draft_calls: Arc::new(Mutex::new(Vec::new())),
+            post_response: None,
+            post_error: None,
+            post_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn service(api: impl SlackApi + 'static) -> SlackService {
         let config = Config::for_test(Url::parse("http://127.0.0.1:1234").unwrap(), 1024);
-        SlackService::new(api, &config)
+        let mut service = SlackService::new(api, &config);
+        service.now_millis = || Ok("9000123".into());
+        service
     }
 
     fn entry(id: &str, has_unreads: bool, mentions: u64) -> RawUnread {
@@ -1527,6 +2363,28 @@ mod tests {
         }
     }
 
+    fn raw_draft(id: &str, revision: &str, channel_id: &str, text: &str) -> RawDraft {
+        RawDraft {
+            id: id.into(),
+            client_msg_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            last_updated_ts: Some(RawDraftRevision::String(revision.into())),
+            text: text.into(),
+            blocks: Some(vec![json!({
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [{"type": "text", "text": text}]
+                }]
+            })]),
+            destinations: vec![DraftDestination {
+                channel_id: Some(channel_id.into()),
+                ..DraftDestination::default()
+            }],
+            is_from_composer: true,
+            ..RawDraft::default()
+        }
+    }
+
     fn raw_user(id: &str, name: &str, display_name: &str) -> RawUser {
         RawUser {
             id: id.into(),
@@ -1550,6 +2408,467 @@ mod tests {
             num_members: Some(7),
             ..RawConversation::default()
         }
+    }
+
+    #[tokio::test]
+    async fn drafts_lifecycle_uses_bounded_pages_and_server_concurrency_revisions() {
+        let mut api = fake_api();
+        api.drafts_page = RawDraftsPage {
+            drafts: vec![
+                raw_draft("DR-list-1", "1000", "C123", "first"),
+                raw_draft("DR-list-2", "2000", "C123", "second"),
+            ],
+            files: vec![],
+            has_more: true,
+        };
+        api.draft_info = RawDraftResponse {
+            draft: raw_draft("DR-existing", "3000.5", "C123", "old"),
+        };
+        api.draft_create = RawDraftResponse {
+            draft: raw_draft("DR-created", "4000", "C123", "created"),
+        };
+        api.draft_update = RawDraftResponse {
+            draft: raw_draft("DR-existing", "3001", "C123", "updated"),
+        };
+        let calls = api.draft_calls.clone();
+        let service = service(api);
+
+        let page = service.list_drafts(Some("500"), 2).await.unwrap();
+        assert_eq!(page.drafts.len(), 2);
+        assert!(page.drafts.iter().all(|draft| draft.is_supported));
+        assert!(page.has_more);
+        assert_eq!(page.next_ts.as_deref(), Some("2000"));
+
+        let created = service
+            .create_draft("C123", None, false, "**created**")
+            .await
+            .unwrap();
+        assert_eq!(created.id, "DR-created");
+
+        let updated = service
+            .update_draft("DR-existing", "replacement")
+            .await
+            .unwrap();
+        assert_eq!(updated.last_updated_ts, "3001");
+        assert_eq!(updated.client_last_updated_ts, "3001000");
+
+        let deleted = service.delete_draft("DR-existing", true).await.unwrap();
+        assert_eq!(
+            deleted,
+            DraftDeleteReport {
+                id: "DR-existing".into(),
+                deleted: true
+            }
+        );
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls[0],
+            DraftCall::List {
+                next_ts: Some("500".into()),
+                limit: 2
+            }
+        );
+        let DraftCall::Create {
+            client_msg_id,
+            destinations,
+            blocks,
+        } = &calls[1]
+        else {
+            panic!("expected draft creation call");
+        };
+        assert_eq!(Uuid::parse_str(client_msg_id).unwrap().get_version_num(), 4);
+        assert_eq!(destinations[0].channel_id.as_deref(), Some("C123"));
+        assert_eq!(blocks[0]["type"], "rich_text");
+        assert_eq!(
+            calls[2..],
+            [
+                DraftCall::Info {
+                    draft_id: "DR-existing".into()
+                },
+                DraftCall::Update {
+                    draft_id: "DR-existing".into(),
+                    last_updated_ts: "9000123".into(),
+                    destinations: vec![DraftDestination {
+                        channel_id: Some("C123".into()),
+                        ..DraftDestination::default()
+                    }],
+                    blocks: render_markdown("replacement").unwrap().blocks,
+                },
+                DraftCall::Info {
+                    draft_id: "DR-existing".into()
+                },
+                DraftCall::Delete {
+                    draft_id: "DR-existing".into(),
+                    last_updated_ts: "3000500".into(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn converts_server_draft_revisions_to_browser_mutation_timestamps() {
+        assert_eq!(
+            server_revision_to_client_timestamp("3000.5").as_deref(),
+            Some("3000500")
+        );
+        assert_eq!(
+            server_revision_to_client_timestamp("1.234567").as_deref(),
+            Some("1234.567")
+        );
+        assert_eq!(
+            server_revision_to_client_timestamp("0001.000000").as_deref(),
+            Some("1000")
+        );
+        assert_eq!(
+            server_revision_to_client_timestamp("0.000001").as_deref(),
+            Some("0.001")
+        );
+    }
+
+    #[test]
+    fn classifies_only_ambiguous_post_outcomes_as_publication_uncertain() {
+        for error in [
+            Error::HttpStatus {
+                method: "chat.postMessage",
+                status: 502,
+            },
+            Error::ResponseTooLarge {
+                method: "chat.postMessage",
+                limit: 1024,
+            },
+            Error::InvalidResponse {
+                method: "chat.postMessage",
+            },
+            Error::Timeout {
+                method: "chat.postMessage",
+            },
+            Error::Transport {
+                method: "chat.postMessage",
+            },
+        ] {
+            assert!(matches!(
+                classify_publication_error("client-id", error),
+                Error::PublicationUncertain { client_msg_id } if client_msg_id == "client-id"
+            ));
+        }
+        assert!(matches!(
+            classify_publication_error(
+                "client-id",
+                Error::SlackApi {
+                    method: "chat.postMessage",
+                    code: "restricted_action".into()
+                }
+            ),
+            Error::SlackApi { code, .. } if code == "restricted_action"
+        ));
+    }
+
+    #[tokio::test]
+    async fn drafts_write_gate_validation_and_confirmation_fail_before_network_io() {
+        let api = fake_api();
+        let calls = api.draft_calls.clone();
+        let service = service(api);
+
+        assert!(service.list_drafts(None, 0).await.is_err());
+        assert!(service.list_drafts(Some("."), 25).await.is_err());
+        assert!(service.get_draft("bad id").await.is_err());
+        assert!(
+            service
+                .create_draft("C123", None, true, "content")
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .create_draft("C123", None, false, "content\u{0}")
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .update_draft("DR-valid", "content\u{0}")
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            service.delete_draft("DR-valid", false).await,
+            Err(Error::ConfirmationRequired {
+                action: "draft deletion"
+            })
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drafts_reject_stale_pagination_and_unsupported_mutation_shapes() {
+        let mut repeated = fake_api();
+        repeated.drafts_page = RawDraftsPage {
+            drafts: vec![raw_draft("DR-one", "500", "C123", "one")],
+            has_more: true,
+            ..RawDraftsPage::default()
+        };
+        assert!(matches!(
+            service(repeated).list_drafts(Some("500"), 25).await,
+            Err(Error::InvalidResponse {
+                method: "drafts.list"
+            })
+        ));
+
+        let mut unsupported = fake_api();
+        let mut attached = raw_draft("DR-attached", "600", "C123", "attached");
+        attached.file_ids.push("F123".into());
+        unsupported.draft_info = RawDraftResponse { draft: attached };
+        let calls = unsupported.draft_calls.clone();
+        let service = service(unsupported);
+        assert!(matches!(
+            service.update_draft("DR-attached", "new").await,
+            Err(Error::InvalidInput { field: "draft", .. })
+        ));
+        assert!(matches!(
+            service.delete_draft("DR-attached", true).await,
+            Err(Error::InvalidInput { field: "draft", .. })
+        ));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                DraftCall::Info {
+                    draft_id: "DR-attached".into()
+                },
+                DraftCall::Info {
+                    draft_id: "DR-attached".into()
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn drafts_info_rejects_a_mismatched_response_id_before_mutation() {
+        let mut api = fake_api();
+        api.draft_info = RawDraftResponse {
+            draft: raw_draft("DR-other", "700", "C123", "other"),
+        };
+        let calls = api.draft_calls.clone();
+        let service = service(api);
+
+        assert!(matches!(
+            service.update_draft("DR-requested", "new").await,
+            Err(Error::InvalidResponse {
+                method: "drafts.info"
+            })
+        ));
+        assert!(matches!(
+            service.delete_draft("DR-requested", true).await,
+            Err(Error::InvalidResponse {
+                method: "drafts.info"
+            })
+        ));
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                DraftCall::Info {
+                    draft_id: "DR-requested".into()
+                },
+                DraftCall::Info {
+                    draft_id: "DR-requested".into()
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_root_and_reply_use_fresh_uuid_forms_and_shared_validation() {
+        let api = fake_api();
+        let post_calls = api.post_calls.clone();
+        let service = service(api);
+
+        let root = service
+            .send_message("C123", None, false, "**root**", true)
+            .await
+            .unwrap();
+        let reply = service
+            .send_message("C123", Some("6000.000001"), true, "reply", true)
+            .await
+            .unwrap();
+        assert_eq!(root.message.channel_id, "C123");
+        assert_eq!(root.message.thread_ts, None);
+        assert_eq!(reply.message.thread_ts.as_deref(), Some("6000.000001"));
+        assert_ne!(root.client_msg_id, reply.client_msg_id);
+        for id in [&root.client_msg_id, &reply.client_msg_id] {
+            assert_eq!(Uuid::parse_str(id).unwrap().get_version_num(), 4);
+        }
+
+        assert!(matches!(
+            service
+                .send_message("C123", None, false, "unconfirmed", false)
+                .await,
+            Err(Error::ConfirmationRequired {
+                action: "message publication"
+            })
+        ));
+        assert!(matches!(
+            service
+                .send_message("C123", None, true, "bad broadcast", true)
+                .await,
+            Err(Error::InvalidInput {
+                field: "broadcast",
+                ..
+            })
+        ));
+
+        let calls = post_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].channel, "C123");
+        assert_eq!(calls[0].thread_ts, None);
+        assert!(!calls[0].broadcast);
+        assert_eq!(calls[0].text, "root");
+        assert_eq!(calls[0].blocks[0]["type"], "rich_text");
+        assert_eq!(calls[1].thread_ts.as_deref(), Some("6000.000001"));
+        assert!(calls[1].broadcast);
+    }
+
+    #[tokio::test]
+    async fn send_rejects_malformed_acknowledgements_and_preserves_slack_errors() {
+        let mut malformed = fake_api();
+        malformed.post_response = Some(RawPostMessageResponse {
+            channel: "C-other".into(),
+            ts: "7000.000001".into(),
+            message: RawMessage {
+                ts: "7000.000001".into(),
+                text: "synthetic".into(),
+                ..RawMessage::default()
+            },
+        });
+        let post_calls = malformed.post_calls.clone();
+        let error = service(malformed)
+            .send_message("C123", None, false, "synthetic", true)
+            .await
+            .unwrap_err();
+        let Error::PublicationUncertain { client_msg_id } = error else {
+            panic!("malformed acknowledgement must be publication-uncertain");
+        };
+        assert_eq!(post_calls.lock().unwrap()[0].client_msg_id, client_msg_id);
+
+        let mut rejected = fake_api();
+        rejected.post_error = Some("restricted_action".into());
+        assert!(matches!(
+            service(rejected)
+                .send_message("C123", None, false, "synthetic", true)
+                .await,
+            Err(Error::SlackApi {
+                method: "chat.postMessage",
+                code
+            }) if code == "restricted_action"
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_draft_reports_post_success_cleanup_failure_without_reposting() {
+        let mut api = fake_api();
+        api.draft_info = RawDraftResponse {
+            draft: raw_draft("DR-send", "8000.5", "C123", "draft body"),
+        };
+        api.draft_delete_error = true;
+        let draft_calls = api.draft_calls.clone();
+        let post_calls = api.post_calls.clone();
+        let service = service(api);
+
+        assert!(matches!(
+            service.send_draft("DR-send", false).await,
+            Err(Error::ConfirmationRequired {
+                action: "draft publication"
+            })
+        ));
+        let report = service.send_draft("DR-send", true).await.unwrap();
+        assert_eq!(report.draft_id, "DR-send");
+        assert!(!report.draft_deleted);
+        let warning = report.cleanup_warning.expect("cleanup warning");
+        assert_eq!(warning.draft_id, "DR-send");
+        assert_eq!(warning.last_updated_ts, "8000.5");
+        assert!(warning.reason.contains("draft_conflict"));
+        assert_eq!(post_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            draft_calls.lock().unwrap().as_slice(),
+            [
+                DraftCall::Info {
+                    draft_id: "DR-send".into()
+                },
+                DraftCall::Delete {
+                    draft_id: "DR-send".into(),
+                    last_updated_ts: "8000500".into()
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_draft_exposes_client_id_and_does_not_delete_on_ambiguous_post() {
+        let mut api = fake_api();
+        api.draft_info = RawDraftResponse {
+            draft: raw_draft("DR-unsent", "8100", "C123", "draft body"),
+        };
+        api.post_response = Some(RawPostMessageResponse {
+            channel: "C123".into(),
+            ts: "7000.000001".into(),
+            message: RawMessage {
+                ts: "different.000001".into(),
+                text: "draft body".into(),
+                ..RawMessage::default()
+            },
+        });
+        let draft_calls = api.draft_calls.clone();
+        let post_calls = api.post_calls.clone();
+        let service = service(api);
+
+        let error = service.send_draft("DR-unsent", true).await.unwrap_err();
+        let rendered_error = error.to_string();
+        let Error::PublicationUncertain { client_msg_id } = error else {
+            panic!("ambiguous draft post must expose a publication-uncertain result");
+        };
+        assert_eq!(post_calls.lock().unwrap()[0].client_msg_id, client_msg_id);
+        assert!(rendered_error.contains("do not retry automatically"));
+        assert_eq!(
+            draft_calls.lock().unwrap().as_slice(),
+            [DraftCall::Info {
+                draft_id: "DR-unsent".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_draft_derives_block_only_fallback_and_rejects_non_rich_blocks() {
+        let mut block_only = fake_api();
+        let mut draft = raw_draft("DR-block-only", "8200", "C123", "derived text");
+        draft.text.clear();
+        block_only.draft_info = RawDraftResponse { draft };
+        let post_calls = block_only.post_calls.clone();
+        let report = service(block_only)
+            .send_draft("DR-block-only", true)
+            .await
+            .unwrap();
+        assert!(report.draft_deleted);
+        assert_eq!(post_calls.lock().unwrap()[0].text, "derived text");
+
+        let mut non_rich = fake_api();
+        let mut draft = raw_draft("DR-block-kit", "8300", "C123", "not allowed");
+        draft.blocks = Some(vec![json!({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "not allowed"}
+        })]);
+        non_rich.draft_info = RawDraftResponse { draft };
+        let post_calls = non_rich.post_calls.clone();
+        let draft_calls = non_rich.draft_calls.clone();
+        assert!(matches!(
+            service(non_rich).send_draft("DR-block-kit", true).await,
+            Err(Error::InvalidInput { field: "draft", .. })
+        ));
+        assert!(post_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            draft_calls.lock().unwrap().as_slice(),
+            [DraftCall::Info {
+                draft_id: "DR-block-kit".into()
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2633,6 +3952,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lossless_rich_text_reads_preserve_unknown_missing_and_empty_blocks() {
+        let unknown_blocks = vec![json!({
+            "type": "rich_text",
+            "block_id": "synthetic",
+            "future_top_level": {"keep": [true, 7, null]},
+            "elements": [{
+                "type": "rich_text_section",
+                "future_element": "retained",
+                "elements": [{
+                    "type": "text",
+                    "text": "hello",
+                    "style": {"bold": true, "future_style": "kept"}
+                }]
+            }]
+        })];
+        let mut first = raw_message("100.000001", "fallback");
+        first.blocks = Some(unknown_blocks.clone());
+        let mut second = raw_message("100.000002", "explicitly empty");
+        second.blocks = Some(vec![]);
+        let third = raw_message("100.000003", "omitted");
+
+        let mut api = fake_api();
+        api.history.messages = vec![first, second, third];
+        api.search = RawMessageSearchResponse {
+            query: "fallback".into(),
+            messages: RawMessageSearchMatches {
+                matches: vec![RawMessageSearchMatch {
+                    channel: RawMessageSearchChannel {
+                        id: "C123".into(),
+                        name: "general".into(),
+                    },
+                    ts: "100.000001".into(),
+                    text: "fallback".into(),
+                    blocks: Some(unknown_blocks.clone()),
+                    ..RawMessageSearchMatch::default()
+                }],
+                total: 1,
+                ..RawMessageSearchMatches::default()
+            },
+            ..RawMessageSearchResponse::default()
+        };
+        let service = service(api);
+
+        let history = service.read_channel("C123", None, 3).await.unwrap();
+        assert_eq!(history.messages[0].blocks, Some(unknown_blocks.clone()));
+        assert_eq!(history.messages[1].blocks, Some(vec![]));
+        assert_eq!(history.messages[2].blocks, None);
+
+        let search = service
+            .search_messages("fallback", None, None, None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(search.matches[0].blocks, Some(unknown_blocks));
+    }
+
+    #[tokio::test]
     async fn local_message_truncation_always_sets_has_more() {
         let mut api = fake_api();
         api.history.messages = vec![
@@ -2755,6 +4130,7 @@ mod tests {
                 "author_id": "U123",
                 "author_name": null,
                 "text": "target",
+                "blocks": null,
                 "reply_count": 0,
                 "latest_reply": null,
                 "reactions": [{"name": "eyes", "count": 2}],

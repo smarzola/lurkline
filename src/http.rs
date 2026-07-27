@@ -15,8 +15,9 @@ use crate::{
     config::Config,
     error::{Error, Result},
     model::{
-        ClientCountsPayload, RawConversationsPage, RawMessagePage, RawMessageSearchResponse,
-        RawMessagesList, RawUsersPage,
+        ClientCountsPayload, DraftDestination, RawConversationsPage, RawDraftResponse,
+        RawDraftsPage, RawMessagePage, RawMessageSearchResponse, RawMessagesList,
+        RawMutationResponse, RawPostMessageResponse, RawUsersPage,
     },
     service::SlackApi,
 };
@@ -60,6 +61,31 @@ impl SlackHttpClient {
         method: &'static str,
         reason: &'static str,
         fields: &[(&'static str, String)],
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.post_form_inner(method, reason, fields, false).await
+    }
+
+    async fn post_publication_form<T>(
+        &self,
+        method: &'static str,
+        reason: &'static str,
+        fields: &[(&'static str, String)],
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.post_form_inner(method, reason, fields, true).await
+    }
+
+    async fn post_form_inner<T>(
+        &self,
+        method: &'static str,
+        reason: &'static str,
+        fields: &[(&'static str, String)],
+        malformed_is_ambiguous: bool,
     ) -> Result<T>
     where
         T: DeserializeOwned,
@@ -137,7 +163,13 @@ impl SlackHttpClient {
             body.extend_from_slice(&chunk);
         }
 
-        let value: Value = serde_json::from_slice(&body).map_err(|_| Error::Authentication)?;
+        let value: Value = serde_json::from_slice(&body).map_err(|_| {
+            if malformed_is_ambiguous {
+                Error::InvalidResponse { method }
+            } else {
+                Error::Authentication
+            }
+        })?;
         validate_envelope(method, &value)?;
         serde_json::from_value(value).map_err(|_| Error::InvalidResponse { method })
     }
@@ -283,6 +315,116 @@ impl SlackApi for SlackHttpClient {
         }
         self.post_form("users.list", "users-list", &fields).await
     }
+
+    async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
+        let mut fields = vec![("is_active", "true".into()), ("limit", limit.to_string())];
+        if let Some(next_ts) = next_ts {
+            fields.push(("next_ts", next_ts.into()));
+        }
+        self.post_form("drafts.list", "lurkline-drafts-list", &fields)
+            .await
+    }
+
+    async fn drafts_info(&self, draft_id: &str) -> Result<RawDraftResponse> {
+        self.post_form(
+            "drafts.info",
+            "lurkline-drafts-info",
+            &[("draft_id", draft_id.into())],
+        )
+        .await
+    }
+
+    async fn drafts_create(
+        &self,
+        client_msg_id: &str,
+        destinations: &[DraftDestination],
+        blocks: &[Value],
+    ) -> Result<RawDraftResponse> {
+        self.post_form(
+            "drafts.create",
+            "lurkline-drafts-create",
+            &[
+                ("blocks", encode_json(blocks)?),
+                ("client_msg_id", client_msg_id.into()),
+                ("attachments", "[]".into()),
+                ("destinations", encode_json(destinations)?),
+                ("file_ids", "[]".into()),
+                ("is_from_composer", "true".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn drafts_update(
+        &self,
+        draft_id: &str,
+        last_updated_ts: &str,
+        destinations: &[DraftDestination],
+        blocks: &[Value],
+    ) -> Result<RawDraftResponse> {
+        self.post_form(
+            "drafts.update",
+            "lurkline-drafts-update",
+            &[
+                ("blocks", encode_json(blocks)?),
+                ("client_last_updated_ts", last_updated_ts.into()),
+                ("attachments", "[]".into()),
+                ("destinations", encode_json(destinations)?),
+                ("draft_id", draft_id.into()),
+                ("file_ids", "[]".into()),
+                ("is_from_composer", "true".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn drafts_delete(
+        &self,
+        draft_id: &str,
+        last_updated_ts: &str,
+    ) -> Result<RawMutationResponse> {
+        self.post_form(
+            "drafts.delete",
+            "lurkline-drafts-delete",
+            &[
+                ("client_last_updated_ts", last_updated_ts.into()),
+                ("draft_id", draft_id.into()),
+                ("skip_file_deletion", "false".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn chat_post_message(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        broadcast: bool,
+        client_msg_id: &str,
+        text: &str,
+        blocks: &[Value],
+    ) -> Result<RawPostMessageResponse> {
+        let mut fields = vec![
+            ("channel", channel.into()),
+            ("blocks", encode_json(blocks)?),
+            ("client_msg_id", client_msg_id.into()),
+            ("text", text.into()),
+            ("include_channel_perm_error", "true".into()),
+            ("skip_dlp_user_warning", "false".into()),
+        ];
+        if let Some(thread_ts) = thread_ts {
+            fields.push(("thread_ts", thread_ts.into()));
+        }
+        if broadcast {
+            fields.push(("reply_broadcast", "true".into()));
+        }
+        self.post_publication_form("chat.postMessage", "lurkline-message-send", &fields)
+            .await
+    }
+}
+
+fn encode_json(value: &(impl serde::Serialize + ?Sized)) -> Result<String> {
+    serde_json::to_string(value).map_err(|_| Error::Output)
 }
 
 fn browser_headers(config: &Config) -> Result<HeaderMap> {
@@ -602,6 +744,203 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn sends_drafts_method_shapes_and_json_encodings() {
+        let destination = DraftDestination {
+            channel_id: Some("C123".into()),
+            thread_ts: Some("100.000001".into()),
+            broadcast: true,
+            ..DraftDestination::default()
+        };
+        let blocks = vec![serde_json::json!({
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [{"type": "text", "text": "synthetic"}]
+            }]
+        })];
+        let draft_response = br#"{"ok":true,"draft":{"id":"DR123","client_msg_id":"00000000-0000-4000-8000-000000000001","last_updated_ts":"2000","blocks":[{"type":"rich_text","elements":[]}],"destinations":[{"channel_id":"C123","thread_ts":"100.000001","broadcast":true}]}}"#;
+
+        let (client, capture) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"drafts":[],"files":[],"has_more":false}"#.to_vec(),
+            64 * 1024,
+        )
+        .await;
+        client.drafts_list(Some("1000"), 25).await.unwrap();
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/drafts.list");
+        assert_eq!(multipart_text_field(&body, "is_active"), Some("true"));
+        assert_eq!(multipart_text_field(&body, "limit"), Some("25"));
+        assert_eq!(multipart_text_field(&body, "next_ts"), Some("1000"));
+
+        let (client, capture) = server(StatusCode::OK, draft_response.to_vec(), 64 * 1024).await;
+        client.drafts_info("DR123").await.unwrap();
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/drafts.info");
+        assert_eq!(multipart_text_field(&body, "draft_id"), Some("DR123"));
+
+        let (client, capture) = server(StatusCode::OK, draft_response.to_vec(), 64 * 1024).await;
+        client
+            .drafts_create(
+                "00000000-0000-4000-8000-000000000001",
+                std::slice::from_ref(&destination),
+                &blocks,
+            )
+            .await
+            .unwrap();
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/drafts.create");
+        assert_eq!(
+            multipart_text_field(&body, "client_msg_id"),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(multipart_text_field(&body, "blocks").unwrap()).unwrap(),
+            Value::Array(blocks.clone())
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(multipart_text_field(&body, "destinations").unwrap())
+                .unwrap(),
+            serde_json::to_value([destination.clone()]).unwrap()
+        );
+        for (field, expected) in [
+            ("attachments", "[]"),
+            ("file_ids", "[]"),
+            ("is_from_composer", "true"),
+        ] {
+            assert_eq!(multipart_text_field(&body, field), Some(expected));
+        }
+
+        let (client, capture) = server(StatusCode::OK, draft_response.to_vec(), 64 * 1024).await;
+        client
+            .drafts_update("DR123", "2000", std::slice::from_ref(&destination), &blocks)
+            .await
+            .unwrap();
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/drafts.update");
+        assert_eq!(multipart_text_field(&body, "draft_id"), Some("DR123"));
+        assert_eq!(
+            multipart_text_field(&body, "client_last_updated_ts"),
+            Some("2000")
+        );
+
+        let (client, capture) = server(StatusCode::OK, br#"{"ok":true}"#.to_vec(), 64 * 1024).await;
+        client.drafts_delete("DR123", "2000").await.unwrap();
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/drafts.delete");
+        assert_eq!(multipart_text_field(&body, "draft_id"), Some("DR123"));
+        assert_eq!(
+            multipart_text_field(&body, "client_last_updated_ts"),
+            Some("2000")
+        );
+        assert_eq!(
+            multipart_text_field(&body, "skip_file_deletion"),
+            Some("false")
+        );
+    }
+
+    #[tokio::test]
+    async fn sends_root_and_reply_chat_post_message_forms() {
+        let blocks = vec![serde_json::json!({
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [{"type": "text", "text": "synthetic"}]
+            }]
+        })];
+        for (thread_ts, broadcast) in [(None, false), (Some("100.000001"), true)] {
+            let mut message = serde_json::json!({
+                "ts": "200.000001",
+                "text": "synthetic",
+                "blocks": blocks
+            });
+            if let Some(thread_ts) = thread_ts {
+                message["thread_ts"] = Value::String(thread_ts.into());
+            }
+            let response = serde_json::json!({
+                "ok": true,
+                "channel": "C123",
+                "ts": "200.000001",
+                "message": message
+            })
+            .to_string()
+            .into_bytes();
+            let (client, capture) = server(StatusCode::OK, response, 64 * 1024).await;
+            client
+                .chat_post_message(
+                    "C123",
+                    thread_ts,
+                    broadcast,
+                    "00000000-0000-4000-8000-000000000001",
+                    "synthetic",
+                    &blocks,
+                )
+                .await
+                .unwrap();
+
+            let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+            let body = String::from_utf8_lossy(&raw_body);
+            assert_eq!(uri.path(), "/api/chat.postMessage");
+            assert_eq!(multipart_text_field(&body, "channel"), Some("C123"));
+            assert_eq!(multipart_text_field(&body, "text"), Some("synthetic"));
+            assert_eq!(
+                multipart_text_field(&body, "client_msg_id"),
+                Some("00000000-0000-4000-8000-000000000001")
+            );
+            assert_eq!(
+                multipart_text_field(&body, "include_channel_perm_error"),
+                Some("true")
+            );
+            assert_eq!(
+                multipart_text_field(&body, "skip_dlp_user_warning"),
+                Some("false")
+            );
+            assert_eq!(multipart_text_field(&body, "thread_ts"), thread_ts);
+            assert_eq!(
+                multipart_text_field(&body, "reply_broadcast"),
+                broadcast.then_some("true")
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(multipart_text_field(&body, "blocks").unwrap())
+                    .unwrap(),
+                Value::Array(blocks.clone())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn treats_malformed_publication_responses_as_ambiguous_shapes() {
+        let (client, _) = server(
+            StatusCode::OK,
+            b"accepted response was not readable JSON".to_vec(),
+            64 * 1024,
+        )
+        .await;
+        let error = client
+            .chat_post_message(
+                "C123",
+                None,
+                false,
+                "00000000-0000-4000-8000-000000000001",
+                "synthetic",
+                &[serde_json::json!({"type": "rich_text", "elements": []})],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidResponse {
+                method: "chat.postMessage"
+            }
+        ));
     }
 
     #[tokio::test]

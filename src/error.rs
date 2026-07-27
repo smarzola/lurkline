@@ -51,6 +51,12 @@ pub enum Error {
     CredentialReconciliation { profile: String },
     #[error("could not read cURL input from standard input")]
     InputRead,
+    #[error("could not read Markdown input from standard input")]
+    MarkdownInputRead,
+    #[error("Slack writes are disabled; start the MCP server with --allow-write")]
+    WriteNotAllowed,
+    #[error("confirmation is required for {action}")]
+    ConfirmationRequired { action: &'static str },
     #[error("Slack browser session is expired or invalid; copy fresh browser credentials")]
     Authentication,
     #[error("Slack method {method} failed: {code}")]
@@ -65,6 +71,10 @@ pub enum Error {
     Timeout { method: &'static str },
     #[error("Slack method {method} could not be reached")]
     Transport { method: &'static str },
+    #[error(
+        "Slack publication outcome is unknown for client message {client_msg_id}; do not retry automatically; verify the message in Slack before deciding whether to retry"
+    )]
+    PublicationUncertain { client_msg_id: String },
     #[error("{resource} was not found")]
     NotFound { resource: &'static str },
     #[error("could not resolve {resource} within the {limit}-item scan limit")]
@@ -74,6 +84,8 @@ pub enum Error {
     },
     #[error("could not serialize output")]
     Output,
+    #[error("system clock is earlier than the Unix epoch")]
+    SystemClock,
     #[error("MCP stdio transport failed")]
     McpTransport,
 }

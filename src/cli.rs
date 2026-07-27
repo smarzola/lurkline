@@ -13,11 +13,13 @@ use crate::{
     curl_import::{MAX_CURL_BYTES, parse_copy_as_curl},
     error::{Error, Result},
     http::SlackHttpClient,
+    markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     mcp,
     model::{
         Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
-        ConversationSearchTruncationReason, DoctorReport, InboxReport, Message, MessagePage,
-        MessageSearchPage, ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        ConversationSearchTruncationReason, DoctorReport, Draft, DraftDeleteReport, DraftPage,
+        DraftSendReport, InboxReport, Message, MessagePage, MessageSearchPage, RenderedMessage,
+        SentMessage, ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
     service::{MAX_CONVERSATIONS, MAX_USERS, SlackService},
 };
@@ -26,7 +28,7 @@ use crate::{
 #[command(
     name = "lurkline",
     version,
-    about = "Read-only Slack access through an existing browser session"
+    about = "Slack reading and guarded rich-text authoring through an existing browser session"
 )]
 pub struct Cli {
     /// Use a named credential profile. LURKLINE_PROFILE is the fallback.
@@ -82,23 +84,32 @@ pub enum Command {
         #[command(subcommand)]
         command: ChannelCommand,
     },
-    /// Read a message thread.
+    /// Read or reply to a message thread.
     Thread {
         #[command(subcommand)]
         command: ThreadCommand,
     },
-    /// Fetch an exact message.
+    /// Fetch, render, or send a message.
     Message {
         #[command(subcommand)]
         command: MessageCommand,
+    },
+    /// List and manage Slack drafts.
+    Drafts {
+        #[command(subcommand)]
+        command: DraftsCommand,
     },
     /// Find workspace users.
     Users {
         #[command(subcommand)]
         command: UsersCommand,
     },
-    /// Run the read-only MCP server over stdin/stdout.
-    Mcp,
+    /// Run the MCP server over stdin/stdout.
+    Mcp {
+        /// Enable draft and message write tools. Reads remain available by default.
+        #[arg(long)]
+        allow_write: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,6 +179,22 @@ pub enum ThreadCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Reply to a thread with bounded Markdown from standard input.
+    Reply {
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
+        channel_id: String,
+        /// Slack timestamp of the thread root.
+        thread_ts: String,
+        /// Also publish the reply to the conversation.
+        #[arg(long)]
+        broadcast: bool,
+        /// Confirm irreversible message publication.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -178,6 +205,91 @@ pub enum MessageCommand {
         channel_id: String,
         /// Exact Slack message timestamp.
         message_ts: String,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Render bounded Markdown from standard input as Slack rich text.
+    Render {
+        /// Emit the plain-text fallback and Slack blocks as stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a root message from bounded Markdown on standard input.
+    Send {
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
+        conversation: String,
+        /// Confirm irreversible message publication.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DraftsCommand {
+    /// List one timestamp-paginated page of active drafts.
+    List {
+        /// Private Slack draft timestamp from a previous response.
+        #[arg(long)]
+        next_ts: Option<String>,
+        /// Maximum drafts to return, from 1 through 100.
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch one draft by its server ID.
+    Get {
+        /// Slack server draft ID.
+        draft_id: String,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a draft from bounded Markdown on standard input.
+    Create {
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
+        conversation: String,
+        /// Existing thread root timestamp. Omit for a root-message draft.
+        #[arg(long)]
+        thread_ts: Option<String>,
+        /// Also send the eventual reply to the conversation. Requires --thread-ts.
+        #[arg(long)]
+        broadcast: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace a supported draft's content from bounded Markdown on standard input.
+    Update {
+        /// Slack server draft ID.
+        draft_id: String,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Permanently delete one supported draft.
+    Delete {
+        /// Slack server draft ID.
+        draft_id: String,
+        /// Confirm permanent draft deletion.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish one supported draft, then delete it after Slack acknowledges the message.
+    Send {
+        /// Slack server draft ID.
+        draft_id: String,
+        /// Confirm irreversible message publication.
+        #[arg(long)]
+        confirm: bool,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -256,6 +368,9 @@ pub enum UsersCommand {
 pub async fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Auth { command } => run_auth(command, cli.profile.as_deref()).await,
+        Command::Message {
+            command: MessageCommand::Render { json },
+        } => print_rendered(render_markdown(&read_markdown_stdin()?)?, json),
         command => run_slack_command(command, cli.profile.as_deref()).await,
     }
 }
@@ -295,6 +410,22 @@ fn read_curl_stdin() -> Result<Zeroizing<Vec<u8>>> {
         return Err(Error::invalid_input("curl", "is larger than 256 KiB"));
     }
     Ok(input)
+}
+
+fn read_markdown_stdin() -> Result<String> {
+    let mut input = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take((MAX_MARKDOWN_BYTES + 1) as u64)
+        .read_to_end(&mut input)
+        .map_err(|_| Error::MarkdownInputRead)?;
+    if input.len() > MAX_MARKDOWN_BYTES {
+        return Err(Error::invalid_input(
+            "markdown",
+            "is larger than 40000 bytes",
+        ));
+    }
+    String::from_utf8(input).map_err(|_| Error::invalid_input("markdown", "must be valid UTF-8"))
 }
 
 async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()> {
@@ -380,6 +511,24 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                 .await?,
             json,
         ),
+        Command::Thread {
+            command:
+                ThreadCommand::Reply {
+                    channel_id,
+                    thread_ts,
+                    broadcast,
+                    confirm,
+                    json,
+                },
+        } => {
+            let markdown = read_markdown_stdin()?;
+            print_sent_message(
+                service
+                    .send_message(&channel_id, Some(&thread_ts), broadcast, &markdown, confirm)
+                    .await?,
+                json,
+            )
+        }
         Command::Message {
             command:
                 MessageCommand::Get {
@@ -388,11 +537,183 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                     json,
                 },
         } => print_message(service.get_message(&channel_id, &message_ts).await?, json),
+        Command::Message {
+            command: MessageCommand::Render { .. },
+        } => unreachable!("local Markdown rendering is dispatched before Slack configuration"),
+        Command::Message {
+            command:
+                MessageCommand::Send {
+                    conversation,
+                    confirm,
+                    json,
+                },
+        } => {
+            let markdown = read_markdown_stdin()?;
+            print_sent_message(
+                service
+                    .send_message(&conversation, None, false, &markdown, confirm)
+                    .await?,
+                json,
+            )
+        }
+        Command::Drafts {
+            command:
+                DraftsCommand::List {
+                    next_ts,
+                    limit,
+                    json,
+                },
+        } => print_draft_page(service.list_drafts(next_ts.as_deref(), limit).await?, json),
+        Command::Drafts {
+            command: DraftsCommand::Get { draft_id, json },
+        } => print_draft(service.get_draft(&draft_id).await?, json),
+        Command::Drafts {
+            command:
+                DraftsCommand::Create {
+                    conversation,
+                    thread_ts,
+                    broadcast,
+                    json,
+                },
+        } => {
+            let markdown = read_markdown_stdin()?;
+            print_draft(
+                service
+                    .create_draft(&conversation, thread_ts.as_deref(), broadcast, &markdown)
+                    .await?,
+                json,
+            )
+        }
+        Command::Drafts {
+            command: DraftsCommand::Update { draft_id, json },
+        } => {
+            let markdown = read_markdown_stdin()?;
+            print_draft(service.update_draft(&draft_id, &markdown).await?, json)
+        }
+        Command::Drafts {
+            command:
+                DraftsCommand::Delete {
+                    draft_id,
+                    confirm,
+                    json,
+                },
+        } => print_draft_delete(service.delete_draft(&draft_id, confirm).await?, json),
+        Command::Drafts {
+            command:
+                DraftsCommand::Send {
+                    draft_id,
+                    confirm,
+                    json,
+                },
+        } => print_draft_send(service.send_draft(&draft_id, confirm).await?, json),
         Command::Users {
             command: UsersCommand::Find { query, limit, json },
         } => print_users(service.find_users(&query, limit).await?, json),
-        Command::Mcp => mcp::serve_stdio(service).await,
+        Command::Mcp { allow_write } => mcp::serve_stdio(service, allow_write).await,
     }
+}
+
+fn print_rendered(rendered: RenderedMessage, json: bool) -> Result<()> {
+    if json {
+        print_json(&rendered)
+    } else {
+        println!("{}", rendered.text);
+        Ok(())
+    }
+}
+
+fn print_draft_page(page: DraftPage, json: bool) -> Result<()> {
+    if json {
+        return print_json(&page);
+    }
+    if page.drafts.is_empty() {
+        println!("No active drafts.");
+    } else {
+        for draft in &page.drafts {
+            print_draft_row(draft);
+        }
+    }
+    if page.has_more {
+        println!("more\t{}", page.next_ts.as_deref().unwrap_or("available"));
+    }
+    Ok(())
+}
+
+fn print_draft(draft: Draft, json: bool) -> Result<()> {
+    if json {
+        print_json(&draft)
+    } else {
+        print_draft_row(&draft);
+        Ok(())
+    }
+}
+
+fn print_draft_row(draft: &Draft) {
+    let destination = draft.destinations.first();
+    println!(
+        "{}\t{}\t{}\t{}\t{}",
+        escape_human(&draft.id),
+        escape_human(
+            destination
+                .and_then(|destination| destination.channel_id.as_deref())
+                .unwrap_or("-")
+        ),
+        escape_human(
+            destination
+                .and_then(|destination| destination.thread_ts.as_deref())
+                .unwrap_or("root")
+        ),
+        if draft.is_supported {
+            "supported"
+        } else {
+            "unsupported"
+        },
+        escape_human(&draft.text)
+    );
+}
+
+fn print_draft_delete(report: DraftDeleteReport, json: bool) -> Result<()> {
+    if json {
+        print_json(&report)
+    } else {
+        println!("deleted\t{}", escape_human(&report.id));
+        Ok(())
+    }
+}
+
+fn print_sent_message(sent: SentMessage, json: bool) -> Result<()> {
+    if json {
+        print_json(&sent)
+    } else {
+        println!(
+            "sent\t{}\t{}\t{}",
+            escape_human(&sent.message.channel_id),
+            escape_human(&sent.message.ts),
+            escape_human(&sent.client_msg_id)
+        );
+        Ok(())
+    }
+}
+
+fn print_draft_send(report: DraftSendReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    println!(
+        "sent\t{}\t{}\tdraft={}",
+        escape_human(&report.sent.message.channel_id),
+        escape_human(&report.sent.message.ts),
+        escape_human(&report.draft_id)
+    );
+    if let Some(warning) = report.cleanup_warning {
+        eprintln!(
+            "warning: message was sent, but draft {} at revision {} was not deleted: {}",
+            escape_human(&warning.draft_id),
+            escape_human(&warning.last_updated_ts),
+            escape_human(&warning.reason)
+        );
+    }
+    Ok(())
 }
 
 fn print_json(value: &impl Serialize) -> Result<()> {
@@ -961,6 +1282,14 @@ mod tests {
             Command::Message { .. }
         ));
         assert!(matches!(
+            Cli::try_parse_from(["lurkline", "message", "render", "--json"])
+                .unwrap()
+                .command,
+            Command::Message {
+                command: MessageCommand::Render { json: true }
+            }
+        ));
+        assert!(matches!(
             Cli::try_parse_from(["lurkline", "users", "find", "alice", "--limit", "3"])
                 .unwrap()
                 .command,
@@ -969,8 +1298,83 @@ mod tests {
             }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["lurkline", "mcp"]).unwrap().command,
-            Command::Mcp
+            Cli::try_parse_from(["lurkline", "mcp", "--allow-write"])
+                .unwrap()
+                .command,
+            Command::Mcp { allow_write: true }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "drafts",
+                "create",
+                "#general",
+                "--thread-ts",
+                "100.000001",
+                "--broadcast",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Drafts {
+                command: DraftsCommand::Create {
+                    thread_ts: Some(_),
+                    broadcast: true,
+                    json: true,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_guarded_root_reply_and_draft_publication() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "message",
+                "send",
+                "#general",
+                "--confirm",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Message {
+                command: MessageCommand::Send {
+                    conversation,
+                    confirm: true,
+                    json: true
+                }
+            } if conversation == "#general"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "thread",
+                "reply",
+                "C123",
+                "100.000001",
+                "--broadcast",
+                "--confirm"
+            ])
+            .unwrap()
+            .command,
+            Command::Thread {
+                command: ThreadCommand::Reply {
+                    broadcast: true,
+                    confirm: true,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lurkline", "drafts", "send", "DR123", "--confirm"])
+                .unwrap()
+                .command,
+            Command::Drafts {
+                command: DraftsCommand::Send { confirm: true, .. }
+            }
         ));
     }
 
@@ -1043,6 +1447,7 @@ mod tests {
                 author_id: Some("U456".into()),
                 author_name: None,
                 text: "hello\r\x1b".into(),
+                blocks: None,
                 permalink: None,
             };
             assert_eq!(
