@@ -53,13 +53,14 @@ fn stdout(args: &[&str]) -> String {
 }
 
 #[test]
-fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
+fn version_and_help_expose_the_complete_v040_cli_without_configuration() {
     assert_eq!(
         stdout(&["--version"]).trim(),
         format!("lurkline {}", env!("CARGO_PKG_VERSION"))
     );
 
     let root = stdout(&["--help"]);
+    assert!(root.contains("guarded rich-text authoring"));
     for command in [
         "auth",
         "inbox",
@@ -125,6 +126,20 @@ fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
     let render = stdout(&["message", "render", "--help"]);
     assert!(render.contains("standard input"));
     assert!(render.contains("--json"));
+    let message_group = stdout(&["message", "--help"]);
+    for command in ["get", "render", "send"] {
+        assert!(
+            message_group.contains(command),
+            "message help omitted {command}"
+        );
+    }
+    let thread_group = stdout(&["thread", "--help"]);
+    for command in ["read", "reply"] {
+        assert!(
+            thread_group.contains(command),
+            "thread help omitted {command}"
+        );
+    }
 
     let list = stdout(&["conversations", "list", "--help"]);
     assert!(list.contains("from 1 through 200"));
@@ -132,7 +147,7 @@ fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
     assert!(find.contains("from 1 through 100"));
 
     let drafts = stdout(&["drafts", "--help"]);
-    for command in ["list", "get", "create", "update", "delete"] {
+    for command in ["list", "get", "create", "update", "delete", "send"] {
         assert!(drafts.contains(command), "draft help omitted {command}");
     }
     let draft_create = stdout(&["drafts", "create", "--help"]);

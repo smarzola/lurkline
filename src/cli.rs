@@ -28,7 +28,7 @@ use crate::{
 #[command(
     name = "lurkline",
     version,
-    about = "Read-only Slack access through an existing browser session"
+    about = "Slack reading and guarded rich-text authoring through an existing browser session"
 )]
 pub struct Cli {
     /// Use a named credential profile. LURKLINE_PROFILE is the fallback.
@@ -84,12 +84,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ChannelCommand,
     },
-    /// Read a message thread.
+    /// Read or reply to a message thread.
     Thread {
         #[command(subcommand)]
         command: ThreadCommand,
     },
-    /// Fetch an exact message.
+    /// Fetch, render, or send a message.
     Message {
         #[command(subcommand)]
         command: MessageCommand,

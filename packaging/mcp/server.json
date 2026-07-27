@@ -1,6 +1,6 @@
 {
   "name": "lurkline",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "transport": {
     "type": "stdio",
     "command": "lurkline",
@@ -8,7 +8,7 @@
       "mcp"
     ]
   },
-  "policy": "read-only",
+  "policy": "read-only-by-default",
   "required_env": [],
   "optional_env": [
     "LURKLINE_PROFILE",
