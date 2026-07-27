@@ -67,6 +67,7 @@ fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
         "search",
         "channel",
         "thread",
+        "drafts",
         "mcp",
     ] {
         assert!(root.contains(command), "root help omitted {command}");
@@ -129,6 +130,24 @@ fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
     assert!(list.contains("from 1 through 200"));
     let find = stdout(&["conversations", "find", "--help"]);
     assert!(find.contains("from 1 through 100"));
+
+    let drafts = stdout(&["drafts", "--help"]);
+    for command in ["list", "get", "create", "update", "delete"] {
+        assert!(drafts.contains(command), "draft help omitted {command}");
+    }
+    let draft_create = stdout(&["drafts", "create", "--help"]);
+    for option in ["--thread-ts", "--broadcast", "--json"] {
+        assert!(
+            draft_create.contains(option),
+            "draft create help omitted {option}"
+        );
+    }
+    assert!(draft_create.contains("standard input"));
+    let draft_delete = stdout(&["drafts", "delete", "--help"]);
+    assert!(draft_delete.contains("--confirm"));
+
+    let mcp = stdout(&["mcp", "--help"]);
+    assert!(mcp.contains("--allow-write"));
 }
 
 #[test]

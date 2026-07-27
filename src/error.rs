@@ -53,6 +53,10 @@ pub enum Error {
     InputRead,
     #[error("could not read Markdown input from standard input")]
     MarkdownInputRead,
+    #[error("Slack writes are disabled; start the MCP server with --allow-write")]
+    WriteNotAllowed,
+    #[error("confirmation is required for {action}")]
+    ConfirmationRequired { action: &'static str },
     #[error("Slack browser session is expired or invalid; copy fresh browser credentials")]
     Authentication,
     #[error("Slack method {method} failed: {code}")]
@@ -76,6 +80,8 @@ pub enum Error {
     },
     #[error("could not serialize output")]
     Output,
+    #[error("system clock is earlier than the Unix epoch")]
+    SystemClock,
     #[error("MCP stdio transport failed")]
     McpTransport,
 }

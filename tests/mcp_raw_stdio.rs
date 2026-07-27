@@ -98,16 +98,21 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         names,
         std::collections::BTreeSet::from([
             "slack_doctor",
+            "slack_create_draft",
+            "slack_delete_draft",
             "slack_find_conversations",
             "slack_find_users",
+            "slack_get_draft",
             "slack_get_message",
             "slack_list_conversations",
+            "slack_list_drafts",
             "slack_list_unreads",
             "slack_read_channel",
             "slack_read_inbox",
             "slack_read_thread",
             "slack_render_markdown",
             "slack_search_messages",
+            "slack_update_draft",
         ])
     );
     for tool_name in [
@@ -161,6 +166,34 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     assert_eq!(
         rendered["result"]["structuredContent"]["blocks"][0]["type"],
         "rich_text"
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_create_draft",
+                "arguments": {
+                    "conversation": "C123",
+                    "markdown": "must not reach Slack"
+                }
+            }
+        }),
+    )
+    .await;
+    let write_disabled = response_with_id(&mut stdout, 21).await;
+    assert_eq!(write_disabled["result"]["isError"], true);
+    assert_eq!(
+        write_disabled["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "write_not_allowed",
+                "message": "Slack writes are disabled; start the MCP server with --allow-write"
+            }
+        })
     );
 
     send(

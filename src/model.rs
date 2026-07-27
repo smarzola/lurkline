@@ -192,6 +192,57 @@ pub(crate) struct RawMessageSearchChannel {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawDraftsPage {
+    #[serde(default)]
+    pub drafts: Vec<RawDraft>,
+    #[serde(default)]
+    pub files: Vec<Value>,
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawDraftResponse {
+    pub draft: RawDraft,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawMutationResponse {}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawDraft {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub client_msg_id: Option<String>,
+    #[serde(default)]
+    pub last_updated_ts: Option<RawDraftRevision>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub blocks: Option<Vec<Value>>,
+    #[serde(default)]
+    pub destinations: Vec<DraftDestination>,
+    #[serde(default)]
+    pub file_ids: Vec<String>,
+    #[serde(default)]
+    pub attachments: Vec<Value>,
+    #[serde(default)]
+    pub is_from_composer: bool,
+    #[serde(default)]
+    pub is_deleted: bool,
+    #[serde(default)]
+    pub is_sent: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RawDraftRevision {
+    String(String),
+    Number(serde_json::Number),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawUser {
     pub id: String,
     #[serde(default)]
@@ -329,6 +380,56 @@ pub struct RenderedMessage {
     pub text: String,
     /// Slack `rich_text` blocks generated from the Markdown source.
     pub blocks: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct DraftDestination {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_ts: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub broadcast: bool,
+    /// Unknown private-API destination fields are retained for diagnostics but
+    /// make the draft unsupported for mutation or publication.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct Draft {
+    pub id: String,
+    pub client_msg_id: Option<String>,
+    /// Slack's server revision, used as the drafts.list continuation cursor.
+    pub last_updated_ts: String,
+    /// Browser-compatible optimistic-concurrency timestamp for mutations.
+    pub client_last_updated_ts: String,
+    pub text: String,
+    pub blocks: Option<Vec<Value>>,
+    pub destinations: Vec<DraftDestination>,
+    pub file_ids: Vec<String>,
+    pub attachments: Vec<Value>,
+    pub is_from_composer: bool,
+    /// Whether Lurkline can safely update, delete, or publish this draft.
+    pub is_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftPage {
+    pub drafts: Vec<Draft>,
+    pub has_more: bool,
+    /// Pass this private-API timestamp to the next list request.
+    pub next_ts: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftDeleteReport {
+    pub id: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
