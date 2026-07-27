@@ -112,6 +112,8 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_read_thread",
             "slack_render_markdown",
             "slack_search_messages",
+            "slack_send_draft",
+            "slack_send_message",
             "slack_update_draft",
         ])
     );
@@ -188,6 +190,35 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     assert_eq!(write_disabled["result"]["isError"], true);
     assert_eq!(
         write_disabled["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "write_not_allowed",
+                "message": "Slack writes are disabled; start the MCP server with --allow-write"
+            }
+        })
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_send_message",
+                "arguments": {
+                    "conversation": "C123",
+                    "markdown": "must not reach Slack",
+                    "confirm": true
+                }
+            }
+        }),
+    )
+    .await;
+    let send_disabled = response_with_id(&mut stdout, 22).await;
+    assert_eq!(send_disabled["result"]["isError"], true);
+    assert_eq!(
+        send_disabled["result"]["structuredContent"],
         json!({
             "error": {
                 "code": "write_not_allowed",

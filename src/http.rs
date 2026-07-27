@@ -17,7 +17,7 @@ use crate::{
     model::{
         ClientCountsPayload, DraftDestination, RawConversationsPage, RawDraftResponse,
         RawDraftsPage, RawMessagePage, RawMessageSearchResponse, RawMessagesList,
-        RawMutationResponse, RawUsersPage,
+        RawMutationResponse, RawPostMessageResponse, RawUsersPage,
     },
     service::SlackApi,
 };
@@ -61,6 +61,31 @@ impl SlackHttpClient {
         method: &'static str,
         reason: &'static str,
         fields: &[(&'static str, String)],
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.post_form_inner(method, reason, fields, false).await
+    }
+
+    async fn post_publication_form<T>(
+        &self,
+        method: &'static str,
+        reason: &'static str,
+        fields: &[(&'static str, String)],
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.post_form_inner(method, reason, fields, true).await
+    }
+
+    async fn post_form_inner<T>(
+        &self,
+        method: &'static str,
+        reason: &'static str,
+        fields: &[(&'static str, String)],
+        malformed_is_ambiguous: bool,
     ) -> Result<T>
     where
         T: DeserializeOwned,
@@ -138,7 +163,13 @@ impl SlackHttpClient {
             body.extend_from_slice(&chunk);
         }
 
-        let value: Value = serde_json::from_slice(&body).map_err(|_| Error::Authentication)?;
+        let value: Value = serde_json::from_slice(&body).map_err(|_| {
+            if malformed_is_ambiguous {
+                Error::InvalidResponse { method }
+            } else {
+                Error::Authentication
+            }
+        })?;
         validate_envelope(method, &value)?;
         serde_json::from_value(value).map_err(|_| Error::InvalidResponse { method })
     }
@@ -362,6 +393,33 @@ impl SlackApi for SlackHttpClient {
             ],
         )
         .await
+    }
+
+    async fn chat_post_message(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        broadcast: bool,
+        client_msg_id: &str,
+        text: &str,
+        blocks: &[Value],
+    ) -> Result<RawPostMessageResponse> {
+        let mut fields = vec![
+            ("channel", channel.into()),
+            ("blocks", encode_json(blocks)?),
+            ("client_msg_id", client_msg_id.into()),
+            ("text", text.into()),
+            ("include_channel_perm_error", "true".into()),
+            ("skip_dlp_user_warning", "false".into()),
+        ];
+        if let Some(thread_ts) = thread_ts {
+            fields.push(("thread_ts", thread_ts.into()));
+        }
+        if broadcast {
+            fields.push(("reply_broadcast", "true".into()));
+        }
+        self.post_publication_form("chat.postMessage", "lurkline-message-send", &fields)
+            .await
     }
 }
 
@@ -787,6 +845,102 @@ mod tests {
             multipart_text_field(&body, "skip_file_deletion"),
             Some("false")
         );
+    }
+
+    #[tokio::test]
+    async fn sends_root_and_reply_chat_post_message_forms() {
+        let blocks = vec![serde_json::json!({
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [{"type": "text", "text": "synthetic"}]
+            }]
+        })];
+        for (thread_ts, broadcast) in [(None, false), (Some("100.000001"), true)] {
+            let mut message = serde_json::json!({
+                "ts": "200.000001",
+                "text": "synthetic",
+                "blocks": blocks
+            });
+            if let Some(thread_ts) = thread_ts {
+                message["thread_ts"] = Value::String(thread_ts.into());
+            }
+            let response = serde_json::json!({
+                "ok": true,
+                "channel": "C123",
+                "ts": "200.000001",
+                "message": message
+            })
+            .to_string()
+            .into_bytes();
+            let (client, capture) = server(StatusCode::OK, response, 64 * 1024).await;
+            client
+                .chat_post_message(
+                    "C123",
+                    thread_ts,
+                    broadcast,
+                    "00000000-0000-4000-8000-000000000001",
+                    "synthetic",
+                    &blocks,
+                )
+                .await
+                .unwrap();
+
+            let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+            let body = String::from_utf8_lossy(&raw_body);
+            assert_eq!(uri.path(), "/api/chat.postMessage");
+            assert_eq!(multipart_text_field(&body, "channel"), Some("C123"));
+            assert_eq!(multipart_text_field(&body, "text"), Some("synthetic"));
+            assert_eq!(
+                multipart_text_field(&body, "client_msg_id"),
+                Some("00000000-0000-4000-8000-000000000001")
+            );
+            assert_eq!(
+                multipart_text_field(&body, "include_channel_perm_error"),
+                Some("true")
+            );
+            assert_eq!(
+                multipart_text_field(&body, "skip_dlp_user_warning"),
+                Some("false")
+            );
+            assert_eq!(multipart_text_field(&body, "thread_ts"), thread_ts);
+            assert_eq!(
+                multipart_text_field(&body, "reply_broadcast"),
+                broadcast.then_some("true")
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(multipart_text_field(&body, "blocks").unwrap())
+                    .unwrap(),
+                Value::Array(blocks.clone())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn treats_malformed_publication_responses_as_ambiguous_shapes() {
+        let (client, _) = server(
+            StatusCode::OK,
+            b"accepted response was not readable JSON".to_vec(),
+            64 * 1024,
+        )
+        .await;
+        let error = client
+            .chat_post_message(
+                "C123",
+                None,
+                false,
+                "00000000-0000-4000-8000-000000000001",
+                "synthetic",
+                &[serde_json::json!({"type": "rich_text", "elements": []})],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidResponse {
+                method: "chat.postMessage"
+            }
+        ));
     }
 
     #[tokio::test]

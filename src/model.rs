@@ -210,6 +210,15 @@ pub(crate) struct RawDraftResponse {
 pub(crate) struct RawMutationResponse {}
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawPostMessageResponse {
+    #[serde(default)]
+    pub channel: String,
+    #[serde(default)]
+    pub ts: String,
+    pub message: RawMessage,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawDraft {
     #[serde(default)]
     pub id: String,
@@ -406,7 +415,7 @@ pub struct Draft {
     pub client_msg_id: Option<String>,
     /// Slack's server revision, used as the drafts.list continuation cursor.
     pub last_updated_ts: String,
-    /// Browser-compatible optimistic-concurrency timestamp for mutations.
+    /// Browser-compatible timestamp derived from the server revision for deletion.
     pub client_last_updated_ts: String,
     pub text: String,
     pub blocks: Option<Vec<Value>>,
@@ -430,6 +439,32 @@ pub struct DraftPage {
 pub struct DraftDeleteReport {
     pub id: String,
     pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SentMessage {
+    /// Client-generated UUID v4 used to make the publication identifiable.
+    pub client_msg_id: String,
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftCleanupWarning {
+    /// Draft that remains after the message was acknowledged by Slack.
+    pub draft_id: String,
+    /// Server revision observed immediately before publication.
+    pub last_updated_ts: String,
+    /// Secret-safe reason the post-success cleanup failed.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DraftSendReport {
+    pub sent: SentMessage,
+    pub draft_id: String,
+    pub draft_deleted: bool,
+    /// Present only when Slack acknowledged the message but draft deletion failed.
+    pub cleanup_warning: Option<DraftCleanupWarning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

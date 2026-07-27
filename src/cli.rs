@@ -18,8 +18,8 @@ use crate::{
     model::{
         Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
         ConversationSearchTruncationReason, DoctorReport, Draft, DraftDeleteReport, DraftPage,
-        InboxReport, Message, MessagePage, MessageSearchPage, RenderedMessage, ThreadPage,
-        UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        DraftSendReport, InboxReport, Message, MessagePage, MessageSearchPage, RenderedMessage,
+        SentMessage, ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
     service::{MAX_CONVERSATIONS, MAX_USERS, SlackService},
 };
@@ -179,6 +179,22 @@ pub enum ThreadCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Reply to a thread with bounded Markdown from standard input.
+    Reply {
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
+        channel_id: String,
+        /// Slack timestamp of the thread root.
+        thread_ts: String,
+        /// Also publish the reply to the conversation.
+        #[arg(long)]
+        broadcast: bool,
+        /// Confirm irreversible message publication.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -196,6 +212,17 @@ pub enum MessageCommand {
     /// Render bounded Markdown from standard input as Slack rich text.
     Render {
         /// Emit the plain-text fallback and Slack blocks as stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a root message from bounded Markdown on standard input.
+    Send {
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
+        conversation: String,
+        /// Confirm irreversible message publication.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -250,6 +277,17 @@ pub enum DraftsCommand {
         /// Slack server draft ID.
         draft_id: String,
         /// Confirm permanent draft deletion.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish one supported draft, then delete it after Slack acknowledges the message.
+    Send {
+        /// Slack server draft ID.
+        draft_id: String,
+        /// Confirm irreversible message publication.
         #[arg(long)]
         confirm: bool,
         /// Emit stable JSON.
@@ -473,6 +511,24 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                 .await?,
             json,
         ),
+        Command::Thread {
+            command:
+                ThreadCommand::Reply {
+                    channel_id,
+                    thread_ts,
+                    broadcast,
+                    confirm,
+                    json,
+                },
+        } => {
+            let markdown = read_markdown_stdin()?;
+            print_sent_message(
+                service
+                    .send_message(&channel_id, Some(&thread_ts), broadcast, &markdown, confirm)
+                    .await?,
+                json,
+            )
+        }
         Command::Message {
             command:
                 MessageCommand::Get {
@@ -484,6 +540,22 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
         Command::Message {
             command: MessageCommand::Render { .. },
         } => unreachable!("local Markdown rendering is dispatched before Slack configuration"),
+        Command::Message {
+            command:
+                MessageCommand::Send {
+                    conversation,
+                    confirm,
+                    json,
+                },
+        } => {
+            let markdown = read_markdown_stdin()?;
+            print_sent_message(
+                service
+                    .send_message(&conversation, None, false, &markdown, confirm)
+                    .await?,
+                json,
+            )
+        }
         Command::Drafts {
             command:
                 DraftsCommand::List {
@@ -526,6 +598,14 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                     json,
                 },
         } => print_draft_delete(service.delete_draft(&draft_id, confirm).await?, json),
+        Command::Drafts {
+            command:
+                DraftsCommand::Send {
+                    draft_id,
+                    confirm,
+                    json,
+                },
+        } => print_draft_send(service.send_draft(&draft_id, confirm).await?, json),
         Command::Users {
             command: UsersCommand::Find { query, limit, json },
         } => print_users(service.find_users(&query, limit).await?, json),
@@ -599,6 +679,41 @@ fn print_draft_delete(report: DraftDeleteReport, json: bool) -> Result<()> {
         println!("deleted\t{}", escape_human(&report.id));
         Ok(())
     }
+}
+
+fn print_sent_message(sent: SentMessage, json: bool) -> Result<()> {
+    if json {
+        print_json(&sent)
+    } else {
+        println!(
+            "sent\t{}\t{}\t{}",
+            escape_human(&sent.message.channel_id),
+            escape_human(&sent.message.ts),
+            escape_human(&sent.client_msg_id)
+        );
+        Ok(())
+    }
+}
+
+fn print_draft_send(report: DraftSendReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    println!(
+        "sent\t{}\t{}\tdraft={}",
+        escape_human(&report.sent.message.channel_id),
+        escape_human(&report.sent.message.ts),
+        escape_human(&report.draft_id)
+    );
+    if let Some(warning) = report.cleanup_warning {
+        eprintln!(
+            "warning: message was sent, but draft {} at revision {} was not deleted: {}",
+            escape_human(&warning.draft_id),
+            escape_human(&warning.last_updated_ts),
+            escape_human(&warning.reason)
+        );
+    }
+    Ok(())
 }
 
 fn print_json(value: &impl Serialize) -> Result<()> {
@@ -1208,6 +1323,57 @@ mod tests {
                     json: true,
                     ..
                 }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_guarded_root_reply_and_draft_publication() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "message",
+                "send",
+                "#general",
+                "--confirm",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Message {
+                command: MessageCommand::Send {
+                    conversation,
+                    confirm: true,
+                    json: true
+                }
+            } if conversation == "#general"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "thread",
+                "reply",
+                "C123",
+                "100.000001",
+                "--broadcast",
+                "--confirm"
+            ])
+            .unwrap()
+            .command,
+            Command::Thread {
+                command: ThreadCommand::Reply {
+                    broadcast: true,
+                    confirm: true,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["lurkline", "drafts", "send", "DR123", "--confirm"])
+                .unwrap()
+                .command,
+            Command::Drafts {
+                command: DraftsCommand::Send { confirm: true, .. }
             }
         ));
     }

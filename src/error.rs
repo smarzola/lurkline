@@ -71,6 +71,10 @@ pub enum Error {
     Timeout { method: &'static str },
     #[error("Slack method {method} could not be reached")]
     Transport { method: &'static str },
+    #[error(
+        "Slack publication outcome is unknown for client message {client_msg_id}; do not retry automatically; verify the message in Slack before deciding whether to retry"
+    )]
+    PublicationUncertain { client_msg_id: String },
     #[error("{resource} was not found")]
     NotFound { resource: &'static str },
     #[error("could not resolve {resource} within the {limit}-item scan limit")]

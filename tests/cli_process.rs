@@ -151,6 +151,24 @@ fn version_and_help_expose_the_complete_v030_cli_without_configuration() {
 }
 
 #[test]
+fn authoring_help_exposes_confirmed_root_reply_and_draft_publication() {
+    let message = stdout(&["message", "send", "--help"]);
+    assert!(message.contains("standard input"));
+    assert!(message.contains("--confirm"));
+    assert!(message.contains("--json"));
+
+    let reply = stdout(&["thread", "reply", "--help"]);
+    assert!(reply.contains("standard input"));
+    assert!(reply.contains("--broadcast"));
+    assert!(reply.contains("--confirm"));
+    assert!(reply.contains("--json"));
+
+    let draft = stdout(&["drafts", "send", "--help"]);
+    assert!(draft.contains("--confirm"));
+    assert!(draft.contains("--json"));
+}
+
+#[test]
 fn markdown_render_is_local_bounded_and_emits_stable_rich_text() {
     let output = run_with_stdin(
         &["message", "render", "--json"],
