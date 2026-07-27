@@ -752,6 +752,7 @@ mod tests {
             channel_id: Some("C123".into()),
             thread_ts: Some("100.000001".into()),
             broadcast: true,
+            user_ids: Some(vec!["U123".into()]),
             ..DraftDestination::default()
         };
         let blocks = vec![serde_json::json!({
@@ -761,7 +762,7 @@ mod tests {
                 "elements": [{"type": "text", "text": "synthetic"}]
             }]
         })];
-        let draft_response = br#"{"ok":true,"draft":{"id":"DR123","client_msg_id":"00000000-0000-4000-8000-000000000001","last_updated_ts":"2000","blocks":[{"type":"rich_text","elements":[]}],"destinations":[{"channel_id":"C123","thread_ts":"100.000001","broadcast":true}]}}"#;
+        let draft_response = br#"{"ok":true,"draft":{"id":"DR123","client_msg_id":"00000000-0000-4000-8000-000000000001","last_updated_ts":"2000","blocks":[{"type":"rich_text","elements":[]}],"destinations":[{"channel_id":"C123","thread_ts":"100.000001","broadcast":true,"user_ids":["U123"]}]}}"#;
 
         let (client, capture) = server(
             StatusCode::OK,
@@ -778,7 +779,14 @@ mod tests {
         assert_eq!(multipart_text_field(&body, "next_ts"), Some("1000"));
 
         let (client, capture) = server(StatusCode::OK, draft_response.to_vec(), 64 * 1024).await;
-        client.drafts_info("DR123").await.unwrap();
+        let info = client.drafts_info("DR123").await.unwrap();
+        assert_eq!(
+            info.draft.destinations[0]
+                .user_ids
+                .as_ref()
+                .map(|ids| ids.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["U123"])
+        );
         let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
         let body = String::from_utf8_lossy(&raw_body);
         assert_eq!(uri.path(), "/api/drafts.info");
