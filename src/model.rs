@@ -399,6 +399,14 @@ pub struct DraftDestination {
     pub thread_ts: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub broadcast: bool,
+    /// Slack-provided participant metadata for direct-message destinations.
+    /// Lurkline preserves this value but routes only by `channel_id`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_user_ids",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub user_ids: Option<Vec<String>>,
     /// Unknown private-API destination fields are retained for diagnostics but
     /// make the draft unsupported for mutation or publication.
     #[serde(flatten)]
@@ -407,6 +415,17 @@ pub struct DraftDestination {
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+fn deserialize_present_user_ids<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("user_ids must be an array"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

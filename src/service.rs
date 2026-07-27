@@ -34,6 +34,7 @@ const MAX_CONVERSATION_PAGES: usize = 20;
 const USERS_PAGE_SIZE: usize = 200;
 const MAX_USER_PAGES: usize = 20;
 pub(crate) const MAX_DRAFTS: usize = 100;
+const MAX_DRAFT_DESTINATION_USERS: usize = 100;
 
 #[async_trait]
 pub(crate) trait SlackApi: Send + Sync {
@@ -239,7 +240,8 @@ impl SlackService {
             .await?;
         let draft = normalize_draft(response.draft, "drafts.create")?;
         require_supported_draft(&draft)?;
-        if draft.destinations != [destination] {
+        if draft.destinations.len() != 1 || !same_draft_route(&draft.destinations[0], &destination)
+        {
             return Err(Error::InvalidResponse {
                 method: "drafts.create",
             });
@@ -264,7 +266,10 @@ impl SlackService {
             .await?;
         let updated = normalize_draft(response.draft, "drafts.update")?;
         require_supported_draft(&updated)?;
-        if updated.id != current.id || updated.destinations != current.destinations {
+        if updated.id != current.id
+            || updated.destinations.len() != 1
+            || !same_draft_route(&updated.destinations[0], &current.destinations[0])
+        {
             return Err(Error::InvalidResponse {
                 method: "drafts.update",
             });
@@ -1367,6 +1372,10 @@ fn normalize_draft(raw: RawDraft, method: &'static str) -> Result<Draft> {
                 .as_deref()
                 .is_some_and(|thread_ts| !is_valid_timestamp(thread_ts))
             || (destination.broadcast && destination.thread_ts.is_none())
+            || destination.user_ids.as_ref().is_some_and(|user_ids| {
+                user_ids.len() > MAX_DRAFT_DESTINATION_USERS
+                    || user_ids.iter().any(|user_id| !is_valid_user_id(user_id))
+            })
         {
             return Err(Error::InvalidResponse { method });
         }
@@ -1395,6 +1404,12 @@ fn normalize_draft(raw: RawDraft, method: &'static str) -> Result<Draft> {
         is_from_composer: raw.is_from_composer,
         is_supported,
     })
+}
+
+fn same_draft_route(actual: &DraftDestination, requested: &DraftDestination) -> bool {
+    actual.channel_id == requested.channel_id
+        && actual.thread_ts == requested.thread_ts
+        && actual.broadcast == requested.broadcast
 }
 
 fn normalize_sent_message(
@@ -2385,6 +2400,12 @@ mod tests {
         }
     }
 
+    fn raw_self_dm_draft(id: &str, revision: &str, text: &str) -> RawDraft {
+        let mut draft = raw_draft(id, revision, "D123", text);
+        draft.destinations[0].user_ids = Some(vec!["U123".into()]);
+        draft
+    }
+
     fn raw_user(id: &str, name: &str, display_name: &str) -> RawUser {
         RawUser {
             id: id.into(),
@@ -2504,6 +2525,223 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn drafts_accept_and_preserve_valid_self_dm_user_ids() {
+        let mut api = fake_api();
+        api.drafts_page = RawDraftsPage {
+            drafts: vec![raw_self_dm_draft("DR-list", "1000", "listed")],
+            ..RawDraftsPage::default()
+        };
+        api.draft_info = RawDraftResponse {
+            draft: raw_self_dm_draft("DR-existing", "2000", "existing"),
+        };
+        api.draft_create = RawDraftResponse {
+            draft: raw_self_dm_draft("DR-created", "3000", "created"),
+        };
+        api.draft_update = RawDraftResponse {
+            draft: raw_self_dm_draft("DR-existing", "2001", "updated"),
+        };
+        let draft_calls = api.draft_calls.clone();
+        let post_calls = api.post_calls.clone();
+        let service = service(api);
+
+        let page = service.list_drafts(None, 25).await.unwrap();
+        assert!(page.drafts[0].is_supported);
+        assert_eq!(
+            page.drafts[0].destinations[0].user_ids.as_deref(),
+            Some(["U123".to_owned()].as_slice())
+        );
+        assert_eq!(
+            serde_json::to_value(&page.drafts[0].destinations[0]).unwrap(),
+            json!({"channel_id": "D123", "user_ids": ["U123"]})
+        );
+        assert_eq!(
+            serde_json::to_value(DraftDestination {
+                channel_id: Some("D123".into()),
+                ..DraftDestination::default()
+            })
+            .unwrap(),
+            json!({"channel_id": "D123"})
+        );
+
+        let created = service
+            .create_draft("D123", None, false, "created")
+            .await
+            .unwrap();
+        assert!(created.is_supported);
+        assert_eq!(
+            created.destinations[0].user_ids.as_deref(),
+            Some(["U123".to_owned()].as_slice())
+        );
+
+        let updated = service
+            .update_draft("DR-existing", "updated")
+            .await
+            .unwrap();
+        assert!(updated.is_supported);
+        assert_eq!(
+            updated.destinations[0].user_ids.as_deref(),
+            Some(["U123".to_owned()].as_slice())
+        );
+
+        assert!(
+            service
+                .delete_draft("DR-existing", true)
+                .await
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            service
+                .send_draft("DR-existing", true)
+                .await
+                .unwrap()
+                .draft_deleted
+        );
+
+        let calls = draft_calls.lock().unwrap();
+        let DraftCall::Create { destinations, .. } = &calls[1] else {
+            panic!("expected draft creation");
+        };
+        assert_eq!(destinations[0].user_ids, None);
+        let DraftCall::Update { destinations, .. } = &calls[3] else {
+            panic!("expected draft update");
+        };
+        assert_eq!(
+            destinations[0].user_ids.as_deref(),
+            Some(["U123".to_owned()].as_slice())
+        );
+        let posts = post_calls.lock().unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].channel, "D123");
+        assert_eq!(posts[0].thread_ts, None);
+        assert!(!posts[0].broadcast);
+    }
+
+    #[test]
+    fn draft_user_ids_are_bounded_validated_and_keep_unknown_fields_unsupported() {
+        let mut maximum = raw_self_dm_draft("DR-maximum", "1000", "maximum");
+        maximum.destinations[0].user_ids = Some(
+            (0..MAX_DRAFT_DESTINATION_USERS)
+                .map(|index| format!("U{index:03}"))
+                .collect(),
+        );
+        assert!(
+            normalize_draft(maximum, "drafts.info")
+                .unwrap()
+                .is_supported
+        );
+
+        for user_ids in [
+            vec!["invalid-user".into()],
+            (0..=MAX_DRAFT_DESTINATION_USERS)
+                .map(|index| format!("U{index:03}"))
+                .collect(),
+        ] {
+            let mut malformed = raw_self_dm_draft("DR-invalid", "1000", "invalid");
+            malformed.destinations[0].user_ids = Some(user_ids);
+            assert!(matches!(
+                normalize_draft(malformed, "drafts.info"),
+                Err(Error::InvalidResponse {
+                    method: "drafts.info"
+                })
+            ));
+        }
+
+        for malformed_user_ids in [json!("U123"), json!(null)] {
+            assert!(
+                serde_json::from_value::<RawDraftResponse>(json!({
+                    "draft": {
+                        "id": "DR-invalid-type",
+                        "last_updated_ts": "1000",
+                        "blocks": [{"type": "rich_text", "elements": []}],
+                        "destinations": [{
+                            "channel_id": "D123",
+                            "user_ids": malformed_user_ids
+                        }]
+                    }
+                }))
+                .is_err()
+            );
+        }
+
+        let mut future = raw_self_dm_draft("DR-future", "1000", "future");
+        future.destinations[0]
+            .extra
+            .insert("future_route".into(), json!(true));
+        let normalized = normalize_draft(future, "drafts.info").unwrap();
+        assert!(!normalized.is_supported);
+        assert_eq!(
+            normalized.destinations[0].extra.get("future_route"),
+            Some(&json!(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_creation_rejects_changed_route_despite_valid_user_enrichment() {
+        let mut cases = [
+            (
+                raw_self_dm_draft("DR-channel", "1000", "channel"),
+                None,
+                false,
+            ),
+            (
+                raw_self_dm_draft("DR-thread", "1000", "thread"),
+                Some("1000.000001"),
+                false,
+            ),
+            (
+                raw_self_dm_draft("DR-broadcast", "1000", "broadcast"),
+                Some("1000.000001"),
+                false,
+            ),
+        ];
+        cases[0].0.destinations[0].channel_id = Some("D999".into());
+        cases[1].0.destinations[0].thread_ts = Some("2000.000001".into());
+        cases[2].0.destinations[0].thread_ts = Some("1000.000001".into());
+        cases[2].0.destinations[0].broadcast = true;
+
+        for (draft, requested_thread, requested_broadcast) in cases {
+            let mut api = fake_api();
+            api.draft_create = RawDraftResponse { draft };
+            assert!(matches!(
+                service(api)
+                    .create_draft("D123", requested_thread, requested_broadcast, "synthetic")
+                    .await,
+                Err(Error::InvalidResponse {
+                    method: "drafts.create"
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn draft_update_rejects_changed_route_despite_valid_user_enrichment() {
+        let mut cases = [
+            raw_self_dm_draft("DR-existing", "2001", "channel"),
+            raw_self_dm_draft("DR-existing", "2001", "thread"),
+            raw_self_dm_draft("DR-existing", "2001", "broadcast"),
+        ];
+        cases[0].destinations[0].channel_id = Some("D999".into());
+        cases[1].destinations[0].thread_ts = Some("2000.000001".into());
+        cases[2].destinations[0].thread_ts = Some("1000.000001".into());
+        cases[2].destinations[0].broadcast = true;
+
+        for draft in cases {
+            let mut api = fake_api();
+            api.draft_info = RawDraftResponse {
+                draft: raw_self_dm_draft("DR-existing", "2000", "existing"),
+            };
+            api.draft_update = RawDraftResponse { draft };
+            assert!(matches!(
+                service(api).update_draft("DR-existing", "synthetic").await,
+                Err(Error::InvalidResponse {
+                    method: "drafts.update"
+                })
+            ));
+        }
     }
 
     #[test]
