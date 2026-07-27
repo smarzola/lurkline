@@ -222,6 +222,14 @@ fn markdown_render_is_local_bounded_and_emits_stable_rich_text() {
         String::from_utf8(oversized.stderr).unwrap(),
         "error: invalid markdown: is larger than 40000 bytes\n"
     );
+
+    let deeply_nested_quote = format!("{}visible\n", "> ".repeat(256));
+    let nested = run_with_stdin(&["message", "render"], deeply_nested_quote.as_bytes());
+    assert_eq!(nested.status.code(), Some(1), "renderer process aborted");
+    assert_eq!(
+        String::from_utf8(nested.stderr).unwrap(),
+        "error: invalid markdown: nesting exceeds 64 levels\n"
+    );
 }
 
 #[test]

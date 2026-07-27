@@ -13,6 +13,7 @@ pub(crate) const MAX_MARKDOWN_BYTES: usize = 40_000;
 const MAX_RENDERED_BYTES: usize = 100_000;
 const MAX_RICH_ELEMENTS: usize = 1_000;
 const MAX_LIST_DEPTH: usize = 8;
+const MAX_PARSE_DEPTH: usize = 64;
 
 type Events<'a> = Peekable<Parser<'a>>;
 
@@ -53,6 +54,7 @@ struct Inline {
 pub(crate) fn render_markdown(source: &str) -> Result<RenderedMessage> {
     validate_source(source)?;
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    validate_parse_depth(source, options)?;
     let mut events = Parser::new_ext(source, options).peekable();
     let parsed = parse_blocks(&mut events, None);
     let mut rich_elements = Vec::new();
@@ -99,6 +101,26 @@ pub(crate) fn render_markdown(source: &str) -> Result<RenderedMessage> {
     }
 
     Ok(RenderedMessage { text, blocks })
+}
+
+fn validate_parse_depth(source: &str, options: Options) -> Result<()> {
+    let mut depth = 0_usize;
+    for event in Parser::new_ext(source, options) {
+        match event {
+            Event::Start(_) => {
+                depth = depth.saturating_add(1);
+                if depth > MAX_PARSE_DEPTH {
+                    return Err(Error::invalid_input(
+                        "markdown",
+                        "nesting exceeds 64 levels",
+                    ));
+                }
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_source(source: &str) -> Result<()> {
@@ -485,43 +507,98 @@ fn emit_list(
     target: &mut Vec<Value>,
 ) -> Result<()> {
     for (index, item) in items.iter().enumerate() {
-        let mut item_inlines = Vec::new();
-        for block in item
-            .iter()
-            .filter(|block| !matches!(block, Block::List { .. }))
-        {
-            append_block_inlines(block, &mut item_inlines);
-            push_inline(&mut item_inlines, "\n".into(), InlineStyle::default(), None);
-        }
-        trim_inline_end(&mut item_inlines);
-        if !item_inlines.is_empty() {
-            let mut list = Map::new();
-            list.insert("type".into(), Value::String("rich_text_list".into()));
-            list.insert(
-                "style".into(),
-                Value::String(if start.is_some() { "ordered" } else { "bullet" }.into()),
-            );
-            list.insert("indent".into(), json!(indent));
-            if let Some(first) = start {
-                list.insert(
-                    "offset".into(),
-                    json!(first.saturating_sub(1) + index as u64),
+        let mut direct = Vec::new();
+        let mut emitted_item = false;
+        for block in item {
+            if matches!(block, Block::List { .. }) {
+                emit_list_direct_segment(
+                    start,
+                    index,
+                    indent,
+                    &mut direct,
+                    &mut emitted_item,
+                    target,
                 );
+                if !emitted_item {
+                    push_list_item(
+                        start,
+                        index,
+                        indent,
+                        vec![Inline {
+                            text: " ".into(),
+                            style: InlineStyle::default(),
+                            link: None,
+                        }],
+                        target,
+                    );
+                    emitted_item = true;
+                }
+                emit_blocks(std::slice::from_ref(block), indent + 1, target)?;
+            } else {
+                append_block_inlines(block, &mut direct);
+                push_inline(&mut direct, "\n".into(), InlineStyle::default(), None);
             }
-            list.insert(
-                "elements".into(),
-                Value::Array(vec![section_value(item_inlines)]),
-            );
-            target.push(Value::Object(list));
         }
-        for nested in item
-            .iter()
-            .filter(|block| matches!(block, Block::List { .. }))
-        {
-            emit_blocks(std::slice::from_ref(nested), indent + 1, target)?;
-        }
+        emit_list_direct_segment(start, index, indent, &mut direct, &mut emitted_item, target);
     }
     Ok(())
+}
+
+fn emit_list_direct_segment(
+    start: Option<u64>,
+    item_index: usize,
+    indent: usize,
+    inlines: &mut Vec<Inline>,
+    emitted_item: &mut bool,
+    target: &mut Vec<Value>,
+) {
+    trim_inline_end(inlines);
+    if inlines.is_empty() {
+        return;
+    }
+    let segment = std::mem::take(inlines);
+    if *emitted_item {
+        let mut continuation = Vec::new();
+        push_inline(
+            &mut continuation,
+            "  ".repeat(indent + 1),
+            InlineStyle::default(),
+            None,
+        );
+        extend_inlines(&mut continuation, segment);
+        push_section(continuation, target);
+        return;
+    }
+
+    push_list_item(start, item_index, indent, segment, target);
+    *emitted_item = true;
+}
+
+fn push_list_item(
+    start: Option<u64>,
+    item_index: usize,
+    indent: usize,
+    inlines: Vec<Inline>,
+    target: &mut Vec<Value>,
+) {
+    let mut list = Map::new();
+    list.insert("type".into(), Value::String("rich_text_list".into()));
+    list.insert(
+        "style".into(),
+        Value::String(if start.is_some() { "ordered" } else { "bullet" }.into()),
+    );
+    list.insert("indent".into(), json!(indent));
+    if let Some(first) = start {
+        list.insert(
+            "offset".into(),
+            json!(first.saturating_sub(1) + item_index as u64),
+        );
+    }
+    list.insert(
+        "elements".into(),
+        Value::Array(vec![section_value(inlines)]),
+    );
+    target.push(Value::Object(list));
 }
 
 fn append_block_inlines(block: &Block, target: &mut Vec<Inline>) {
@@ -665,22 +742,33 @@ fn append_list_plain(start: Option<u64>, items: &[Vec<Block>], indent: usize, ta
         } else {
             target.push_str("- ");
         }
-        let direct = item
-            .iter()
-            .filter(|block| !matches!(block, Block::List { .. }))
-            .map(block_plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        target.push_str(direct.trim());
-        target.push('\n');
-        for nested in item {
+        let mut wrote_direct = false;
+        let mut encountered_nested = false;
+        for block in item {
             if let Block::List {
                 start: nested_start,
                 items: nested_items,
-            } = nested
+            } = block
             {
+                if !target.ends_with('\n') {
+                    target.push('\n');
+                }
                 append_list_plain(*nested_start, nested_items, indent + 1, target);
+                encountered_nested = true;
+            } else {
+                if wrote_direct || encountered_nested {
+                    if !target.ends_with('\n') {
+                        target.push('\n');
+                    }
+                    target.push_str(&"  ".repeat(indent + 1));
+                }
+                target.push_str(block_plain(block).trim());
+                target.push('\n');
+                wrote_direct = true;
             }
+        }
+        if !target.ends_with('\n') {
+            target.push('\n');
         }
     }
 }
@@ -848,6 +936,50 @@ mod tests {
     }
 
     #[test]
+    fn markdown_preserves_content_after_a_nested_list_in_source_order() {
+        let rendered = render_markdown(concat!(
+            "- parent before\n",
+            "\n",
+            "  - nested\n",
+            "\n",
+            "  parent after\n",
+        ))
+        .unwrap();
+        assert_eq!(rendered.text, "- parent before\n  - nested\n  parent after");
+        let encoded = serde_json::to_string(&rendered.blocks).unwrap();
+        let before = encoded.find("parent before").unwrap();
+        let nested = encoded.find("nested").unwrap();
+        let after = encoded.find("parent after").unwrap();
+        assert!(before < nested && nested < after, "{encoded}");
+    }
+
+    #[test]
+    fn markdown_preserves_nested_first_and_nested_only_parent_items() {
+        let nested_only = render_markdown("-\n  - nested\n").unwrap();
+        assert_eq!(nested_only.text, "- \n  - nested");
+        assert_eq!(
+            nested_only.blocks[0]["elements"][0]["type"],
+            "rich_text_list"
+        );
+        assert_eq!(
+            nested_only.blocks[0]["elements"][0]["elements"][0]["elements"][0]["text"],
+            " "
+        );
+        assert_eq!(nested_only.blocks[0]["elements"][1]["indent"], 1);
+
+        let nested_first = render_markdown("-\n  - nested\n\n  parent after\n").unwrap();
+        assert_eq!(nested_first.text, "- \n  - nested\n  parent after");
+        let encoded = serde_json::to_string(&nested_first.blocks).unwrap();
+        let nested = encoded.find("nested").unwrap();
+        let after = encoded.find("parent after").unwrap();
+        assert!(nested < after, "{encoded}");
+        assert_eq!(
+            nested_first.blocks[0]["elements"][2]["type"],
+            "rich_text_section"
+        );
+    }
+
+    #[test]
     fn markdown_rejects_empty_control_over_limit_and_excessive_structure() {
         for source in ["", " \n\t", "hello\u{0}"] {
             assert!(matches!(
@@ -859,6 +991,14 @@ mod tests {
             ));
         }
         assert!(render_markdown(&"x".repeat(MAX_MARKDOWN_BYTES + 1)).is_err());
+        let deeply_nested_quote = format!("{}visible\n", "> ".repeat(MAX_PARSE_DEPTH + 1));
+        assert!(matches!(
+            render_markdown(&deeply_nested_quote),
+            Err(Error::InvalidInput {
+                field: "markdown",
+                ..
+            })
+        ));
 
         let fragmented = (0..=MAX_RICH_ELEMENTS)
             .map(|index| format!("**{index}**"))

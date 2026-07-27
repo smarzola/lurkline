@@ -174,6 +174,53 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
+            "id": 23,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_render_markdown",
+                "arguments": {
+                    "markdown": format!("{}visible\n", "> ".repeat(256))
+                }
+            }
+        }),
+    )
+    .await;
+    let nested = response_with_id(&mut stdout, 23).await;
+    assert_eq!(nested["result"]["isError"], true);
+    assert_eq!(
+        nested["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "invalid_input",
+                "message": "invalid markdown: nesting exceeds 64 levels"
+            }
+        })
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_render_markdown",
+                "arguments": {"markdown": "still alive"}
+            }
+        }),
+    )
+    .await;
+    let after_nested = response_with_id(&mut stdout, 24).await;
+    assert_eq!(after_nested["result"]["isError"], false);
+    assert_eq!(
+        after_nested["result"]["structuredContent"]["text"],
+        "still alive"
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
             "id": 21,
             "method": "tools/call",
             "params": {
