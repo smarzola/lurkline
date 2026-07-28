@@ -485,6 +485,33 @@ fn file_and_reaction_process_guards_fail_before_network_access() {
         assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
     }
 
+    let oversized_upload_path = std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "lurkline-upload-limit-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&oversized_upload_path, b"12345").unwrap();
+    let oversized_upload = run_with_credentials(&[
+        "files",
+        "upload",
+        "C123",
+        "--path",
+        oversized_upload_path.to_str().unwrap(),
+        "--max-bytes",
+        "4",
+        "--confirm",
+    ]);
+    std::fs::remove_file(&oversized_upload_path).unwrap();
+    assert!(!oversized_upload.status.success());
+    assert!(oversized_upload.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(oversized_upload.stderr).unwrap(),
+        "error: local file operation failed: file exceeds the configured 4-byte limit\n"
+    );
+
     let invalid_file = run_with_credentials(&["files", "info", "not-a-file"]);
     assert!(!invalid_file.status.success());
     assert!(invalid_file.stdout.is_empty());

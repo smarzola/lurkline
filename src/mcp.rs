@@ -1624,6 +1624,28 @@ mod tests {
             assert!(message.contains(code_fragment), "{message}");
             assert!(!message.contains("local file operation"), "{message}");
         }
+        std::fs::write(directory.join("oversized"), b"12345").unwrap();
+        let oversized = server
+            .upload_file(Parameters(UploadFileRequest {
+                conversation: "C123".into(),
+                path: "oversized".into(),
+                thread_ts: None,
+                title: None,
+                alt_text: None,
+                max_bytes: 4,
+                confirm: true,
+            }))
+            .await;
+        assert_eq!(
+            oversized.structured_content,
+            Some(json!({
+                "error": {
+                    "code": "local_file",
+                    "message": "local file operation failed: file exceeds the configured 4-byte limit"
+                }
+            }))
+        );
+        std::fs::remove_file(directory.join("oversized")).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
 

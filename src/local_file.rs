@@ -37,7 +37,7 @@ pub(crate) enum LocalFileError {
     DestinationExists,
     #[error("the download destination parent changed before commit")]
     ParentChanged,
-    #[error("download exceeds the configured {limit}-byte limit")]
+    #[error("file exceeds the configured {limit}-byte limit")]
     SizeLimit { limit: u64 },
     #[error("local file operation {operation} failed")]
     Io {
