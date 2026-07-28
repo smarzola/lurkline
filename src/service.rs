@@ -408,6 +408,11 @@ impl SlackService {
         user_id: &str,
     ) -> Result<bool> {
         let response = self.api.reactions_get(channel_id, message_ts).await?;
+        if response.item_type != "message" || response.channel.as_deref() != Some(channel_id) {
+            return Err(Error::InvalidResponse {
+                method: "reactions.get",
+            });
+        }
         let message = response.message.ok_or(Error::InvalidResponse {
             method: "reactions.get",
         })?;
@@ -1895,12 +1900,14 @@ fn normalize_reactions(reactions: Vec<RawReaction>, method: &'static str) -> Res
     if reactions.len() > MAX_REACTIONS_PER_MESSAGE {
         return Err(Error::InvalidResponse { method });
     }
+    let mut names = HashSet::with_capacity(reactions.len());
     reactions
         .into_iter()
         .map(|reaction| {
             let name = validate_reaction_name(&reaction.name)
                 .map_err(|_| Error::InvalidResponse { method })?;
-            if reaction.users.len() > MAX_REACTION_USERS
+            if !names.insert(name.clone())
+                || reaction.users.len() > MAX_REACTION_USERS
                 || reaction.count < reaction.users.len() as u64
                 || reaction
                     .users
@@ -2536,6 +2543,9 @@ mod tests {
         reaction_error: Option<&'static str>,
         reaction_apply_before_error: bool,
         reaction_get_error_after: Option<usize>,
+        reaction_wrong_channel_after: Option<usize>,
+        reaction_wrong_type_after: Option<usize>,
+        reaction_duplicate_after: Option<usize>,
         reaction_get_count: Arc<Mutex<usize>>,
         reaction_calls: Arc<Mutex<Vec<String>>>,
         download_bytes: Vec<u8>,
@@ -2708,7 +2718,7 @@ mod tests {
 
         async fn reactions_get(
             &self,
-            _channel: &str,
+            channel: &str,
             message_ts: &str,
         ) -> Result<RawReactionItemResponse> {
             self.reaction_calls.lock().unwrap().push("get".into());
@@ -2724,17 +2734,41 @@ mod tests {
             }
             let present = *self.reaction_present.lock().unwrap();
             let name = self.reaction_name.lock().unwrap().clone();
+            let is_after = |threshold: Option<usize>| {
+                threshold.is_some_and(|successful_reads| *get_count > successful_reads)
+            };
+            let mut reactions = present
+                .then(|| RawReaction {
+                    name: name.clone(),
+                    count: 1,
+                    users: vec!["U123".into()],
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            if is_after(self.reaction_duplicate_after) {
+                reactions.push(RawReaction {
+                    name,
+                    count: 1,
+                    users: vec![],
+                });
+            }
             Ok(RawReactionItemResponse {
+                item_type: if is_after(self.reaction_wrong_type_after) {
+                    "file".into()
+                } else {
+                    "message".into()
+                },
+                channel: Some(
+                    if is_after(self.reaction_wrong_channel_after) {
+                        "COTHER"
+                    } else {
+                        channel
+                    }
+                    .into(),
+                ),
                 message: Some(RawMessage {
                     ts: message_ts.into(),
-                    reactions: present
-                        .then(|| RawReaction {
-                            name,
-                            count: 1,
-                            users: vec!["U123".into()],
-                        })
-                        .into_iter()
-                        .collect(),
+                    reactions,
                     ..RawMessage::default()
                 }),
             })
@@ -3015,6 +3049,9 @@ mod tests {
             reaction_error: None,
             reaction_apply_before_error: false,
             reaction_get_error_after: None,
+            reaction_wrong_channel_after: None,
+            reaction_wrong_type_after: None,
+            reaction_duplicate_after: None,
             reaction_get_count: Arc::new(Mutex::new(0)),
             reaction_calls: Arc::new(Mutex::new(Vec::new())),
             download_bytes: b"safe".to_vec(),
@@ -5363,7 +5400,12 @@ mod tests {
             assert!(reconciled.reconciled);
         }
 
-        for ambiguous_error in ["timeout", "fatal_error", "internal_error"] {
+        for ambiguous_error in [
+            "timeout",
+            "invalid_response",
+            "fatal_error",
+            "internal_error",
+        ] {
             let mut not_applied = fake_api();
             not_applied.reaction_error = Some(ambiguous_error);
             assert!(matches!(
@@ -5385,6 +5427,53 @@ mod tests {
             unreadable.reaction_get_error_after = Some(1);
             assert!(matches!(
                 service(unreadable)
+                    .add_reaction("C123", "100.000001", "eyes", true)
+                    .await,
+                Err(Error::ReactionUncertain {
+                    channel_id,
+                    message_ts,
+                    name
+                }) if channel_id == "C123"
+                    && message_ts == "100.000001"
+                && name == "eyes"
+            ));
+        }
+
+        for malformed_kind in 0..3 {
+            let mut malformed = fake_api();
+            match malformed_kind {
+                0 => malformed.reaction_wrong_channel_after = Some(0),
+                1 => malformed.reaction_wrong_type_after = Some(0),
+                2 => {
+                    *malformed.reaction_present.lock().unwrap() = true;
+                    malformed.reaction_duplicate_after = Some(0);
+                }
+                _ => unreachable!(),
+            }
+            let calls = malformed.reaction_calls.clone();
+            assert!(matches!(
+                service(malformed)
+                    .add_reaction("C123", "100.000001", "eyes", true)
+                    .await,
+                Err(Error::InvalidResponse {
+                    method: "reactions.get"
+                })
+            ));
+            assert_eq!(&*calls.lock().unwrap(), &["get"]);
+        }
+
+        for malformed_kind in 0..3 {
+            let mut malformed = fake_api();
+            malformed.reaction_error = Some("timeout");
+            malformed.reaction_apply_before_error = true;
+            match malformed_kind {
+                0 => malformed.reaction_wrong_channel_after = Some(1),
+                1 => malformed.reaction_wrong_type_after = Some(1),
+                2 => malformed.reaction_duplicate_after = Some(1),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                service(malformed)
                     .add_reaction("C123", "100.000001", "eyes", true)
                     .await,
                 Err(Error::ReactionUncertain {

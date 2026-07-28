@@ -677,35 +677,35 @@ fn browser_headers(config: &Config) -> Result<HeaderMap> {
 }
 
 fn validate_envelope(method: &'static str, value: &Value) -> Result<()> {
-    if value.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(());
+    match value.get("ok").and_then(Value::as_bool) {
+        Some(true) => return Ok(()),
+        Some(false) => {}
+        None => return Err(Error::InvalidResponse { method }),
     }
     let code = value
         .get("error")
         .and_then(Value::as_str)
-        .unwrap_or("unknown_error");
+        .and_then(sanitize_error_code)
+        .ok_or(Error::InvalidResponse { method })?;
     if matches!(
-        code,
+        code.as_str(),
         "invalid_auth" | "not_authed" | "account_inactive" | "token_revoked"
     ) {
         return Err(Error::Authentication);
     }
-    Err(Error::SlackApi {
-        method,
-        code: sanitize_error_code(code),
-    })
+    Err(Error::SlackApi { method, code })
 }
 
-fn sanitize_error_code(code: &str) -> String {
+fn sanitize_error_code(code: &str) -> Option<String> {
     if !code.is_empty()
         && code.len() <= 80
         && code
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
     {
-        return code.to_owned();
+        return Some(code.to_owned());
     }
-    "unknown_error".into()
+    None
 }
 
 #[cfg(test)]
@@ -1032,7 +1032,8 @@ mod tests {
             ),
             (
                 "reaction",
-                br#"{"ok":true,"message":{"ts":"100.000001"}}"#.as_slice(),
+                br#"{"ok":true,"type":"message","channel":"C123","message":{"ts":"100.000001"}}"#
+                    .as_slice(),
                 "/api/reactions.get",
                 vec!["C123", "100.000001", "full", "true"],
             ),
@@ -1139,6 +1140,27 @@ mod tests {
                 method: "reactions.add"
             })
         ));
+
+        for body in [
+            br#"{"ok":false}"#.as_slice(),
+            br#"{"ok":false,"error":null}"#.as_slice(),
+            br#"{"ok":false,"error":42}"#.as_slice(),
+            br#"{"ok":false,"error":""}"#.as_slice(),
+            br#"{"ok":false,"error":"bad-error"}"#.as_slice(),
+            br#"{"error":"already_reacted"}"#.as_slice(),
+            br#"{"ok":null,"error":"no_reaction"}"#.as_slice(),
+            br#"{"ok":"false","error":"already_reacted"}"#.as_slice(),
+            br#"{"ok":0,"error":"no_reaction"}"#.as_slice(),
+            br#"{"ok":{},"error":"already_reacted"}"#.as_slice(),
+        ] {
+            let (client, _) = server(StatusCode::OK, body.to_vec(), 64 * 1024).await;
+            assert!(matches!(
+                client.reactions_add("C123", "100.000001", "eyes").await,
+                Err(Error::InvalidResponse {
+                    method: "reactions.add"
+                })
+            ));
+        }
 
         for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
             let (client, _) = server(status, Vec::new(), 64 * 1024).await;
@@ -1494,12 +1516,18 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_server_supplied_error_codes() {
+    fn rejects_unsafe_server_supplied_error_codes_without_disclosure() {
         let value = serde_json::json!({
             "ok": false,
             "error": "bad\nSLACK_TOKEN=xoxc-secret"
         });
         let error = validate_envelope("client.counts", &value).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::InvalidResponse {
+                method: "client.counts"
+            }
+        ));
         let rendered = error.to_string();
         assert!(!rendered.contains("xoxc-secret"));
         assert!(!rendered.contains("SLACK_TOKEN="));

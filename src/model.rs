@@ -177,6 +177,10 @@ pub(crate) struct RawAuthTestResponse {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawReactionItemResponse {
+    #[serde(default, rename = "type")]
+    pub item_type: String,
+    #[serde(default)]
+    pub channel: Option<String>,
     #[serde(default)]
     pub message: Option<RawMessage>,
 }
