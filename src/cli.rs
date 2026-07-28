@@ -176,7 +176,7 @@ pub enum FilesCommand {
         /// Optional Slack title: 1 to 255 UTF-8 bytes without control characters.
         #[arg(long)]
         title: Option<String>,
-        /// Optional Slack alt text: 1 to 1,000 UTF-8 bytes without control characters.
+        /// Optional image alt text: 1 to 1,000 UTF-8 bytes without control characters.
         #[arg(long)]
         alt_text: Option<String>,
         /// Maximum source bytes to read, up to 1 GiB.
@@ -1869,6 +1869,7 @@ mod tests {
             id: "F123".into(),
             name: Some("report\tfinal.pdf".into()),
             title: Some("Report".into()),
+            alt_text: None,
             mimetype: Some("application/pdf".into()),
             filetype: Some("pdf".into()),
             pretty_type: Some("PDF".into()),

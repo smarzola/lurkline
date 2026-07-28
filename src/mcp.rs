@@ -95,7 +95,7 @@ struct UploadFileRequest {
     thread_ts: Option<String>,
     /// Optional Slack title: 1 to 255 UTF-8 bytes without control characters.
     title: Option<String>,
-    /// Optional Slack alt text: 1 to 1,000 UTF-8 bytes without control characters.
+    /// Optional image alt text: 1 to 1,000 UTF-8 bytes without control characters.
     alt_text: Option<String>,
     /// Maximum source bytes to read, up to 1 GiB.
     #[serde(default = "default_file_upload_bytes")]

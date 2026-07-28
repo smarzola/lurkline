@@ -457,9 +457,9 @@ Upload one regular file to a conversation root:
 
 ```sh
 lurkline files upload platform \
-  --path ./reports/release.txt \
-  --title 'Release report' \
-  --alt-text 'Plain-text release verification report' \
+  --path ./diagrams/release.png \
+  --title 'Release architecture' \
+  --alt-text 'Components and data flow for the release' \
   --confirm \
   --json
 ```
@@ -482,20 +482,25 @@ still match.
 
 The source basename must be valid UTF-8, contain at least one non-whitespace
 character, contain no control characters, and be at most 255 bytes. Optional
-`--title` values use the same 1-to-255-byte text rules. Optional `--alt-text`
-values can contain 1 to 1,000 UTF-8 bytes and use the same non-whitespace and
-non-control rules. Lurkline validates the conversation, thread timestamp,
-basename, title, and alt text before it opens or hashes the source.
+`--title` values use the same 1-to-255-byte text rules. Optional image
+`--alt-text` values can contain 1 to 1,000 UTF-8 bytes and use the same
+non-whitespace and non-control rules. Lurkline validates the conversation,
+thread timestamp, basename, title, and alt text before it opens or hashes the
+source. Slack applies alt text only to supported image files. If you supply alt
+text for another file type, Slack can retain the file privately and Lurkline
+returns `completion_uncertain` instead of claiming that it shared the file.
 For a thread upload, it also reads the exact timestamp and requires an existing
 root message before Slack allocates upload storage.
 
-The Slack lifecycle has three mutations—allocation, transfer, and
+The Slack browser lifecycle has three mutations—allocation, transfer, and
 completion—followed by exact verification:
 
-1. Allocate a non-secret Slack file ID and a signed upload URL.
+1. Call `files.getUploadURL` to allocate a non-secret file ID and a signed
+   upload URL.
 2. Stream the exact bytes to the URL with a separate credential-free client.
-3. Complete the upload for the requested root or thread.
-4. Read `files.info` to prove membership in the requested conversation.
+3. Call `files.completeUpload` for the requested root or thread.
+4. Read `files.info` to prove the requested alternative text, when present,
+   and membership in the requested conversation.
 5. For a direct message, read bounded conversation history or thread replies
    to prove that the unique file ID has the requested root or thread route.
 
@@ -503,9 +508,11 @@ For a channel, the exact `files.info` share entry proves both the conversation
 and root or thread timestamp. For a direct message, Slack reports membership
 through `im_ids` without a message timestamp. Lurkline therefore requires both
 the exact DM ID in `im_ids` and one exact file-ID match in the requested
-history or thread. It scans at most 10 pages of 200 messages. Missing,
-ambiguous, malformed, or still-truncated evidence returns
-`completion_uncertain`.
+history or thread. Slack can expose processed file metadata after it
+acknowledges completion, so Lurkline makes up to six exact verification reads
+with 3.85 seconds of bounded delay. Each direct-message read scans at most 10
+pages of 200 messages. Missing, ambiguous, malformed, or still-truncated
+evidence returns `completion_uncertain`.
 
 Lurkline never prints or returns the signed URL. The byte request contains no
 browser token, cookie, workspace origin, or referrer and doesn't follow

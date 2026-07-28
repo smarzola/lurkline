@@ -107,6 +107,8 @@ pub(crate) struct RawFile {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
+    pub alt_txt: Option<String>,
+    #[serde(default)]
     pub mimetype: Option<String>,
     #[serde(default)]
     pub filetype: Option<String>,
@@ -176,6 +178,7 @@ pub(crate) struct RawFileResponse {
 #[derive(Clone, Deserialize)]
 pub(crate) struct RawFileUploadAllocation {
     pub upload_url: String,
+    #[serde(rename = "file")]
     pub file_id: String,
 }
 
@@ -645,6 +648,8 @@ pub struct FileReference {
     pub id: String,
     pub name: Option<String>,
     pub title: Option<String>,
+    /// Slack-provided alternative text. `None` means Slack omitted the field.
+    pub alt_text: Option<String>,
     pub mimetype: Option<String>,
     pub filetype: Option<String>,
     pub pretty_type: Option<String>,
