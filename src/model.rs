@@ -364,6 +364,18 @@ pub(crate) struct RawDraft {
     pub is_deleted: bool,
     #[serde(default)]
     pub is_sent: bool,
+    #[serde(default)]
+    pub date_created: Option<u64>,
+    #[serde(default)]
+    pub date_scheduled: Option<u64>,
+    #[serde(default)]
+    pub last_updated_client: Option<String>,
+    #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -556,6 +568,15 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDraftAssociation {
+    /// The response identified one file but didn't perform a complete ownership proof.
+    Unverified,
+    /// Complete Slack state proved exclusive private-file ownership.
+    Verified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Draft {
     pub id: String,
     pub client_msg_id: Option<String>,
@@ -569,8 +590,32 @@ pub struct Draft {
     pub file_ids: Vec<String>,
     pub attachments: Vec<Value>,
     pub is_from_composer: bool,
+    /// Ownership-proof state for a one-file draft. Absent for text-only drafts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_association: Option<FileDraftAssociation>,
     /// Whether Lurkline can safely update, delete, or publish this draft.
     pub is_supported: bool,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) has_unknown_fields: bool,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) file_shape_supported: bool,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) date_created: Option<u64>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) date_scheduled: Option<u64>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) last_updated_client: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) team_id: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -585,6 +630,13 @@ pub struct DraftPage {
 pub struct DraftDeleteReport {
     pub id: String,
     pub deleted: bool,
+    /// File deleted with the draft. Absent for text-only drafts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    /// Whether Slack proved the draft-owned file was deleted. Absent for
+    /// text-only drafts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_deleted: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -596,7 +648,7 @@ pub struct SentMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct DraftCleanupWarning {
-    /// Draft that remains after the message was acknowledged by Slack.
+    /// Draft whose post-publication deletion wasn't confirmed.
     pub draft_id: String,
     /// Server revision observed immediately before publication.
     pub last_updated_ts: String,
@@ -608,8 +660,9 @@ pub struct DraftCleanupWarning {
 pub struct DraftSendReport {
     pub sent: SentMessage,
     pub draft_id: String,
+    /// True only when Slack acknowledged deletion or a bounded reread proved absence.
     pub draft_deleted: bool,
-    /// Present only when Slack acknowledged the message but draft deletion failed.
+    /// Present when Slack acknowledged the message but draft deletion wasn't confirmed.
     pub cleanup_warning: Option<DraftCleanupWarning>,
 }
 
@@ -767,6 +820,34 @@ pub enum FileUploadReport {
     Shared {
         file: Box<FileReference>,
         share: FileShare,
+        reconciled: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum FileDraftCreateReport {
+    /// Slack may have allocated an upload, but returned no safe recovery key.
+    AllocationUncertain,
+    /// Slack allocated a file ID, but no file bytes were sent.
+    Allocated { file_id: String },
+    /// Slack allocated a file ID, but the local source changed.
+    SourceChanged { file_id: String },
+    /// Slack byte acceptance cannot be proven.
+    TransferUncertain { file_id: String },
+    /// Slack received the bytes, but private completion cannot be proven.
+    FileCompletionUncertain { file_id: String },
+    /// Slack definitively rejected draft creation after the private file was ready.
+    DraftNotCreated { file_id: String, reason: String },
+    /// Draft creation may have succeeded; do not retry automatically.
+    DraftCreationUncertain {
+        file_id: String,
+        client_msg_id: String,
+    },
+    /// Exact cross-process Slack state proves one draft exclusively owns the file.
+    Created {
+        draft: Box<Draft>,
+        file: Box<FileReference>,
         reconciled: bool,
     },
 }

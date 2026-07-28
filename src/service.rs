@@ -17,16 +17,17 @@ use crate::{
         ClientCountsPayload, Conversation, ConversationKind, ConversationPage,
         ConversationSearchReport, ConversationSearchTruncationReason, CustomEmoji, CustomEmojiKind,
         CustomEmojiList, DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport,
-        DraftDestination, DraftPage, DraftSendReport, FileDownloadReport, FileReference, FileShare,
-        FileShareVisibility, FileUploadReport, InboxConversation, InboxReport, Message,
-        MessagePage, MessageSearchMatch, MessageSearchPage, RawAuthTestResponse, RawConversation,
-        RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision, RawDraftsPage,
-        RawEmojiResponse, RawFile, RawFileResponse, RawFileUploadAllocation,
-        RawFileUploadCompletion, RawMessage, RawMessagePage, RawMessageSearchMatch,
-        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
-        RawReaction, RawReactionItemResponse, RawUnread, RawUser, RawUsersPage, Reaction,
-        ReactionMutationReport, SentMessage, ThreadPage, UnreadConversation, UnreadReport,
-        UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
+        DraftDestination, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
+        FileDraftCreateReport, FileReference, FileShare, FileShareVisibility, FileUploadReport,
+        InboxConversation, InboxReport, Message, MessagePage, MessageSearchMatch,
+        MessageSearchPage, RawAuthTestResponse, RawConversation, RawConversationsPage, RawDraft,
+        RawDraftResponse, RawDraftRevision, RawDraftsPage, RawEmojiResponse, RawFile,
+        RawFileResponse, RawFileUploadAllocation, RawFileUploadCompletion, RawMessage,
+        RawMessagePage, RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList,
+        RawMutationResponse, RawPostMessageResponse, RawReaction, RawReactionItemResponse,
+        RawUnread, RawUser, RawUsersPage, Reaction, ReactionMutationReport, SentMessage,
+        ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
+        UserSearchTruncationReason,
     },
 };
 
@@ -48,6 +49,8 @@ const MAX_FILE_UPLOAD_NAME_BYTES: usize = 255;
 const MAX_FILE_UPLOAD_TITLE_BYTES: usize = 255;
 const MAX_FILE_UPLOAD_ALT_TEXT_BYTES: usize = 1_000;
 const UPLOAD_RECONCILIATION_DELAYS_MS: &[u64] = &[0, 100, 250, 500, 1_000, 2_000];
+const DRAFT_RECONCILIATION_DELAYS_MS: &[u64] = &[0, 250, 500, 1_000, 2_000, 4_000];
+const MAX_DRAFT_OWNERSHIP_SCAN_PAGES: usize = 10;
 const MAX_DRAFT_DESTINATION_USERS: usize = 100;
 const MAX_ATTACHMENTS_PER_MESSAGE: usize = 100;
 const MAX_FILES_PER_MESSAGE: usize = 100;
@@ -57,6 +60,35 @@ const MAX_FILE_SHARE_SCAN_PAGES: usize = 10;
 const MAX_REACTIONS_PER_MESSAGE: usize = 100;
 const MAX_REACTION_USERS: usize = 1_000;
 const MAX_CUSTOM_EMOJI: usize = 10_000;
+
+pub(crate) struct FileDraftCreateRequest<'a> {
+    pub(crate) conversation: &'a str,
+    pub(crate) thread_ts: Option<&'a str>,
+    pub(crate) broadcast: bool,
+    pub(crate) markdown: &'a str,
+    pub(crate) title: Option<&'a str>,
+    pub(crate) alt_text: Option<&'a str>,
+    pub(crate) confirmed: bool,
+}
+
+pub(crate) struct ChatPostMessageRequest<'a> {
+    pub(crate) channel: &'a str,
+    pub(crate) thread_ts: Option<&'a str>,
+    pub(crate) broadcast: bool,
+    pub(crate) client_msg_id: &'a str,
+    pub(crate) text: &'a str,
+    pub(crate) blocks: &'a [serde_json::Value],
+}
+
+pub(crate) struct FileShareRequest<'a> {
+    pub(crate) channel: &'a str,
+    pub(crate) thread_ts: Option<&'a str>,
+    pub(crate) broadcast: bool,
+    pub(crate) client_msg_id: &'a str,
+    pub(crate) draft_id: &'a str,
+    pub(crate) blocks: &'a [serde_json::Value],
+    pub(crate) file_id: &'a str,
+}
 
 #[async_trait]
 pub(crate) trait SlackApi: Send + Sync {
@@ -179,6 +211,16 @@ pub(crate) trait SlackApi: Send + Sync {
             method: "files.completeUpload",
         })
     }
+    async fn files_complete_draft_upload(
+        &self,
+        file_id: &str,
+        title: Option<&str>,
+    ) -> Result<RawFileUploadCompletion> {
+        let _ = (file_id, title);
+        Err(Error::InvalidResponse {
+            method: "files.completeUpload",
+        })
+    }
     async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
         let _ = (next_ts, limit);
         Err(Error::InvalidResponse {
@@ -196,8 +238,9 @@ pub(crate) trait SlackApi: Send + Sync {
         client_msg_id: &str,
         destinations: &[DraftDestination],
         blocks: &[serde_json::Value],
+        file_ids: &[String],
     ) -> Result<RawDraftResponse> {
-        let _ = (client_msg_id, destinations, blocks);
+        let _ = (client_msg_id, destinations, blocks, file_ids);
         Err(Error::InvalidResponse {
             method: "drafts.create",
         })
@@ -208,8 +251,9 @@ pub(crate) trait SlackApi: Send + Sync {
         last_updated_ts: &str,
         destinations: &[DraftDestination],
         blocks: &[serde_json::Value],
+        file_ids: &[String],
     ) -> Result<RawDraftResponse> {
-        let _ = (draft_id, last_updated_ts, destinations, blocks);
+        let _ = (draft_id, last_updated_ts, destinations, blocks, file_ids);
         Err(Error::InvalidResponse {
             method: "drafts.update",
         })
@@ -218,24 +262,41 @@ pub(crate) trait SlackApi: Send + Sync {
         &self,
         draft_id: &str,
         last_updated_ts: &str,
+        skip_file_deletion: bool,
     ) -> Result<RawMutationResponse> {
-        let _ = (draft_id, last_updated_ts);
+        let _ = (draft_id, last_updated_ts, skip_file_deletion);
         Err(Error::InvalidResponse {
             method: "drafts.delete",
         })
     }
     async fn chat_post_message(
         &self,
-        channel: &str,
-        thread_ts: Option<&str>,
-        broadcast: bool,
-        client_msg_id: &str,
-        text: &str,
-        blocks: &[serde_json::Value],
+        request: &ChatPostMessageRequest<'_>,
     ) -> Result<RawPostMessageResponse> {
-        let _ = (channel, thread_ts, broadcast, client_msg_id, text, blocks);
+        let _ = (
+            request.channel,
+            request.thread_ts,
+            request.broadcast,
+            request.client_msg_id,
+            request.text,
+            request.blocks,
+        );
         Err(Error::InvalidResponse {
             method: "chat.postMessage",
+        })
+    }
+    async fn files_share(&self, request: &FileShareRequest<'_>) -> Result<RawMutationResponse> {
+        let _ = (
+            request.channel,
+            request.thread_ts,
+            request.broadcast,
+            request.client_msg_id,
+            request.draft_id,
+            request.blocks,
+            request.file_id,
+        );
+        Err(Error::InvalidResponse {
+            method: "files.share",
         })
     }
 }
@@ -247,6 +308,12 @@ pub(crate) struct SlackService {
     workspace_url: String,
     now_millis: fn() -> Result<String>,
     upload_reconciliation_delays_ms: &'static [u64],
+    draft_reconciliation_delays_ms: &'static [u64],
+}
+
+struct VerifiedFileDraft {
+    draft: Draft,
+    file: FileReference,
 }
 
 struct UserDirectory {
@@ -262,6 +329,7 @@ impl SlackService {
             workspace_url: config.base_url.origin().ascii_serialization(),
             now_millis: system_unix_milliseconds,
             upload_reconciliation_delays_ms: UPLOAD_RECONCILIATION_DELAYS_MS,
+            draft_reconciliation_delays_ms: DRAFT_RECONCILIATION_DELAYS_MS,
         }
     }
 
@@ -544,6 +612,165 @@ impl SlackService {
         None
     }
 
+    async fn complete_active_draft_snapshot(&self) -> Result<Vec<Draft>> {
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_draft_ids = HashSet::new();
+        let mut drafts = Vec::new();
+
+        for page_index in 0..MAX_DRAFT_OWNERSHIP_SCAN_PAGES {
+            let raw = self.api.drafts_list(cursor.as_deref(), MAX_DRAFTS).await?;
+            if raw.drafts.len() > MAX_DRAFTS || raw.files.len() > 1_000 {
+                return Err(Error::InvalidResponse {
+                    method: "drafts.list",
+                });
+            }
+            let page = raw
+                .drafts
+                .into_iter()
+                .map(|draft| normalize_draft(draft, "drafts.list"))
+                .collect::<Result<Vec<_>>>()?;
+            if page
+                .iter()
+                .any(|draft| !seen_draft_ids.insert(draft.id.clone()))
+            {
+                return Err(Error::InvalidResponse {
+                    method: "drafts.list",
+                });
+            }
+            let next_cursor = raw
+                .has_more
+                .then(|| {
+                    page.last()
+                        .map(|draft| draft.last_updated_ts.clone())
+                        .ok_or(Error::InvalidResponse {
+                            method: "drafts.list",
+                        })
+                })
+                .transpose()?;
+            drafts.extend(page);
+            let Some(next_cursor) = next_cursor else {
+                return Ok(drafts);
+            };
+            if page_index + 1 == MAX_DRAFT_OWNERSHIP_SCAN_PAGES {
+                return Err(Error::ScanLimit {
+                    resource: "complete active Slack draft ownership",
+                    limit: MAX_DRAFT_OWNERSHIP_SCAN_PAGES * MAX_DRAFTS,
+                });
+            }
+            if cursor.as_deref() == Some(next_cursor.as_str())
+                || !seen_cursors.insert(next_cursor.clone())
+            {
+                return Err(Error::InvalidResponse {
+                    method: "drafts.list",
+                });
+            }
+            cursor = Some(next_cursor);
+        }
+        Err(Error::ScanLimit {
+            resource: "complete active Slack draft ownership",
+            limit: MAX_DRAFT_OWNERSHIP_SCAN_PAGES * MAX_DRAFTS,
+        })
+    }
+
+    async fn prove_exclusive_file_draft(
+        &self,
+        file_id: &str,
+        client_msg_id: &str,
+        expected: Option<&Draft>,
+        expected_destination: Option<&DraftDestination>,
+        required_blocks: Option<&[serde_json::Value]>,
+    ) -> Result<VerifiedFileDraft> {
+        validate_file_id(file_id)?;
+        let drafts = self.complete_active_draft_snapshot().await?;
+        let occurrences = drafts
+            .iter()
+            .flat_map(|draft| draft.file_ids.iter())
+            .filter(|candidate| candidate.as_str() == file_id)
+            .count();
+        if occurrences != 1 {
+            return Err(Error::invalid_input(
+                "draft",
+                "does not exclusively own its Slack file",
+            ));
+        }
+        let snapshot = drafts
+            .into_iter()
+            .find(|draft| {
+                draft.client_msg_id.as_deref() == Some(client_msg_id)
+                    && draft.file_ids.len() == 1
+                    && draft.file_ids[0] == file_id
+            })
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "draft",
+                    "does not have a complete exclusive private-file association",
+                )
+            })?;
+        if !snapshot.file_shape_supported
+            || snapshot.team_id.as_deref() != Some(self.team_id.as_str())
+            || expected_destination.is_some_and(|destination| {
+                snapshot.destinations.len() != 1
+                    || !same_draft_route(&snapshot.destinations[0], destination)
+            })
+            || expected.is_some_and(|expected| !same_draft_snapshot(&snapshot, expected))
+            || required_blocks.is_some_and(|blocks| {
+                !snapshot
+                    .blocks
+                    .as_deref()
+                    .is_some_and(|actual| same_rendered_draft_blocks(actual, blocks))
+            })
+        {
+            return Err(Error::invalid_input(
+                "draft",
+                "changed route, revision, content, or file association",
+            ));
+        }
+
+        let info = normalize_draft(
+            self.api.drafts_info(&snapshot.id).await?.draft,
+            "drafts.info",
+        )?;
+        if !same_draft_snapshot(&info, &snapshot) || !info.file_shape_supported {
+            return Err(Error::invalid_input(
+                "draft",
+                "does not match its complete active-draft snapshot",
+            ));
+        }
+        let raw_file = self.api.files_info(file_id).await?;
+        if raw_file.file.id != file_id {
+            return Err(Error::InvalidResponse {
+                method: "files.info",
+            });
+        }
+        let file = normalize_file(raw_file.file, "files.info")?;
+        if !is_private_unshared_file(&file) {
+            return Err(Error::invalid_input(
+                "draft",
+                "file is shared, public, or has incomplete ownership state",
+            ));
+        }
+        let mut draft = info;
+        draft.file_association = Some(FileDraftAssociation::Verified);
+        draft.is_supported = true;
+        Ok(VerifiedFileDraft { draft, file })
+    }
+
+    async fn reconcile_draft_absence(&self, draft_id: &str) -> bool {
+        for delay_ms in self.draft_reconciliation_delays_ms {
+            if *delay_ms != 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            let Ok(drafts) = self.complete_active_draft_snapshot().await else {
+                continue;
+            };
+            if drafts.iter().all(|draft| draft.id != draft_id) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn validate_upload_request(
         conversation: &str,
         thread_ts: Option<&str>,
@@ -563,6 +790,18 @@ impl SlackService {
             validate_timestamp("thread_ts", thread_ts)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_file_draft_request(
+        conversation: &str,
+        thread_ts: Option<&str>,
+        broadcast: bool,
+        title: Option<&str>,
+        alt_text: Option<&str>,
+        file_name: &str,
+    ) -> Result<()> {
+        validate_draft_destination(thread_ts, broadcast)?;
+        Self::validate_upload_request(conversation, thread_ts, title, alt_text, file_name)
     }
 
     pub(crate) async fn add_reaction(
@@ -755,6 +994,24 @@ impl SlackService {
                 method: "drafts.info",
             });
         }
+        if draft.file_shape_supported
+            && let (Some(client_msg_id), Some(file_id), Some(destination)) = (
+                draft.client_msg_id.as_deref(),
+                draft.file_ids.first(),
+                draft.destinations.first(),
+            )
+            && let Ok(proof) = self
+                .prove_exclusive_file_draft(
+                    file_id,
+                    client_msg_id,
+                    Some(&draft),
+                    Some(destination),
+                    None,
+                )
+                .await
+        {
+            return Ok(proof.draft);
+        }
         Ok(draft)
     }
 
@@ -780,6 +1037,7 @@ impl SlackService {
                 &Uuid::new_v4().to_string(),
                 std::slice::from_ref(&destination),
                 &rendered.blocks,
+                &[],
             )
             .await?;
         let draft = normalize_draft(response.draft, "drafts.create")?;
@@ -793,32 +1051,245 @@ impl SlackService {
         Ok(draft)
     }
 
+    pub(crate) async fn create_file_draft(
+        &self,
+        request: FileDraftCreateRequest<'_>,
+        mut source: UploadSource,
+    ) -> Result<FileDraftCreateReport> {
+        let FileDraftCreateRequest {
+            conversation,
+            thread_ts,
+            broadcast,
+            markdown,
+            title,
+            alt_text,
+            confirmed,
+        } = request;
+        require_confirmation("file draft creation", confirmed)?;
+        let rendered = render_markdown(markdown)?;
+        Self::validate_file_draft_request(
+            conversation,
+            thread_ts,
+            broadcast,
+            title,
+            alt_text,
+            source.file_name(),
+        )?;
+        let expected_file_name = source.file_name().to_owned();
+        let expected_file_size = source.size();
+        if source.size() > MAX_FILE_UPLOAD_BYTES {
+            return Err(Error::invalid_input(
+                "max_bytes",
+                "Slack file is larger than the 1 GiB hard limit",
+            ));
+        }
+        let channel_id = self.resolve_conversation_id(conversation).await?;
+        if let Some(thread_ts) = thread_ts {
+            let root = self.get_message_by_id(&channel_id, thread_ts).await?;
+            if !is_exact_file_route(&root.ts, root.thread_ts.as_deref(), None) {
+                return Err(Error::invalid_input(
+                    "thread_ts",
+                    "must identify a root message in the target conversation",
+                ));
+            }
+        }
+        let destination = DraftDestination {
+            channel_id: Some(channel_id),
+            thread_ts: thread_ts.map(str::to_owned),
+            broadcast,
+            ..DraftDestination::default()
+        };
+
+        let raw_allocation = match self
+            .api
+            .files_get_upload_url(source.file_name(), source.size(), alt_text)
+            .await
+        {
+            Ok(allocation) => allocation,
+            Err(error) if upload_allocation_error_is_ambiguous(&error) => {
+                return Ok(FileDraftCreateReport::AllocationUncertain);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(file_id) = raw_allocation
+            .file_id
+            .filter(|file_id| is_valid_file_id(file_id))
+        else {
+            return Ok(FileDraftCreateReport::AllocationUncertain);
+        };
+        let Some(raw_upload_url) = raw_allocation.upload_url else {
+            return Ok(FileDraftCreateReport::Allocated { file_id });
+        };
+        let upload_url = Zeroizing::new(raw_upload_url);
+        if !is_safe_upload_url(&upload_url) {
+            return Ok(FileDraftCreateReport::Allocated { file_id });
+        }
+        if !matches!(source.is_stable(), Ok(true)) {
+            return Ok(FileDraftCreateReport::SourceChanged { file_id });
+        }
+
+        let upload_pass = match self.api.upload_edge_file(&upload_url, &mut source).await {
+            Ok(pass) => pass,
+            Err(_) => return Ok(FileDraftCreateReport::TransferUncertain { file_id }),
+        };
+        if !matches!(source.upload_pass_matches(&upload_pass), Ok(true)) {
+            return Ok(FileDraftCreateReport::SourceChanged { file_id });
+        }
+
+        let completion = self.api.files_complete_draft_upload(&file_id, title).await;
+        if !completion
+            .as_ref()
+            .is_ok_and(|completion| completion_has_exact_file(completion, &file_id))
+        {
+            return Ok(FileDraftCreateReport::FileCompletionUncertain { file_id });
+        }
+        let mut private_file_ready = false;
+        for delay_ms in self.upload_reconciliation_delays_ms {
+            if *delay_ms != 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            let Ok(raw) = self.api.files_info(&file_id).await else {
+                continue;
+            };
+            if raw.file.id != file_id {
+                continue;
+            }
+            let Ok(file) = normalize_file(raw.file, "files.info") else {
+                continue;
+            };
+            if is_expected_private_draft_file(
+                &file,
+                &file_id,
+                &expected_file_name,
+                expected_file_size,
+                alt_text,
+            ) {
+                private_file_ready = true;
+                break;
+            }
+        }
+        if !private_file_ready {
+            return Ok(FileDraftCreateReport::FileCompletionUncertain { file_id });
+        }
+
+        let client_msg_id = Uuid::new_v4().to_string();
+        let file_ids = vec![file_id.clone()];
+        let response = self
+            .api
+            .drafts_create(
+                &client_msg_id,
+                std::slice::from_ref(&destination),
+                &rendered.blocks,
+                &file_ids,
+            )
+            .await;
+        let acknowledged = match response {
+            Ok(response) => normalize_draft(response.draft, "drafts.create")
+                .ok()
+                .filter(|draft| {
+                    draft.client_msg_id.as_deref() == Some(client_msg_id.as_str())
+                        && draft.file_ids == file_ids
+                        && draft.destinations.len() == 1
+                        && same_draft_route(&draft.destinations[0], &destination)
+                        && draft.blocks.as_deref().is_some_and(|actual| {
+                            same_rendered_draft_blocks(actual, &rendered.blocks)
+                        })
+                }),
+            Err(error) if draft_mutation_error_is_ambiguous(&error) => None,
+            Err(error) => {
+                return Ok(FileDraftCreateReport::DraftNotCreated {
+                    file_id,
+                    reason: error.to_string(),
+                });
+            }
+        };
+        for delay_ms in self.draft_reconciliation_delays_ms {
+            if *delay_ms != 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            let proof = self
+                .prove_exclusive_file_draft(
+                    &file_id,
+                    &client_msg_id,
+                    None,
+                    Some(&destination),
+                    Some(&rendered.blocks),
+                )
+                .await;
+            if let Ok(proof) = proof {
+                if !is_expected_private_draft_file(
+                    &proof.file,
+                    &file_id,
+                    &expected_file_name,
+                    expected_file_size,
+                    alt_text,
+                ) {
+                    continue;
+                }
+                let reconciled = acknowledged
+                    .as_ref()
+                    .is_none_or(|acknowledged| !same_draft_snapshot(&proof.draft, acknowledged));
+                return Ok(FileDraftCreateReport::Created {
+                    draft: Box::new(proof.draft),
+                    file: Box::new(proof.file),
+                    reconciled,
+                });
+            }
+        }
+        Ok(FileDraftCreateReport::DraftCreationUncertain {
+            file_id,
+            client_msg_id,
+        })
+    }
+
     pub(crate) async fn update_draft(&self, draft_id: &str, markdown: &str) -> Result<Draft> {
         validate_draft_id(draft_id)?;
         let rendered = render_markdown(markdown)?;
         let current = self.get_draft(draft_id).await?;
         require_supported_draft(&current)?;
+        let current_destination = current.destinations.first().ok_or(Error::InvalidResponse {
+            method: "drafts.info",
+        })?;
+        let mutation_destination = draft_mutation_destination(current_destination);
         let client_last_updated_ts = (self.now_millis)()?;
         let response = self
             .api
             .drafts_update(
                 &current.id,
                 &client_last_updated_ts,
-                &current.destinations,
+                std::slice::from_ref(&mutation_destination),
                 &rendered.blocks,
+                &current.file_ids,
             )
-            .await?;
-        let updated = normalize_draft(response.draft, "drafts.update")?;
-        require_supported_draft(&updated)?;
-        if updated.id != current.id
-            || updated.destinations.len() != 1
-            || !same_draft_route(&updated.destinations[0], &current.destinations[0])
-        {
-            return Err(Error::InvalidResponse {
-                method: "drafts.update",
-            });
+            .await;
+        match response {
+            Ok(_) => {}
+            Err(error) if draft_mutation_error_is_ambiguous(&error) => {}
+            Err(error) => return Err(error),
         }
-        Ok(updated)
+        for delay_ms in self.draft_reconciliation_delays_ms {
+            if *delay_ms != 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            if let Ok(updated) = self.get_draft(&current.id).await
+                && updated.is_supported
+                && updated.id == current.id
+                && updated.client_msg_id == current.client_msg_id
+                && updated.last_updated_ts != current.last_updated_ts
+                && updated.destinations == current.destinations
+                && updated.file_ids == current.file_ids
+                && updated
+                    .blocks
+                    .as_deref()
+                    .is_some_and(|actual| same_rendered_draft_blocks(actual, &rendered.blocks))
+            {
+                return Ok(updated);
+            }
+        }
+        Err(Error::DraftMutationUncertain {
+            draft_id: current.id,
+            action: "update",
+        })
     }
 
     pub(crate) async fn delete_draft(
@@ -830,12 +1301,60 @@ impl SlackService {
         validate_draft_id(draft_id)?;
         let current = self.get_draft(draft_id).await?;
         require_supported_draft(&current)?;
-        self.api
-            .drafts_delete(&current.id, &current.client_last_updated_ts)
-            .await?;
-        Ok(DraftDeleteReport {
-            id: current.id,
-            deleted: true,
+        if current.file_ids.is_empty() {
+            self.api
+                .drafts_delete(&current.id, &current.client_last_updated_ts, false)
+                .await?;
+            return Ok(DraftDeleteReport {
+                id: current.id,
+                deleted: true,
+                file_id: None,
+                file_deleted: None,
+            });
+        }
+        let file_id = current
+            .file_ids
+            .first()
+            .cloned()
+            .ok_or(Error::InvalidResponse {
+                method: "drafts.info",
+            })?;
+        match self
+            .api
+            .drafts_delete(&current.id, &current.client_last_updated_ts, false)
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if draft_mutation_error_is_ambiguous(&error) => {}
+            Err(error) => return Err(error),
+        }
+        for delay_ms in self.draft_reconciliation_delays_ms {
+            if *delay_ms != 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            let Ok(drafts) = self.complete_active_draft_snapshot().await else {
+                continue;
+            };
+            if drafts.iter().any(|draft| {
+                draft.id == current.id || draft.file_ids.iter().any(|id| id == &file_id)
+            }) {
+                continue;
+            }
+            match self.api.files_info(&file_id).await {
+                Err(error) if file_is_absent(&error) => {
+                    return Ok(DraftDeleteReport {
+                        id: current.id,
+                        deleted: true,
+                        file_id: Some(file_id),
+                        file_deleted: Some(true),
+                    });
+                }
+                _ => continue,
+            }
+        }
+        Err(Error::DraftMutationUncertain {
+            draft_id: current.id,
+            action: "delete",
         })
     }
 
@@ -892,37 +1411,90 @@ impl SlackService {
                 )
             })?
         };
-        let sent = self
-            .post_rich_message(
+        let authored_blocks = authored_draft_blocks(blocks).ok_or(Error::InvalidResponse {
+            method: "drafts.info",
+        })?;
+        let sent = if let Some(file_id) = draft.file_ids.first() {
+            let client_msg_id = Uuid::new_v4().to_string();
+            let request = FileShareRequest {
+                channel: channel_id,
+                thread_ts: destination.thread_ts.as_deref(),
+                broadcast: destination.broadcast,
+                client_msg_id: &client_msg_id,
+                draft_id: &draft.id,
+                blocks: &authored_blocks,
+                file_id,
+            };
+            self.share_file_draft(&request).await?
+        } else {
+            self.post_rich_message(
                 channel_id,
                 destination.thread_ts.as_deref(),
                 destination.broadcast,
                 &fallback,
-                blocks,
+                &authored_blocks,
             )
-            .await?;
+            .await?
+        };
 
-        match self
-            .api
-            .drafts_delete(&draft.id, &draft.client_last_updated_ts)
-            .await
+        if !draft.file_ids.is_empty()
+            && self
+                .complete_active_draft_snapshot()
+                .await
+                .is_ok_and(|drafts| drafts.iter().all(|candidate| candidate.id != draft.id))
         {
+            return Ok(DraftSendReport {
+                sent,
+                draft_id: draft.id,
+                draft_deleted: true,
+                cleanup_warning: None,
+            });
+        }
+
+        let cleanup = self
+            .api
+            .drafts_delete(
+                &draft.id,
+                &draft.client_last_updated_ts,
+                !draft.file_ids.is_empty(),
+            )
+            .await;
+        match cleanup {
             Ok(_) => Ok(DraftSendReport {
                 sent,
                 draft_id: draft.id,
                 draft_deleted: true,
                 cleanup_warning: None,
             }),
-            Err(error) => Ok(DraftSendReport {
-                sent,
-                draft_id: draft.id.clone(),
-                draft_deleted: false,
-                cleanup_warning: Some(DraftCleanupWarning {
-                    draft_id: draft.id,
-                    last_updated_ts: draft.last_updated_ts,
-                    reason: error.to_string(),
-                }),
-            }),
+            Err(error) => {
+                if self.reconcile_draft_absence(&draft.id).await {
+                    return Ok(DraftSendReport {
+                        sent,
+                        draft_id: draft.id,
+                        draft_deleted: true,
+                        cleanup_warning: None,
+                    });
+                }
+                let reason = if draft_mutation_error_is_ambiguous(&error) {
+                    Error::DraftMutationUncertain {
+                        draft_id: draft.id.clone(),
+                        action: "post-publication cleanup",
+                    }
+                    .to_string()
+                } else {
+                    error.to_string()
+                };
+                Ok(DraftSendReport {
+                    sent,
+                    draft_id: draft.id.clone(),
+                    draft_deleted: false,
+                    cleanup_warning: Some(DraftCleanupWarning {
+                        draft_id: draft.id.clone(),
+                        last_updated_ts: draft.last_updated_ts,
+                        reason,
+                    }),
+                })
+            }
         }
     }
 
@@ -942,20 +1514,95 @@ impl SlackService {
             ));
         }
         let client_msg_id = Uuid::new_v4().to_string();
+        let request = ChatPostMessageRequest {
+            channel: channel_id,
+            thread_ts,
+            broadcast,
+            client_msg_id: &client_msg_id,
+            text,
+            blocks,
+        };
         let response = self
             .api
-            .chat_post_message(
-                channel_id,
-                thread_ts,
-                broadcast,
-                &client_msg_id,
-                text,
-                blocks,
-            )
+            .chat_post_message(&request)
             .await
             .map_err(|error| classify_publication_error(&client_msg_id, error))?;
         normalize_sent_message(channel_id, thread_ts, client_msg_id.clone(), response)
             .map_err(|_| Error::PublicationUncertain { client_msg_id })
+    }
+
+    async fn share_file_draft(&self, request: &FileShareRequest<'_>) -> Result<SentMessage> {
+        match self.api.files_share(request).await {
+            Ok(_) => {}
+            Err(error) => match classify_publication_error(request.client_msg_id, error) {
+                Error::PublicationUncertain { .. } => {}
+                definitive => return Err(definitive),
+            },
+        }
+        for delay_ms in self.draft_reconciliation_delays_ms {
+            if *delay_ms != 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            let Ok(raw) = self.api.files_info(request.file_id).await else {
+                continue;
+            };
+            if raw.file.id != request.file_id {
+                continue;
+            }
+            let Ok(file) = normalize_file(raw.file, "files.info") else {
+                continue;
+            };
+            let share = if request.channel.starts_with('D') {
+                match exact_file_share(&file, request.channel, request.thread_ts) {
+                    Some(share) => Some(share),
+                    None if file.shares_complete
+                        && file.shares.as_ref().is_some_and(Vec::is_empty)
+                        && file
+                            .im_ids
+                            .as_ref()
+                            .is_some_and(|ids| ids.len() == 1 && ids[0] == request.channel) =>
+                    {
+                        self.find_direct_message_file_share(
+                            request.channel,
+                            request.thread_ts,
+                            request.file_id,
+                        )
+                        .await
+                    }
+                    None => None,
+                }
+            } else {
+                exact_file_share(&file, request.channel, request.thread_ts)
+            };
+            let Some(share) = share else {
+                continue;
+            };
+            if !is_valid_timestamp(&share.ts) {
+                continue;
+            }
+            let Ok(message) = self.get_message_by_id(request.channel, &share.ts).await else {
+                continue;
+            };
+            if !is_exact_file_route(&message.ts, message.thread_ts.as_deref(), request.thread_ts)
+                || message.files.len() != 1
+                || message.files[0].id != request.file_id
+                || !message
+                    .blocks
+                    .as_deref()
+                    .is_some_and(|actual| same_rendered_draft_blocks(actual, request.blocks))
+            {
+                continue;
+            }
+            if is_exact_published_file(&file, request.channel, &message.ts, request.thread_ts) {
+                return Ok(SentMessage {
+                    client_msg_id: request.client_msg_id.to_owned(),
+                    message,
+                });
+            }
+        }
+        Err(Error::PublicationUncertain {
+            client_msg_id: request.client_msg_id.to_owned(),
+        })
     }
 
     pub(crate) async fn unreads(&self) -> Result<UnreadReport> {
@@ -1918,9 +2565,11 @@ fn normalize_draft(raw: RawDraft, method: &'static str) -> Result<Draft> {
         client_msg_id.is_empty()
             || client_msg_id.len() > 128
             || client_msg_id.chars().any(char::is_control)
-    }) || raw.file_ids.iter().any(|file_id| {
-        file_id.is_empty() || file_id.len() > 128 || file_id.chars().any(char::is_control)
-    }) {
+    }) || raw
+        .file_ids
+        .iter()
+        .any(|file_id| !is_valid_file_id(file_id))
+    {
         return Err(Error::InvalidResponse { method });
     }
     for destination in &raw.destinations {
@@ -1941,10 +2590,10 @@ fn normalize_draft(raw: RawDraft, method: &'static str) -> Result<Draft> {
             return Err(Error::InvalidResponse { method });
         }
     }
-    let is_supported = raw.destinations.len() == 1
+    let has_unknown_fields = !raw.extra.is_empty();
+    let supported_shape = raw.destinations.len() == 1
         && raw.destinations[0].channel_id.is_some()
         && raw.destinations[0].extra.is_empty()
-        && raw.file_ids.is_empty()
         && raw.attachments.is_empty()
         && !raw.is_deleted
         && !raw.is_sent
@@ -1952,6 +2601,20 @@ fn normalize_draft(raw: RawDraft, method: &'static str) -> Result<Draft> {
             .blocks
             .as_ref()
             .is_some_and(|blocks| is_rich_text_blocks(blocks));
+    let is_supported = supported_shape && raw.file_ids.is_empty();
+    let file_identity_supported = raw.date_created.is_some_and(|created| created > 0)
+        && raw.date_scheduled == Some(0)
+        && raw
+            .last_updated_client
+            .as_deref()
+            .is_some_and(is_valid_draft_client)
+        && raw.team_id.as_deref().is_some_and(is_valid_team_id)
+        && raw.user_id.as_deref().is_some_and(is_valid_user_id);
+    let file_shape_supported = supported_shape
+        && file_identity_supported
+        && !has_unknown_fields
+        && raw.file_ids.len() == 1;
+    let file_association = (raw.file_ids.len() == 1).then_some(FileDraftAssociation::Unverified);
     Ok(Draft {
         id: raw.id,
         client_msg_id: raw.client_msg_id,
@@ -1963,7 +2626,15 @@ fn normalize_draft(raw: RawDraft, method: &'static str) -> Result<Draft> {
         file_ids: raw.file_ids,
         attachments: raw.attachments,
         is_from_composer: raw.is_from_composer,
+        file_association,
         is_supported,
+        has_unknown_fields,
+        file_shape_supported,
+        date_created: raw.date_created,
+        date_scheduled: raw.date_scheduled,
+        last_updated_client: raw.last_updated_client,
+        team_id: raw.team_id,
+        user_id: raw.user_id,
     })
 }
 
@@ -1971,6 +2642,108 @@ fn same_draft_route(actual: &DraftDestination, requested: &DraftDestination) -> 
     actual.channel_id == requested.channel_id
         && actual.thread_ts == requested.thread_ts
         && actual.broadcast == requested.broadcast
+}
+
+fn draft_mutation_destination(destination: &DraftDestination) -> DraftDestination {
+    DraftDestination {
+        channel_id: destination.channel_id.clone(),
+        thread_ts: destination.thread_ts.clone(),
+        broadcast: destination.broadcast,
+        ..DraftDestination::default()
+    }
+}
+
+fn same_draft_snapshot(actual: &Draft, expected: &Draft) -> bool {
+    actual.id == expected.id
+        && actual.client_msg_id == expected.client_msg_id
+        && actual.last_updated_ts == expected.last_updated_ts
+        && actual.client_last_updated_ts == expected.client_last_updated_ts
+        && actual.text == expected.text
+        && actual.blocks == expected.blocks
+        && actual.destinations == expected.destinations
+        && actual.file_ids == expected.file_ids
+        && actual.attachments == expected.attachments
+        && actual.is_from_composer == expected.is_from_composer
+        && actual.has_unknown_fields == expected.has_unknown_fields
+        && actual.file_shape_supported == expected.file_shape_supported
+        && actual.date_created == expected.date_created
+        && actual.date_scheduled == expected.date_scheduled
+        && actual.last_updated_client == expected.last_updated_client
+        && actual.team_id == expected.team_id
+        && actual.user_id == expected.user_id
+}
+
+fn is_private_unshared_file(file: &FileReference) -> bool {
+    file.is_external == Some(false)
+        && file.mode.as_deref() != Some("external")
+        && file.is_public == Some(false)
+        && file.public_url_shared == Some(false)
+        && file.channel_ids.as_ref().is_some_and(Vec::is_empty)
+        && file.group_ids.as_ref().is_some_and(Vec::is_empty)
+        && file.im_ids.as_ref().is_some_and(Vec::is_empty)
+        && file.shares.as_ref().is_some_and(Vec::is_empty)
+        && file.shares_complete
+}
+
+fn is_expected_private_draft_file(
+    file: &FileReference,
+    file_id: &str,
+    expected_name: &str,
+    expected_size: u64,
+    expected_alt_text: Option<&str>,
+) -> bool {
+    file.id == file_id
+        && file.name.as_deref() == Some(expected_name)
+        && file.size == Some(expected_size)
+        && expected_alt_text.is_none_or(|expected| file.alt_text.as_deref() == Some(expected))
+        && is_private_unshared_file(file)
+}
+
+fn is_exact_published_file(
+    file: &FileReference,
+    channel_id: &str,
+    message_ts: &str,
+    thread_ts: Option<&str>,
+) -> bool {
+    if file.public_url_shared != Some(false)
+        || file.is_external != Some(false)
+        || file.mode.as_deref() == Some("external")
+        || file.is_public.is_none()
+        || !file.shares_complete
+    {
+        return false;
+    }
+    let channel_ids = file.channel_ids.as_deref();
+    let group_ids = file.group_ids.as_deref();
+    let im_ids = file.im_ids.as_deref();
+    let shares = file.shares.as_deref();
+    if channel_id.starts_with('D') {
+        return channel_ids == Some(&[])
+            && group_ids == Some(&[])
+            && im_ids.is_some_and(|ids| ids == [channel_id])
+            && shares.is_some_and(|shares| {
+                shares.is_empty()
+                    || (shares.len() == 1
+                        && shares[0].channel_id == channel_id
+                        && shares[0].ts == message_ts
+                        && is_exact_file_route(
+                            &shares[0].ts,
+                            shares[0].thread_ts.as_deref(),
+                            thread_ts,
+                        ))
+            });
+    }
+    let has_exact_membership = (channel_ids.is_some_and(|ids| ids == [channel_id])
+        && group_ids == Some(&[]))
+        || (group_ids.is_some_and(|ids| ids == [channel_id]) && channel_ids == Some(&[]));
+    has_exact_membership
+        && im_ids == Some(&[])
+        && shares.is_some_and(|shares| {
+            shares.len() == 1
+                && shares[0].channel_id == channel_id
+                && shares[0].ts == message_ts
+                && is_exact_file_route(&shares[0].ts, shares[0].thread_ts.as_deref(), thread_ts)
+        })
 }
 
 fn normalize_sent_message(
@@ -2009,6 +2782,33 @@ fn is_rich_text_blocks(blocks: &[serde_json::Value]) -> bool {
                 .and_then(serde_json::Value::as_str)
                 == Some("rich_text")
         })
+}
+
+fn same_rendered_draft_blocks(
+    actual: &[serde_json::Value],
+    requested: &[serde_json::Value],
+) -> bool {
+    authored_draft_blocks(actual).as_deref() == Some(requested)
+}
+
+fn authored_draft_blocks(blocks: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+    if !is_rich_text_blocks(blocks) {
+        return None;
+    }
+    blocks
+        .iter()
+        .map(|block| {
+            let mut block = block.as_object()?.clone();
+            if let Some(block_id) = block.remove("block_id")
+                && !block_id.as_str().is_some_and(|block_id| {
+                    (1..=255).contains(&block_id.len()) && !block_id.chars().any(char::is_control)
+                })
+            {
+                return None;
+            }
+            Some(serde_json::Value::Object(block))
+        })
+        .collect()
 }
 
 fn rich_text_fallback(blocks: &[serde_json::Value]) -> Option<String> {
@@ -2154,6 +2954,13 @@ fn classify_publication_error(client_msg_id: &str, error: Error) -> Error {
         | Error::Transport { .. } => Error::PublicationUncertain {
             client_msg_id: client_msg_id.to_owned(),
         },
+        Error::SlackApi { code, .. }
+            if matches!(code.as_str(), "fatal_error" | "internal_error") =>
+        {
+            Error::PublicationUncertain {
+                client_msg_id: client_msg_id.to_owned(),
+            }
+        }
         definitive => definitive,
     }
 }
@@ -2472,6 +3279,28 @@ fn reaction_error_is_ambiguous(error: &Error) -> bool {
     )
 }
 
+fn draft_mutation_error_is_ambiguous(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::HttpStatus { .. }
+            | Error::ResponseTooLarge { .. }
+            | Error::InvalidResponse { .. }
+            | Error::Timeout { .. }
+            | Error::Transport { .. }
+    ) || matches!(
+        error,
+        Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
+    )
+}
+
+fn file_is_absent(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::SlackApi { method: "files.info", code }
+            if matches!(code.as_str(), "file_not_found" | "file_deleted")
+    )
+}
+
 fn validate_file_id(file_id: &str) -> Result<()> {
     if is_valid_file_id(file_id) {
         Ok(())
@@ -2711,6 +3540,19 @@ fn is_valid_draft_id(draft_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn is_valid_draft_client(client: &str) -> bool {
+    client.len() <= 64
+        && client
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn is_valid_team_id(team_id: &str) -> bool {
+    team_id.starts_with('T')
+        && (2..=64).contains(&team_id.len())
+        && team_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
 fn validate_draft_revision_input(field: &'static str, revision: Option<&str>) -> Result<()> {
     if revision.is_some_and(|revision| !is_valid_draft_revision(revision)) {
         Err(Error::invalid_input(
@@ -2931,17 +3773,26 @@ mod tests {
         conversation_pages: Mutex<VecDeque<RawConversationsPage>>,
         user_pages: Mutex<VecDeque<RawUsersPage>>,
         drafts_page: RawDraftsPage,
+        draft_pages: Mutex<VecDeque<RawDraftsPage>>,
         draft_info: RawDraftResponse,
+        draft_infos: Mutex<VecDeque<RawDraftResponse>>,
         draft_create: RawDraftResponse,
+        draft_create_error: Option<&'static str>,
         draft_update: RawDraftResponse,
+        draft_update_error: Option<&'static str>,
         draft_delete_error: bool,
+        draft_delete_ambiguous: bool,
         draft_calls: Arc<Mutex<Vec<DraftCall>>>,
         post_response: Option<RawPostMessageResponse>,
         post_error: Option<String>,
         post_calls: Arc<Mutex<Vec<PostCall>>>,
+        file_share_error: Option<String>,
+        file_share_transport_error: bool,
+        file_share_calls: Arc<Mutex<Vec<FileShareCall>>>,
         emoji_response: RawEmojiResponse,
         file_response: RawFileResponse,
         file_responses: Mutex<VecDeque<RawFileResponse>>,
+        file_info_results: Mutex<VecDeque<Result<RawFileResponse>>>,
         file_info_calls: Arc<Mutex<Vec<String>>>,
         reaction_present: Arc<Mutex<bool>>,
         reaction_name: Arc<Mutex<String>>,
@@ -3005,16 +3856,19 @@ mod tests {
             client_msg_id: String,
             destinations: Vec<DraftDestination>,
             blocks: Vec<serde_json::Value>,
+            file_ids: Vec<String>,
         },
         Update {
             draft_id: String,
             last_updated_ts: String,
             destinations: Vec<DraftDestination>,
             blocks: Vec<serde_json::Value>,
+            file_ids: Vec<String>,
         },
         Delete {
             draft_id: String,
             last_updated_ts: String,
+            skip_file_deletion: bool,
         },
     }
 
@@ -3026,6 +3880,35 @@ mod tests {
         client_msg_id: String,
         text: String,
         blocks: Vec<serde_json::Value>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FileShareCall {
+        channel: String,
+        thread_ts: Option<String>,
+        broadcast: bool,
+        client_msg_id: String,
+        draft_id: String,
+        blocks: Vec<serde_json::Value>,
+        file_id: String,
+    }
+
+    const REQUEST_CLIENT_MSG_ID: &str = "__from_request__";
+
+    fn hydrate_test_client_msg_id(draft: &mut RawDraft, client_msg_id: &str) {
+        if draft.client_msg_id.as_deref() == Some(REQUEST_CLIENT_MSG_ID) {
+            draft.client_msg_id = Some(client_msg_id.to_owned());
+        }
+    }
+
+    fn last_created_client_msg_id(calls: &Mutex<Vec<DraftCall>>) -> Option<String> {
+        calls.lock().unwrap().iter().rev().find_map(|call| {
+            if let DraftCall::Create { client_msg_id, .. } = call {
+                Some(client_msg_id.clone())
+            } else {
+                None
+            }
+        })
     }
 
     #[async_trait]
@@ -3140,6 +4023,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(file_id.to_owned());
+            if let Some(result) = self.file_info_results.lock().unwrap().pop_front() {
+                return result;
+            }
             Ok(self
                 .file_responses
                 .lock()
@@ -3346,19 +4232,54 @@ mod tests {
             }
         }
 
+        async fn files_complete_draft_upload(
+            &self,
+            _file_id: &str,
+            _title: Option<&str>,
+        ) -> Result<RawFileUploadCompletion> {
+            self.upload_calls.lock().unwrap().push("complete");
+            if self.upload_completion_error {
+                Err(Error::Timeout {
+                    method: "files.completeUpload",
+                })
+            } else {
+                Ok(self.upload_completion.clone())
+            }
+        }
+
         async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
             self.draft_calls.lock().unwrap().push(DraftCall::List {
                 next_ts: next_ts.map(str::to_owned),
                 limit,
             });
-            Ok(self.drafts_page.clone())
+            let mut page = self
+                .draft_pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.drafts_page.clone());
+            if let Some(client_msg_id) = last_created_client_msg_id(&self.draft_calls) {
+                for draft in &mut page.drafts {
+                    hydrate_test_client_msg_id(draft, &client_msg_id);
+                }
+            }
+            Ok(page)
         }
 
         async fn drafts_info(&self, draft_id: &str) -> Result<RawDraftResponse> {
             self.draft_calls.lock().unwrap().push(DraftCall::Info {
                 draft_id: draft_id.into(),
             });
-            Ok(self.draft_info.clone())
+            let mut response = self
+                .draft_infos
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.draft_info.clone());
+            if let Some(client_msg_id) = last_created_client_msg_id(&self.draft_calls) {
+                hydrate_test_client_msg_id(&mut response.draft, &client_msg_id);
+            }
+            Ok(response)
         }
 
         async fn drafts_create(
@@ -3366,13 +4287,28 @@ mod tests {
             client_msg_id: &str,
             destinations: &[DraftDestination],
             blocks: &[serde_json::Value],
+            file_ids: &[String],
         ) -> Result<RawDraftResponse> {
             self.draft_calls.lock().unwrap().push(DraftCall::Create {
                 client_msg_id: client_msg_id.into(),
                 destinations: destinations.to_vec(),
                 blocks: blocks.to_vec(),
+                file_ids: file_ids.to_vec(),
             });
-            Ok(self.draft_create.clone())
+            match self.draft_create_error {
+                Some("timeout") => Err(Error::Timeout {
+                    method: "drafts.create",
+                }),
+                Some(code) => Err(Error::SlackApi {
+                    method: "drafts.create",
+                    code: code.into(),
+                }),
+                None => {
+                    let mut response = self.draft_create.clone();
+                    hydrate_test_client_msg_id(&mut response.draft, client_msg_id);
+                    Ok(response)
+                }
+            }
         }
 
         async fn drafts_update(
@@ -3381,26 +4317,43 @@ mod tests {
             last_updated_ts: &str,
             destinations: &[DraftDestination],
             blocks: &[serde_json::Value],
+            file_ids: &[String],
         ) -> Result<RawDraftResponse> {
             self.draft_calls.lock().unwrap().push(DraftCall::Update {
                 draft_id: draft_id.into(),
                 last_updated_ts: last_updated_ts.into(),
                 destinations: destinations.to_vec(),
                 blocks: blocks.to_vec(),
+                file_ids: file_ids.to_vec(),
             });
-            Ok(self.draft_update.clone())
+            match self.draft_update_error {
+                Some("timeout") => Err(Error::Timeout {
+                    method: "drafts.update",
+                }),
+                Some(code) => Err(Error::SlackApi {
+                    method: "drafts.update",
+                    code: code.into(),
+                }),
+                None => Ok(self.draft_update.clone()),
+            }
         }
 
         async fn drafts_delete(
             &self,
             draft_id: &str,
             last_updated_ts: &str,
+            skip_file_deletion: bool,
         ) -> Result<RawMutationResponse> {
             self.draft_calls.lock().unwrap().push(DraftCall::Delete {
                 draft_id: draft_id.into(),
                 last_updated_ts: last_updated_ts.into(),
+                skip_file_deletion,
             });
-            if self.draft_delete_error {
+            if self.draft_delete_ambiguous {
+                Err(Error::Timeout {
+                    method: "drafts.delete",
+                })
+            } else if self.draft_delete_error {
                 Err(Error::SlackApi {
                     method: "drafts.delete",
                     code: "draft_conflict".into(),
@@ -3412,20 +4365,15 @@ mod tests {
 
         async fn chat_post_message(
             &self,
-            channel: &str,
-            thread_ts: Option<&str>,
-            broadcast: bool,
-            client_msg_id: &str,
-            text: &str,
-            blocks: &[serde_json::Value],
+            request: &ChatPostMessageRequest<'_>,
         ) -> Result<RawPostMessageResponse> {
             self.post_calls.lock().unwrap().push(PostCall {
-                channel: channel.into(),
-                thread_ts: thread_ts.map(str::to_owned),
-                broadcast,
-                client_msg_id: client_msg_id.into(),
-                text: text.into(),
-                blocks: blocks.to_vec(),
+                channel: request.channel.into(),
+                thread_ts: request.thread_ts.map(str::to_owned),
+                broadcast: request.broadcast,
+                client_msg_id: request.client_msg_id.into(),
+                text: request.text.into(),
+                blocks: request.blocks.to_vec(),
             });
             if let Some(code) = &self.post_error {
                 return Err(Error::SlackApi {
@@ -3437,16 +4385,40 @@ mod tests {
                 .post_response
                 .clone()
                 .unwrap_or_else(|| RawPostMessageResponse {
-                    channel: channel.into(),
+                    channel: request.channel.into(),
                     ts: "7000.000001".into(),
                     message: RawMessage {
                         ts: "7000.000001".into(),
-                        thread_ts: thread_ts.map(str::to_owned),
-                        text: text.into(),
-                        blocks: Some(blocks.to_vec()),
+                        thread_ts: request.thread_ts.map(str::to_owned),
+                        text: request.text.into(),
+                        blocks: Some(request.blocks.to_vec()),
                         ..RawMessage::default()
                     },
                 }))
+        }
+
+        async fn files_share(&self, request: &FileShareRequest<'_>) -> Result<RawMutationResponse> {
+            self.file_share_calls.lock().unwrap().push(FileShareCall {
+                channel: request.channel.into(),
+                thread_ts: request.thread_ts.map(str::to_owned),
+                broadcast: request.broadcast,
+                client_msg_id: request.client_msg_id.into(),
+                draft_id: request.draft_id.into(),
+                blocks: request.blocks.to_vec(),
+                file_id: request.file_id.into(),
+            });
+            if self.file_share_transport_error {
+                return Err(Error::Timeout {
+                    method: "files.share",
+                });
+            }
+            if let Some(code) = &self.file_share_error {
+                return Err(Error::SlackApi {
+                    method: "files.share",
+                    code: code.clone(),
+                });
+            }
+            Ok(RawMutationResponse::default())
         }
     }
 
@@ -3540,17 +4512,26 @@ mod tests {
             conversation_pages: Mutex::new(VecDeque::new()),
             user_pages: Mutex::new(VecDeque::new()),
             drafts_page: RawDraftsPage::default(),
+            draft_pages: Mutex::new(VecDeque::new()),
             draft_info: RawDraftResponse::default(),
+            draft_infos: Mutex::new(VecDeque::new()),
             draft_create: RawDraftResponse::default(),
+            draft_create_error: None,
             draft_update: RawDraftResponse::default(),
+            draft_update_error: None,
             draft_delete_error: false,
+            draft_delete_ambiguous: false,
             draft_calls: Arc::new(Mutex::new(Vec::new())),
             post_response: None,
             post_error: None,
             post_calls: Arc::new(Mutex::new(Vec::new())),
+            file_share_error: None,
+            file_share_transport_error: false,
+            file_share_calls: Arc::new(Mutex::new(Vec::new())),
             emoji_response: RawEmojiResponse::default(),
             file_response: RawFileResponse::default(),
             file_responses: Mutex::new(VecDeque::new()),
+            file_info_results: Mutex::new(VecDeque::new()),
             file_info_calls: Arc::new(Mutex::new(Vec::new())),
             reaction_present: Arc::new(Mutex::new(false)),
             reaction_name: Arc::new(Mutex::new("eyes".into())),
@@ -3587,6 +4568,7 @@ mod tests {
         let mut service = SlackService::new(api, &config);
         service.now_millis = || Ok("9000123".into());
         service.upload_reconciliation_delays_ms = &[0];
+        service.draft_reconciliation_delays_ms = &[0];
         service
     }
 
@@ -3617,6 +4599,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    async fn create_file_draft_report(
+        api: FakeApi,
+        fixture: &UploadFixture,
+    ) -> FileDraftCreateReport {
+        service(api)
+            .create_file_draft(
+                FileDraftCreateRequest {
+                    conversation: "C123",
+                    thread_ts: None,
+                    broadcast: false,
+                    markdown: "**body**",
+                    title: None,
+                    alt_text: Some("Synthetic test file"),
+                    confirmed: true,
+                },
+                fixture.source(),
+            )
+            .await
+            .unwrap()
     }
 
     fn uploaded_file(thread_ts: Option<&str>) -> RawFile {
@@ -3727,6 +4730,11 @@ mod tests {
                 ..DraftDestination::default()
             }],
             is_from_composer: true,
+            date_created: Some(1_700_000_000),
+            date_scheduled: Some(0),
+            last_updated_client: Some(String::new()),
+            team_id: Some("T000TEST".into()),
+            user_id: Some("U123".into()),
             ..RawDraft::default()
         }
     }
@@ -3735,6 +4743,116 @@ mod tests {
         let mut draft = raw_draft(id, revision, "D123", text);
         draft.destinations[0].user_ids = Some(vec!["U123".into()]);
         draft
+    }
+
+    fn raw_file_draft(
+        id: &str,
+        revision: &str,
+        channel_id: &str,
+        text: &str,
+        file_id: &str,
+    ) -> RawDraft {
+        let mut draft = raw_draft(id, revision, channel_id, text);
+        draft.file_ids = vec![file_id.into()];
+        draft
+    }
+
+    fn private_draft_file(file_id: &str) -> RawFile {
+        RawFile {
+            id: file_id.into(),
+            name: Some("source.txt".into()),
+            alt_txt: Some("Synthetic test file".into()),
+            size: Some(9),
+            is_external: Some(false),
+            is_public: Some(false),
+            public_url_shared: Some(false),
+            channels: Some(vec![]),
+            groups: Some(vec![]),
+            ims: Some(vec![]),
+            shares: Some(crate::model::RawFileShares::default()),
+            ..RawFile::default()
+        }
+    }
+
+    fn published_dm_file(file_id: &str, message_ts: &str) -> RawFile {
+        RawFile {
+            id: file_id.into(),
+            name: Some("source.txt".into()),
+            alt_txt: Some("Synthetic test file".into()),
+            size: Some(9),
+            is_external: Some(false),
+            is_public: Some(false),
+            public_url_shared: Some(false),
+            channels: Some(vec![]),
+            groups: Some(vec![]),
+            ims: Some(vec!["D123".into()]),
+            shares: Some(crate::model::RawFileShares {
+                private: BTreeMap::from([(
+                    "D123".into(),
+                    vec![crate::model::RawFileShare {
+                        ts: message_ts.into(),
+                        thread_ts: None,
+                    }],
+                )]),
+                ..crate::model::RawFileShares::default()
+            }),
+            ..RawFile::default()
+        }
+    }
+
+    fn published_dm_file_without_share(file_id: &str) -> RawFile {
+        RawFile {
+            id: file_id.into(),
+            name: Some("source.txt".into()),
+            alt_txt: Some("Synthetic test file".into()),
+            size: Some(9),
+            is_external: Some(false),
+            is_public: Some(false),
+            public_url_shared: Some(false),
+            channels: Some(vec![]),
+            groups: Some(vec![]),
+            ims: Some(vec!["D123".into()]),
+            shares: Some(crate::model::RawFileShares::default()),
+            ..RawFile::default()
+        }
+    }
+
+    fn published_channel_file(
+        file_id: &str,
+        message_ts: &str,
+        actual_thread_ts: Option<&str>,
+    ) -> RawFile {
+        RawFile {
+            id: file_id.into(),
+            name: Some("source.txt".into()),
+            alt_txt: Some("Synthetic test file".into()),
+            size: Some(9),
+            is_external: Some(false),
+            is_public: Some(false),
+            public_url_shared: Some(false),
+            channels: Some(vec!["C123".into()]),
+            groups: Some(vec![]),
+            ims: Some(vec![]),
+            shares: Some(crate::model::RawFileShares {
+                private: BTreeMap::from([(
+                    "C123".into(),
+                    vec![crate::model::RawFileShare {
+                        ts: message_ts.into(),
+                        thread_ts: actual_thread_ts.map(str::to_owned),
+                    }],
+                )]),
+                ..crate::model::RawFileShares::default()
+            }),
+            ..RawFile::default()
+        }
+    }
+
+    fn active_drafts(drafts: Vec<RawDraft>) -> RawDraftsPage {
+        RawDraftsPage {
+            drafts,
+            files: vec![],
+            has_more: false,
+        }
     }
 
     fn raw_user(id: &str, name: &str, display_name: &str) -> RawUser {
@@ -3764,6 +4882,8 @@ mod tests {
 
     #[tokio::test]
     async fn drafts_lifecycle_uses_bounded_pages_and_server_concurrency_revisions() {
+        let existing = raw_draft("DR-existing", "3000.5", "C123", "old");
+        let updated = raw_draft("DR-existing", "3001", "C123", "replacement");
         let mut api = fake_api();
         api.drafts_page = RawDraftsPage {
             drafts: vec![
@@ -3774,14 +4894,21 @@ mod tests {
             has_more: true,
         };
         api.draft_info = RawDraftResponse {
-            draft: raw_draft("DR-existing", "3000.5", "C123", "old"),
+            draft: existing.clone(),
         };
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse { draft: existing },
+            RawDraftResponse {
+                draft: updated.clone(),
+            },
+            RawDraftResponse {
+                draft: updated.clone(),
+            },
+        ]));
         api.draft_create = RawDraftResponse {
             draft: raw_draft("DR-created", "4000", "C123", "created"),
         };
-        api.draft_update = RawDraftResponse {
-            draft: raw_draft("DR-existing", "3001", "C123", "updated"),
-        };
+        api.draft_update = RawDraftResponse { draft: updated };
         let calls = api.draft_calls.clone();
         let service = service(api);
 
@@ -3809,7 +4936,9 @@ mod tests {
             deleted,
             DraftDeleteReport {
                 id: "DR-existing".into(),
-                deleted: true
+                deleted: true,
+                file_id: None,
+                file_deleted: None,
             }
         );
 
@@ -3825,6 +4954,7 @@ mod tests {
             client_msg_id,
             destinations,
             blocks,
+            file_ids,
         } = &calls[1]
         else {
             panic!("expected draft creation call");
@@ -3832,6 +4962,7 @@ mod tests {
         assert_eq!(Uuid::parse_str(client_msg_id).unwrap().get_version_num(), 4);
         assert_eq!(destinations[0].channel_id.as_deref(), Some("C123"));
         assert_eq!(blocks[0]["type"], "rich_text");
+        assert!(file_ids.is_empty());
         assert_eq!(
             calls[2..],
             [
@@ -3846,13 +4977,18 @@ mod tests {
                         ..DraftDestination::default()
                     }],
                     blocks: render_markdown("replacement").unwrap().blocks,
+                    file_ids: vec![],
+                },
+                DraftCall::Info {
+                    draft_id: "DR-existing".into()
                 },
                 DraftCall::Info {
                     draft_id: "DR-existing".into()
                 },
                 DraftCall::Delete {
                     draft_id: "DR-existing".into(),
-                    last_updated_ts: "3000500".into(),
+                    last_updated_ts: "3001000".into(),
+                    skip_file_deletion: false,
                 }
             ]
         );
@@ -3860,19 +4996,31 @@ mod tests {
 
     #[tokio::test]
     async fn drafts_accept_and_preserve_valid_self_dm_user_ids() {
+        let existing = raw_self_dm_draft("DR-existing", "2000", "existing");
+        let updated = raw_self_dm_draft("DR-existing", "2001", "updated");
         let mut api = fake_api();
         api.drafts_page = RawDraftsPage {
             drafts: vec![raw_self_dm_draft("DR-list", "1000", "listed")],
             ..RawDraftsPage::default()
         };
         api.draft_info = RawDraftResponse {
-            draft: raw_self_dm_draft("DR-existing", "2000", "existing"),
+            draft: existing.clone(),
         };
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: existing.clone(),
+            },
+            RawDraftResponse {
+                draft: updated.clone(),
+            },
+            RawDraftResponse { draft: updated },
+            RawDraftResponse { draft: existing },
+        ]));
         api.draft_create = RawDraftResponse {
             draft: raw_self_dm_draft("DR-created", "3000", "created"),
         };
         api.draft_update = RawDraftResponse {
-            draft: raw_self_dm_draft("DR-existing", "2001", "updated"),
+            draft: raw_self_dm_draft("DR-existing", "2001", "transient"),
         };
         let draft_calls = api.draft_calls.clone();
         let post_calls = api.post_calls.clone();
@@ -3940,10 +5088,8 @@ mod tests {
         let DraftCall::Update { destinations, .. } = &calls[3] else {
             panic!("expected draft update");
         };
-        assert_eq!(
-            destinations[0].user_ids.as_deref(),
-            Some(["U123".to_owned()].as_slice())
-        );
+        assert_eq!(destinations[0].channel_id.as_deref(), Some("D123"));
+        assert_eq!(destinations[0].user_ids, None);
         let posts = post_calls.lock().unwrap();
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].channel, "D123");
@@ -4082,14 +5228,22 @@ mod tests {
 
         for draft in cases {
             let mut api = fake_api();
+            let current = raw_self_dm_draft("DR-existing", "2000", "existing");
             api.draft_info = RawDraftResponse {
-                draft: raw_self_dm_draft("DR-existing", "2000", "existing"),
+                draft: current.clone(),
             };
+            api.draft_infos = Mutex::new(VecDeque::from([
+                RawDraftResponse { draft: current },
+                RawDraftResponse {
+                    draft: draft.clone(),
+                },
+            ]));
             api.draft_update = RawDraftResponse { draft };
             assert!(matches!(
                 service(api).update_draft("DR-existing", "synthetic").await,
-                Err(Error::InvalidResponse {
-                    method: "drafts.update"
+                Err(Error::DraftMutationUncertain {
+                    action: "update",
+                    ..
                 })
             ));
         }
@@ -4134,6 +5288,14 @@ mod tests {
             },
             Error::Transport {
                 method: "chat.postMessage",
+            },
+            Error::SlackApi {
+                method: "chat.postMessage",
+                code: "fatal_error".into(),
+            },
+            Error::SlackApi {
+                method: "chat.postMessage",
+                code: "internal_error".into(),
             },
         ] {
             assert!(matches!(
@@ -4224,10 +5386,947 @@ mod tests {
                 DraftCall::Info {
                     draft_id: "DR-attached".into()
                 },
+                DraftCall::List {
+                    next_ts: None,
+                    limit: MAX_DRAFTS,
+                },
                 DraftCall::Info {
                     draft_id: "DR-attached".into()
-                }
+                },
+                DraftCall::List {
+                    next_ts: None,
+                    limit: MAX_DRAFTS,
+                },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_file_draft_read_requires_global_exclusive_private_file_proof() {
+        let mut api = fake_api();
+        let draft = raw_file_draft("DR-file", "610", "C123", "attached", "FPRIVATE");
+        api.draft_info = RawDraftResponse {
+            draft: draft.clone(),
+        };
+        api.drafts_page = active_drafts(vec![draft.clone()]);
+        api.file_response = RawFileResponse {
+            file: private_draft_file("FPRIVATE"),
+        };
+        let service = service(api);
+
+        let verified = service.get_draft("DR-file").await.unwrap();
+        assert!(verified.is_supported);
+        assert_eq!(verified.file_ids, ["FPRIVATE"]);
+        assert_eq!(
+            verified.file_association,
+            Some(FileDraftAssociation::Verified)
+        );
+    }
+
+    #[tokio::test]
+    async fn one_file_draft_read_fails_closed_on_duplicate_unknown_or_incomplete_state() {
+        let draft = raw_file_draft("DR-file", "620", "C123", "attached", "FPRIVATE");
+        let mut duplicate = fake_api();
+        duplicate.draft_info = RawDraftResponse {
+            draft: draft.clone(),
+        };
+        duplicate.draft_pages = Mutex::new(VecDeque::from([
+            RawDraftsPage {
+                drafts: vec![draft.clone()],
+                has_more: true,
+                ..RawDraftsPage::default()
+            },
+            active_drafts(vec![raw_file_draft(
+                "DR-other", "619", "C123", "other", "FPRIVATE",
+            )]),
+        ]));
+        let duplicate = service(duplicate).get_draft("DR-file").await.unwrap();
+        assert!(!duplicate.is_supported);
+        assert_eq!(
+            duplicate.file_association,
+            Some(FileDraftAssociation::Unverified)
+        );
+
+        let mut unknown = draft.clone();
+        unknown.extra.insert("future_field".into(), json!(true));
+        let mut api = fake_api();
+        api.draft_info = RawDraftResponse { draft: unknown };
+        let unknown = service(api).get_draft("DR-file").await.unwrap();
+        assert!(!unknown.is_supported);
+
+        let mut api = fake_api();
+        api.draft_info = RawDraftResponse {
+            draft: draft.clone(),
+        };
+        api.drafts_page = active_drafts(vec![draft.clone()]);
+        api.file_response = RawFileResponse {
+            file: RawFile {
+                id: "FPRIVATE".into(),
+                is_public: Some(false),
+                public_url_shared: Some(false),
+                ..RawFile::default()
+            },
+        };
+        let incomplete = service(api).get_draft("DR-file").await.unwrap();
+        assert!(!incomplete.is_supported);
+
+        let mut api = fake_api();
+        api.draft_info = RawDraftResponse {
+            draft: draft.clone(),
+        };
+        api.drafts_page = active_drafts(vec![draft]);
+        let mut external = private_draft_file("FPRIVATE");
+        external.is_external = Some(true);
+        external.mode = Some("external".into());
+        api.file_response = RawFileResponse { file: external };
+        let external = service(api).get_draft("DR-file").await.unwrap();
+        assert!(!external.is_supported);
+        assert_eq!(
+            external.file_association,
+            Some(FileDraftAssociation::Unverified)
+        );
+    }
+
+    #[tokio::test]
+    async fn file_draft_ownership_scan_fails_closed_on_cursor_loops_and_scan_caps() {
+        let target = raw_file_draft("DR-file", "630", "C123", "attached", "FPRIVATE");
+        let mut looped = fake_api();
+        looped.draft_info = RawDraftResponse {
+            draft: target.clone(),
+        };
+        looped.draft_pages = Mutex::new(VecDeque::from([
+            RawDraftsPage {
+                drafts: vec![target.clone()],
+                has_more: true,
+                ..RawDraftsPage::default()
+            },
+            RawDraftsPage {
+                drafts: vec![raw_draft("DR-loop", "630", "C123", "loop")],
+                has_more: true,
+                ..RawDraftsPage::default()
+            },
+        ]));
+        let loop_calls = looped.draft_calls.clone();
+        let looped = service(looped).get_draft("DR-file").await.unwrap();
+        assert!(!looped.is_supported);
+        assert_eq!(
+            loop_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::List { .. }))
+                .count(),
+            2
+        );
+
+        let mut capped = fake_api();
+        capped.draft_info = RawDraftResponse {
+            draft: target.clone(),
+        };
+        capped.draft_pages = Mutex::new(
+            (0..MAX_DRAFT_OWNERSHIP_SCAN_PAGES)
+                .map(|index| RawDraftsPage {
+                    drafts: vec![if index == 0 {
+                        target.clone()
+                    } else {
+                        raw_draft(
+                            &format!("DR-cap-{index}"),
+                            &format!("{}", 630 + index),
+                            "C123",
+                            "cap",
+                        )
+                    }],
+                    has_more: true,
+                    ..RawDraftsPage::default()
+                })
+                .collect::<VecDeque<_>>(),
+        );
+        let cap_calls = capped.draft_calls.clone();
+        let capped = service(capped).get_draft("DR-file").await.unwrap();
+        assert!(!capped.is_supported);
+        assert_eq!(
+            capped.file_association,
+            Some(FileDraftAssociation::Unverified)
+        );
+        assert_eq!(
+            cap_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::List { .. }))
+                .count(),
+            MAX_DRAFT_OWNERSHIP_SCAN_PAGES
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_one_file_draft_only_after_private_cross_process_proof() {
+        let fixture = UploadFixture::new(b"synthetic");
+        let mut api = fake_api();
+        let mut draft = raw_file_draft("DR-created-file", "700", "C123", "body", "FUPLOAD");
+        draft.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        draft.blocks = Some(render_markdown("**body**").unwrap().blocks);
+        draft.blocks.as_mut().unwrap()[0]["block_id"] = json!("B1234");
+        api.draft_create = RawDraftResponse {
+            draft: draft.clone(),
+        };
+        api.drafts_page = active_drafts(vec![draft.clone()]);
+        api.draft_info = RawDraftResponse { draft };
+        let initial_file = private_draft_file("FUPLOAD");
+        let mut enriched_file = initial_file.clone();
+        enriched_file.title = Some("Asynchronously enriched title".into());
+        enriched_file.mimetype = Some("text/plain".into());
+        enriched_file.timestamp = Some(1_700_000_000);
+        enriched_file.url_private = Some("https://files.slack.com/files-pri/synthetic".into());
+        api.file_responses = Mutex::new(VecDeque::from([
+            RawFileResponse { file: initial_file },
+            RawFileResponse {
+                file: enriched_file,
+            },
+        ]));
+        let upload_calls = api.upload_calls.clone();
+        let draft_calls = api.draft_calls.clone();
+        let service = service(api);
+
+        let report = service
+            .create_file_draft(
+                FileDraftCreateRequest {
+                    conversation: "C123",
+                    thread_ts: None,
+                    broadcast: false,
+                    markdown: "**body**",
+                    title: None,
+                    alt_text: Some("Synthetic test file"),
+                    confirmed: true,
+                },
+                fixture.source(),
+            )
+            .await
+            .unwrap();
+        let FileDraftCreateReport::Created {
+            draft,
+            file,
+            reconciled,
+        } = report
+        else {
+            panic!("expected a proved file draft");
+        };
+        assert_eq!(draft.id, "DR-created-file");
+        assert_eq!(draft.file_association, Some(FileDraftAssociation::Verified));
+        assert_eq!(file.id, "FUPLOAD");
+        assert_eq!(file.title.as_deref(), Some("Asynchronously enriched title"));
+        assert_eq!(file.mimetype.as_deref(), Some("text/plain"));
+        assert!(!reconciled);
+        assert_eq!(
+            upload_calls.lock().unwrap().as_slice(),
+            ["allocate", "transfer", "complete"]
+        );
+        let calls = draft_calls.lock().unwrap();
+        assert!(matches!(
+            &calls[0],
+            DraftCall::Create { file_ids, .. } if file_ids == &["FUPLOAD"]
+        ));
+        assert!(matches!(&calls[1], DraftCall::List { .. }));
+        assert!(matches!(&calls[2], DraftCall::Info { .. }));
+    }
+
+    #[tokio::test]
+    async fn file_draft_creation_reports_every_recoverable_pre_draft_stage() {
+        let fixture = UploadFixture::new(b"synthetic");
+
+        let mut allocation_uncertain = fake_api();
+        allocation_uncertain.upload_allocation_error = Some("timeout");
+        assert!(matches!(
+            create_file_draft_report(allocation_uncertain, &fixture).await,
+            FileDraftCreateReport::AllocationUncertain
+        ));
+
+        let mut allocated = fake_api();
+        allocated.upload_allocation.upload_url = None;
+        assert!(matches!(
+            create_file_draft_report(allocated, &fixture).await,
+            FileDraftCreateReport::Allocated { file_id } if file_id == "FUPLOAD"
+        ));
+
+        let mut source_changed = fake_api();
+        source_changed.upload_mutate_pass = true;
+        assert!(matches!(
+            create_file_draft_report(source_changed, &fixture).await,
+            FileDraftCreateReport::SourceChanged { file_id } if file_id == "FUPLOAD"
+        ));
+
+        let mut transfer_uncertain = fake_api();
+        transfer_uncertain.upload_transfer_error = true;
+        assert!(matches!(
+            create_file_draft_report(transfer_uncertain, &fixture).await,
+            FileDraftCreateReport::TransferUncertain { file_id } if file_id == "FUPLOAD"
+        ));
+
+        let mut completion_uncertain = fake_api();
+        completion_uncertain.upload_completion_error = true;
+        assert!(matches!(
+            create_file_draft_report(completion_uncertain, &fixture).await,
+            FileDraftCreateReport::FileCompletionUncertain { file_id }
+                if file_id == "FUPLOAD"
+        ));
+
+        let mut draft_rejected = fake_api();
+        draft_rejected.file_response = RawFileResponse {
+            file: private_draft_file("FUPLOAD"),
+        };
+        draft_rejected.draft_create_error = Some("restricted_action");
+        let calls = draft_rejected.draft_calls.clone();
+        let report = create_file_draft_report(draft_rejected, &fixture).await;
+        assert!(matches!(
+            report,
+            FileDraftCreateReport::DraftNotCreated { file_id, reason }
+                if file_id == "FUPLOAD" && reason.contains("restricted_action")
+        ));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Create { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn file_draft_creation_requires_exact_requested_blocks() {
+        let fixture = UploadFixture::new(b"synthetic");
+        let mut api = fake_api();
+        let mut response = raw_file_draft("DR-created-file", "710", "C123", "body", "FUPLOAD");
+        response.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        response.blocks = Some(render_markdown("**body**").unwrap().blocks);
+        api.draft_create = RawDraftResponse {
+            draft: response.clone(),
+        };
+        let mut wrong = response;
+        wrong.blocks = Some(render_markdown("different").unwrap().blocks);
+        api.drafts_page = active_drafts(vec![wrong.clone()]);
+        api.draft_info = RawDraftResponse { draft: wrong };
+        api.file_response = RawFileResponse {
+            file: private_draft_file("FUPLOAD"),
+        };
+        let calls = api.draft_calls.clone();
+
+        let report = service(api)
+            .create_file_draft(
+                FileDraftCreateRequest {
+                    conversation: "C123",
+                    thread_ts: None,
+                    broadcast: false,
+                    markdown: "**body**",
+                    title: None,
+                    alt_text: Some("Synthetic test file"),
+                    confirmed: true,
+                },
+                fixture.source(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            report,
+            FileDraftCreateReport::DraftCreationUncertain {
+                file_id,
+                client_msg_id: _
+            } if file_id == "FUPLOAD"
+        ));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Create { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_file_draft_creation_reconciles_exact_state_or_stays_uncertain() {
+        let fixture = UploadFixture::new(b"synthetic");
+        let mut exact_api = fake_api();
+        let mut exact = raw_file_draft("DR-created-file", "720", "C123", "body", "FUPLOAD");
+        exact.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        exact.blocks = Some(render_markdown("**body**").unwrap().blocks);
+        exact_api.draft_create_error = Some("timeout");
+        exact_api.drafts_page = active_drafts(vec![exact.clone()]);
+        exact_api.draft_info = RawDraftResponse { draft: exact };
+        exact_api.file_response = RawFileResponse {
+            file: private_draft_file("FUPLOAD"),
+        };
+        let exact_calls = exact_api.draft_calls.clone();
+        let report = service(exact_api)
+            .create_file_draft(
+                FileDraftCreateRequest {
+                    conversation: "C123",
+                    thread_ts: None,
+                    broadcast: false,
+                    markdown: "**body**",
+                    title: None,
+                    alt_text: Some("Synthetic test file"),
+                    confirmed: true,
+                },
+                fixture.source(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            report,
+            FileDraftCreateReport::Created {
+                reconciled: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            exact_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Create { .. }))
+                .count(),
+            1
+        );
+
+        let mut absent_api = fake_api();
+        absent_api.draft_create_error = Some("timeout");
+        absent_api.drafts_page = active_drafts(vec![]);
+        absent_api.file_response = RawFileResponse {
+            file: private_draft_file("FUPLOAD"),
+        };
+        let absent_calls = absent_api.draft_calls.clone();
+        let report = service(absent_api)
+            .create_file_draft(
+                FileDraftCreateRequest {
+                    conversation: "C123",
+                    thread_ts: None,
+                    broadcast: false,
+                    markdown: "**body**",
+                    title: None,
+                    alt_text: Some("Synthetic test file"),
+                    confirmed: true,
+                },
+                fixture.source(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            report,
+            FileDraftCreateReport::DraftCreationUncertain {
+                file_id,
+                client_msg_id: _
+            } if file_id == "FUPLOAD"
+        ));
+        assert_eq!(
+            absent_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Create { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn updates_one_file_draft_with_the_exact_file_and_reproves_state() {
+        let current = raw_file_draft("DR-file", "800", "C123", "old", "FPRIVATE");
+        let mut updated = raw_file_draft("DR-file", "801", "C123", "replacement", "FPRIVATE");
+        updated.blocks = Some(render_markdown("replacement").unwrap().blocks);
+        updated.blocks.as_mut().unwrap()[0]["block_id"] = json!("B1234");
+        let mut api = fake_api();
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: current.clone(),
+            },
+            RawDraftResponse {
+                draft: current.clone(),
+            },
+            RawDraftResponse {
+                draft: updated.clone(),
+            },
+            RawDraftResponse {
+                draft: updated.clone(),
+            },
+            RawDraftResponse {
+                draft: updated.clone(),
+            },
+        ]));
+        api.draft_pages = Mutex::new(VecDeque::from([
+            active_drafts(vec![current.clone()]),
+            active_drafts(vec![current]),
+            active_drafts(vec![updated.clone()]),
+        ]));
+        let mut transient = updated;
+        transient.blocks = Some(render_markdown("transient").unwrap().blocks);
+        transient
+            .extra
+            .insert("client_last_updated_ts".into(), json!("synthetic"));
+        api.draft_update = RawDraftResponse { draft: transient };
+        api.file_response = RawFileResponse {
+            file: private_draft_file("FPRIVATE"),
+        };
+        let calls = api.draft_calls.clone();
+        let mut service = service(api);
+        service.draft_reconciliation_delays_ms = &[0, 0];
+
+        let updated = service
+            .update_draft("DR-file", "replacement")
+            .await
+            .unwrap();
+        assert!(updated.is_supported);
+        assert_eq!(
+            updated.file_association,
+            Some(FileDraftAssociation::Verified)
+        );
+        assert!(calls.lock().unwrap().iter().any(|call| {
+            matches!(
+                call,
+                DraftCall::Update { file_ids, .. } if file_ids == &["FPRIVATE"]
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_one_file_draft_update_is_not_retried() {
+        let current = raw_file_draft("DR-file", "810", "C123", "old", "FPRIVATE");
+        let mut api = fake_api();
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: current.clone(),
+            },
+            RawDraftResponse {
+                draft: current.clone(),
+            },
+        ]));
+        api.drafts_page = active_drafts(vec![current]);
+        api.file_response = RawFileResponse {
+            file: private_draft_file("FPRIVATE"),
+        };
+        api.draft_update_error = Some("timeout");
+        let calls = api.draft_calls.clone();
+
+        assert!(matches!(
+            service(api).update_draft("DR-file", "replacement").await,
+            Err(Error::DraftMutationUncertain {
+                action: "update",
+                ..
+            })
+        ));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Update { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deletes_only_a_proved_draft_owned_file_and_reconciles_ambiguity() {
+        for (ambiguous, terminal_code) in [
+            (false, "file_not_found"),
+            (false, "file_deleted"),
+            (true, "file_not_found"),
+            (true, "file_deleted"),
+        ] {
+            let draft = raw_file_draft("DR-file", "900", "C123", "delete", "FPRIVATE");
+            let mut api = fake_api();
+            api.draft_infos = Mutex::new(VecDeque::from([
+                RawDraftResponse {
+                    draft: draft.clone(),
+                },
+                RawDraftResponse {
+                    draft: draft.clone(),
+                },
+            ]));
+            api.draft_pages = Mutex::new(VecDeque::from([
+                active_drafts(vec![draft]),
+                active_drafts(vec![]),
+            ]));
+            api.file_info_results = Mutex::new(VecDeque::from([
+                Ok(RawFileResponse {
+                    file: private_draft_file("FPRIVATE"),
+                }),
+                Err(Error::SlackApi {
+                    method: "files.info",
+                    code: terminal_code.into(),
+                }),
+            ]));
+            api.draft_delete_ambiguous = ambiguous;
+            let calls = api.draft_calls.clone();
+            let service = service(api);
+
+            let report = service.delete_draft("DR-file", true).await.unwrap();
+            assert_eq!(report.file_id.as_deref(), Some("FPRIVATE"));
+            assert_eq!(report.file_deleted, Some(true));
+            assert_eq!(
+                calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                    .count(),
+                1
+            );
+            assert!(calls.lock().unwrap().iter().any(|call| {
+                matches!(
+                    call,
+                    DraftCall::Delete {
+                        skip_file_deletion: false,
+                        ..
+                    }
+                )
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_one_file_draft_delete_is_bounded_and_not_retried() {
+        let draft = raw_file_draft("DR-file", "910", "C123", "delete", "FPRIVATE");
+        let mut api = fake_api();
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+        ]));
+        api.draft_pages = Mutex::new(
+            std::iter::repeat_with(|| active_drafts(vec![draft.clone()]))
+                .take(7)
+                .collect::<VecDeque<_>>(),
+        );
+        api.file_response = RawFileResponse {
+            file: private_draft_file("FPRIVATE"),
+        };
+        api.draft_delete_ambiguous = true;
+        let calls = api.draft_calls.clone();
+        let mut service = service(api);
+        service.draft_reconciliation_delays_ms = &[0, 0, 0, 0, 0, 0];
+
+        assert!(matches!(
+            service.delete_draft("DR-file", true).await,
+            Err(Error::DraftMutationUncertain {
+                action: "delete",
+                ..
+            })
+        ));
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DraftCall::List { .. }))
+                .count(),
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn publishes_one_file_draft_once_then_preserves_file_during_cleanup() {
+        let mut draft = raw_file_draft("DR-file", "1000", "D123", "publish", "FPRIVATE");
+        draft.blocks.as_mut().unwrap()[0]["block_id"] = json!("server-block-id");
+        let blocks = draft.blocks.clone();
+        let mut api = fake_api();
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+        ]));
+        api.drafts_page = active_drafts(vec![draft]);
+        api.file_info_results = Mutex::new(VecDeque::from([
+            Ok(RawFileResponse {
+                file: private_draft_file("FPRIVATE"),
+            }),
+            Ok(RawFileResponse {
+                file: published_dm_file("FPRIVATE", "7000.000001"),
+            }),
+        ]));
+        api.message_list.messages.insert(
+            "published".into(),
+            RawMessage {
+                ts: "7000.000001".into(),
+                text: "publish".into(),
+                blocks,
+                files: vec![RawFile {
+                    id: "FPRIVATE".into(),
+                    ..RawFile::default()
+                }],
+                ..RawMessage::default()
+            },
+        );
+        let file_share_calls = api.file_share_calls.clone();
+        let post_calls = api.post_calls.clone();
+        let draft_calls = api.draft_calls.clone();
+        let service = service(api);
+
+        let report = service.send_draft("DR-file", true).await.unwrap();
+        assert!(report.draft_deleted);
+        let shares = file_share_calls.lock().unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].channel, "D123");
+        assert_eq!(shares[0].thread_ts, None);
+        assert!(!shares[0].broadcast);
+        assert_eq!(shares[0].draft_id, "DR-file");
+        assert_eq!(shares[0].file_id, "FPRIVATE");
+        assert_eq!(shares[0].blocks[0]["type"], "rich_text");
+        assert!(shares[0].blocks[0].get("block_id").is_none());
+        assert_eq!(
+            Uuid::parse_str(&shares[0].client_msg_id)
+                .unwrap()
+                .get_version_num(),
+            4
+        );
+        assert!(post_calls.lock().unwrap().is_empty());
+        assert!(draft_calls.lock().unwrap().iter().any(|call| {
+            matches!(
+                call,
+                DraftCall::Delete {
+                    skip_file_deletion: true,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn one_file_draft_publication_requires_exact_readback_before_cleanup() {
+        let draft = raw_file_draft("DR-file", "1010", "D123", "publish", "FPRIVATE");
+        let mut api = fake_api();
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+        ]));
+        api.drafts_page = active_drafts(vec![draft]);
+        api.file_info_results = Mutex::new(VecDeque::from([
+            Ok(RawFileResponse {
+                file: private_draft_file("FPRIVATE"),
+            }),
+            Ok(RawFileResponse {
+                file: published_dm_file("FPRIVATE", "7000.000001"),
+            }),
+        ]));
+        api.message_list.messages.insert(
+            "published".into(),
+            RawMessage {
+                ts: "7000.000001".into(),
+                text: "wrong content".into(),
+                blocks: Some(vec![json!({
+                    "type": "rich_text",
+                    "elements": [{
+                        "type": "rich_text_section",
+                        "elements": [{"type": "text", "text": "wrong content"}]
+                    }]
+                })]),
+                files: vec![RawFile {
+                    id: "FPRIVATE".into(),
+                    ..RawFile::default()
+                }],
+                ..RawMessage::default()
+            },
+        );
+        let file_share_calls = api.file_share_calls.clone();
+        let draft_calls = api.draft_calls.clone();
+        let mut service = service(api);
+        service.draft_reconciliation_delays_ms = &[0, 0, 0, 0, 0, 0];
+
+        assert!(matches!(
+            service.send_draft("DR-file", true).await,
+            Err(Error::PublicationUncertain { .. })
+        ));
+        assert_eq!(file_share_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            draft_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_file_share_reconciles_once_and_accepts_atomic_draft_removal() {
+        let draft = raw_file_draft("DR-file", "1020", "D123", "publish", "FPRIVATE");
+        let blocks = draft.blocks.clone();
+        let mut api = fake_api();
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+        ]));
+        api.draft_pages = Mutex::new(VecDeque::from([
+            active_drafts(vec![draft]),
+            active_drafts(vec![]),
+        ]));
+        api.file_info_results = Mutex::new(VecDeque::from([
+            Ok(RawFileResponse {
+                file: private_draft_file("FPRIVATE"),
+            }),
+            Ok(RawFileResponse {
+                file: published_dm_file_without_share("FPRIVATE"),
+            }),
+        ]));
+        let published = RawMessage {
+            ts: "7000.000001".into(),
+            text: "publish".into(),
+            blocks,
+            files: vec![RawFile {
+                id: "FPRIVATE".into(),
+                ..RawFile::default()
+            }],
+            ..RawMessage::default()
+        };
+        api.history.messages = vec![published.clone()];
+        api.message_list
+            .messages
+            .insert("published".into(), published);
+        api.file_share_error = Some("internal_error".into());
+        let file_share_calls = api.file_share_calls.clone();
+        let post_calls = api.post_calls.clone();
+        let draft_calls = api.draft_calls.clone();
+        let history_calls = api.history_calls.clone();
+
+        let report = service(api).send_draft("DR-file", true).await.unwrap();
+        assert!(report.draft_deleted);
+        assert!(report.cleanup_warning.is_none());
+        assert_eq!(file_share_calls.lock().unwrap().len(), 1);
+        assert!(post_calls.lock().unwrap().is_empty());
+        assert_eq!(history_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            draft_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn file_draft_publication_accepts_a_self_threaded_channel_root() {
+        let draft = raw_file_draft("DR-file", "1021", "C123", "publish", "FPRIVATE");
+        let blocks = draft.blocks.clone();
+        let mut api = fake_api();
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+        ]));
+        api.draft_pages = Mutex::new(VecDeque::from([
+            active_drafts(vec![draft]),
+            active_drafts(vec![]),
+        ]));
+        api.file_info_results = Mutex::new(VecDeque::from([
+            Ok(RawFileResponse {
+                file: private_draft_file("FPRIVATE"),
+            }),
+            Ok(RawFileResponse {
+                file: published_channel_file("FPRIVATE", "7001.000001", Some("7001.000001")),
+            }),
+        ]));
+        api.message_list.messages.insert(
+            "published".into(),
+            RawMessage {
+                ts: "7001.000001".into(),
+                thread_ts: Some("7001.000001".into()),
+                text: "publish".into(),
+                blocks,
+                files: vec![RawFile {
+                    id: "FPRIVATE".into(),
+                    ..RawFile::default()
+                }],
+                ..RawMessage::default()
+            },
+        );
+        let file_share_calls = api.file_share_calls.clone();
+        let draft_calls = api.draft_calls.clone();
+
+        let report = service(api).send_draft("DR-file", true).await.unwrap();
+        assert!(report.draft_deleted);
+        assert!(report.cleanup_warning.is_none());
+        assert_eq!(
+            report.sent.message.thread_ts.as_deref(),
+            Some("7001.000001")
+        );
+        assert_eq!(file_share_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            draft_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn definitive_file_share_rejection_does_not_delete_or_fallback_post() {
+        let draft = raw_file_draft("DR-file", "1030", "D123", "publish", "FPRIVATE");
+        let mut api = fake_api();
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+        ]));
+        api.drafts_page = active_drafts(vec![draft]);
+        api.file_response = RawFileResponse {
+            file: private_draft_file("FPRIVATE"),
+        };
+        api.file_share_error = Some("restricted_action".into());
+        let file_share_calls = api.file_share_calls.clone();
+        let post_calls = api.post_calls.clone();
+        let draft_calls = api.draft_calls.clone();
+
+        assert!(matches!(
+            service(api).send_draft("DR-file", true).await,
+            Err(Error::SlackApi {
+                method: "files.share",
+                code
+            }) if code == "restricted_action"
+        ));
+        assert_eq!(file_share_calls.lock().unwrap().len(), 1);
+        assert!(post_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            draft_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            0
         );
     }
 
@@ -4353,14 +6452,17 @@ mod tests {
 
     #[tokio::test]
     async fn send_draft_reports_post_success_cleanup_failure_without_reposting() {
+        let draft = raw_draft("DR-send", "8000.5", "C123", "draft body");
         let mut api = fake_api();
         api.draft_info = RawDraftResponse {
-            draft: raw_draft("DR-send", "8000.5", "C123", "draft body"),
+            draft: draft.clone(),
         };
+        api.drafts_page = active_drafts(vec![draft]);
         api.draft_delete_error = true;
         let draft_calls = api.draft_calls.clone();
         let post_calls = api.post_calls.clone();
-        let service = service(api);
+        let mut service = service(api);
+        service.draft_reconciliation_delays_ms = &[0, 0, 0, 0, 0, 0];
 
         assert!(matches!(
             service.send_draft("DR-send", false).await,
@@ -4376,17 +6478,88 @@ mod tests {
         assert_eq!(warning.last_updated_ts, "8000.5");
         assert!(warning.reason.contains("draft_conflict"));
         assert_eq!(post_calls.lock().unwrap().len(), 1);
+        let calls = draft_calls.lock().unwrap();
         assert_eq!(
-            draft_calls.lock().unwrap().as_slice(),
-            [
+            &calls[..2],
+            &[
                 DraftCall::Info {
                     draft_id: "DR-send".into()
                 },
                 DraftCall::Delete {
                     draft_id: "DR-send".into(),
-                    last_updated_ts: "8000500".into()
+                    last_updated_ts: "8000500".into(),
+                    skip_file_deletion: false,
                 }
             ]
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DraftCall::List { .. }))
+                .count(),
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn send_draft_reconciles_ambiguous_cleanup_without_reposting() {
+        let mut absent = fake_api();
+        absent.draft_info = RawDraftResponse {
+            draft: raw_draft("DR-send", "8050", "C123", "draft body"),
+        };
+        absent.draft_delete_ambiguous = true;
+        absent.drafts_page = active_drafts(vec![]);
+        let absent_posts = absent.post_calls.clone();
+        let absent_calls = absent.draft_calls.clone();
+        let report = service(absent).send_draft("DR-send", true).await.unwrap();
+        assert!(report.draft_deleted);
+        assert!(report.cleanup_warning.is_none());
+        assert_eq!(absent_posts.lock().unwrap().len(), 1);
+        assert_eq!(
+            absent_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            1
+        );
+
+        let draft = raw_draft("DR-send", "8051", "C123", "draft body");
+        let mut unresolved = fake_api();
+        unresolved.draft_info = RawDraftResponse {
+            draft: draft.clone(),
+        };
+        unresolved.drafts_page = active_drafts(vec![draft]);
+        unresolved.draft_delete_ambiguous = true;
+        let unresolved_posts = unresolved.post_calls.clone();
+        let unresolved_calls = unresolved.draft_calls.clone();
+        let mut service = service(unresolved);
+        service.draft_reconciliation_delays_ms = &[0, 0, 0, 0, 0, 0];
+        let report = service.send_draft("DR-send", true).await.unwrap();
+        assert!(!report.draft_deleted);
+        assert!(
+            report
+                .cleanup_warning
+                .expect("cleanup warning")
+                .reason
+                .contains("outcome is unknown")
+        );
+        assert_eq!(unresolved_posts.lock().unwrap().len(), 1);
+        let calls = unresolved_calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DraftCall::List { .. }))
+                .count(),
+            6
         );
     }
 
@@ -6574,10 +8747,13 @@ mod tests {
     }
 
     #[test]
-    fn upload_reconciliation_schedule_is_bounded() {
+    fn upload_and_draft_reconciliation_schedules_are_bounded() {
         assert_eq!(UPLOAD_RECONCILIATION_DELAYS_MS.len(), 6);
         assert_eq!(UPLOAD_RECONCILIATION_DELAYS_MS.iter().sum::<u64>(), 3_850);
         assert_eq!(UPLOAD_RECONCILIATION_DELAYS_MS.first(), Some(&0));
+        assert_eq!(DRAFT_RECONCILIATION_DELAYS_MS.len(), 6);
+        assert_eq!(DRAFT_RECONCILIATION_DELAYS_MS.iter().sum::<u64>(), 7_750);
+        assert_eq!(DRAFT_RECONCILIATION_DELAYS_MS.first(), Some(&0));
     }
 
     #[tokio::test]

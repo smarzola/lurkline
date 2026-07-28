@@ -164,7 +164,15 @@ fn version_and_help_expose_the_complete_cli_without_configuration() {
     assert!(find.contains("from 1 through 100"));
 
     let drafts = stdout(&["drafts", "--help"]);
-    for command in ["list", "get", "create", "update", "delete", "send"] {
+    for command in [
+        "list",
+        "get",
+        "create",
+        "create-file",
+        "update",
+        "delete",
+        "send",
+    ] {
         assert!(drafts.contains(command), "draft help omitted {command}");
     }
     let draft_create = stdout(&["drafts", "create", "--help"]);
@@ -175,6 +183,23 @@ fn version_and_help_expose_the_complete_cli_without_configuration() {
         );
     }
     assert!(draft_create.contains("standard input"));
+    let draft_create_file = stdout(&["drafts", "create-file", "--help"]);
+    for option in [
+        "--path",
+        "--thread-ts",
+        "--broadcast",
+        "--title",
+        "--alt-text",
+        "--max-bytes",
+        "--confirm",
+        "--json",
+    ] {
+        assert!(
+            draft_create_file.contains(option),
+            "draft create-file help omitted {option}"
+        );
+    }
+    assert!(draft_create_file.contains("standard input"));
     let draft_delete = stdout(&["drafts", "delete", "--help"]);
     assert!(draft_delete.contains("--confirm"));
 
@@ -229,6 +254,42 @@ fn authoring_help_exposes_confirmed_root_reply_and_draft_publication() {
     let draft = stdout(&["drafts", "send", "--help"]);
     assert!(draft.contains("--confirm"));
     assert!(draft.contains("--json"));
+}
+
+#[test]
+fn file_draft_creation_requires_confirmation_before_stdin_or_file_io() {
+    let output = run_with_credentials(&[
+        "drafts",
+        "create-file",
+        "C123",
+        "--path",
+        "/definitely/missing/lurkline-file-draft.txt",
+    ]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: confirmation is required for file draft creation\n"
+    );
+}
+
+#[test]
+fn file_draft_creation_rejects_root_broadcast_before_stdin_or_file_io() {
+    let output = run_with_credentials(&[
+        "drafts",
+        "create-file",
+        "C123",
+        "--path",
+        "/definitely/missing/lurkline-file-draft.txt",
+        "--broadcast",
+        "--confirm",
+    ]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: invalid broadcast: is valid only for a thread reply\n"
+    );
 }
 
 #[test]
