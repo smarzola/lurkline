@@ -15,14 +15,14 @@ Use Lurkline to:
 - Upload one local regular file to a conversation root or thread.
 - Add or remove confirmed emoji reactions idempotently.
 - Render bounded Markdown as Slack `rich_text`.
-- Create, update, inspect, delete, and publish Slack drafts.
+- Create, update, inspect, delete, and publish text or one-file Slack drafts.
 - Send confirmed root messages and thread replies.
 
-Lurkline reads by default. CLI publication, deletion, reaction, and file-upload
-mutations require `--confirm`.
+Lurkline reads by default. CLI publication, deletion, reaction, file-upload,
+and file-draft creation mutations require `--confirm`.
 The MCP server rejects every write unless you start it with
-`--allow-write`; publication, deletion, reactions, and file uploads then also
-require `confirm: true`.
+`--allow-write`; publication, deletion, reactions, file uploads, and file-draft
+creation then also require `confirm: true`.
 
 > [!WARNING]
 > Slack's browser-session APIs are unsupported and can change without notice.
@@ -70,13 +70,15 @@ history. Don't save it in a file, shell history, issue, or chat.
 The following safeguards apply to Slack writes:
 
 - `drafts create` and `drafts update` are explicit CLI write commands.
+- `drafts create-file` requires `--confirm` before Lurkline reads standard input
+  or opens the local file.
 - `drafts delete`, `drafts send`, `message send`, `thread reply`, and reaction
   add/remove require `--confirm`.
 - `files upload` requires `--confirm`.
 - MCP draft mutations and publications require the server's `--allow-write`
   option.
-- MCP deletion, publication, reaction, and file-upload mutations also require
-  `confirm: true` in each tool call.
+- MCP deletion, publication, reaction, file-upload, and file-draft creation
+  mutations also require `confirm: true` in each tool call.
 - Every message publication uses a fresh UUID v4 client message ID.
 - Draft publication posts first and deletes the draft only after Slack returns
   a valid acknowledgement.
@@ -84,6 +86,8 @@ The following safeguards apply to Slack writes:
   and a cleanup warning instead of reporting a failed send.
 - If the post outcome is unknown, Lurkline returns `publication_uncertain`, the
   client message ID, and instructions not to retry automatically.
+- File-draft updates and deletions preserve or delete only the exact file that
+  a complete Slack-state scan proves belongs exclusively to that draft.
 
 Lurkline doesn't ask for confirmation when it reads, renders Markdown locally,
 or lists and inspects drafts.
@@ -106,9 +110,9 @@ For example, run the following commands to verify and install the macOS ARM64
 archive:
 
 ```sh
-shasum -a 256 -c lurkline-v0.7.0-macos-aarch64.tar.gz.sha256
-tar -xzf lurkline-v0.7.0-macos-aarch64.tar.gz
-sudo install lurkline-v0.7.0-macos-aarch64/lurkline /usr/local/bin/lurkline
+shasum -a 256 -c lurkline-v0.8.0-macos-aarch64.tar.gz.sha256
+tar -xzf lurkline-v0.8.0-macos-aarch64.tar.gz
+sudo install lurkline-v0.8.0-macos-aarch64/lurkline /usr/local/bin/lurkline
 lurkline --version
 ```
 
@@ -575,7 +579,7 @@ lurkline drafts get DR123 --json
 Create a root-message draft from standard input:
 
 ```sh
-printf '%s\n' 'Review **release 0.7.0**.' \
+printf '%s\n' 'Review **release 0.8.0**.' \
   | lurkline drafts create platform
 ```
 
@@ -588,7 +592,21 @@ printf '%s\n' 'The fix is ready.' \
       --broadcast
 ```
 
-Replace a supported draft's content:
+Create a root-message draft with one private local file:
+
+```sh
+printf '%s\n' 'Review the attached **release report**.' \
+  | lurkline drafts create-file platform \
+      --path ./reports/release.txt \
+      --title 'Release report' \
+      --confirm \
+      --json
+```
+
+To create a one-file thread draft, add `--thread-ts`. You can also add
+`--broadcast` for a thread reply.
+
+Replace a supported text or one-file draft's content:
 
 ```sh
 printf '%s\n' 'Updated **draft** content.' \
@@ -610,11 +628,64 @@ lurkline drafts send DR123 --confirm --json
 Draft pagination uses private Slack timestamps. Pass the returned `next_ts` to
 `--next-ts`.
 
-Lurkline supports a draft only when it has one root or thread destination,
-Slack `rich_text` blocks, and no files, attachments, sent state, deleted state,
-or unrecognized destination fields. For DM destinations, Lurkline validates
+Text drafts are supported when they have one root or thread destination, Slack
+`rich_text` blocks, and no files, attachments, sent state, deleted state, or
+unrecognized destination fields. For DM destinations, Lurkline validates
 Slack's `user_ids` participant metadata but routes only by `channel_id`.
-Lurkline leaves unsupported drafts unchanged.
+
+A one-file draft is supported only after `drafts get` proves all of the
+following Slack state:
+
+1. A complete scan of active drafts contains the file ID exactly once.
+2. `drafts.info` exactly matches that active-draft snapshot, including its
+   route, revision, content, client message ID, workspace/user identity,
+   creation/client metadata, and single file ID. Authored rich-text content must
+   match exactly; Lurkline ignores only Slack's bounded top-level `block_id`.
+3. `files.info` explicitly reports a non-external private file with no public
+   URL, conversation membership, or shares.
+4. Slack returned complete, explicitly empty channel, private-channel, DM, and
+   share metadata. Omitted or truncated metadata isn't proof.
+
+`drafts list` doesn't perform this workspace-wide proof for every row. A
+one-file row remains unsupported with `file_association: "unverified"` until
+you fetch it with `drafts get`. A proved exact read returns
+`file_association: "verified"`. The proof scans at most 10 pages of 100 active
+drafts. Incomplete pagination, duplicate ownership, multiple files,
+attachments, unrecognized draft fields, a changed route or revision, and
+shared or public files fail closed. Lurkline leaves unsupported drafts
+unchanged.
+
+`drafts create-file` uploads and privately completes one file without a
+destination, creates one draft with that exact file ID, and then performs the
+same cross-process proof. It never retries allocation or draft creation after
+an ambiguous result. Use the returned `stage` to recover:
+
+| Stage | Meaning | Recovery |
+| --- | --- | --- |
+| `allocation_uncertain` | Slack might have allocated storage, but no safe file ID was returned. | Don't retry automatically. |
+| `allocated` | Slack returned a file ID, but Lurkline sent no bytes because the upload URL was missing or unsafe. | Keep the file ID for diagnosis. Retry only deliberately. |
+| `source_changed` | The local source changed after allocation. | Stabilize the source, then retry deliberately. |
+| `transfer_uncertain` | Slack byte acceptance can't be proven. | Inspect Slack before deciding whether to retry. |
+| `file_completion_uncertain` | Slack received the bytes, but private completion can't be proven. | Inspect the returned file ID. Don't retry automatically. |
+| `draft_not_created` | Slack definitively rejected draft creation after private file completion. | The returned file ID can identify an unshared orphan. Create another draft only deliberately. |
+| `draft_creation_uncertain` | Draft creation might have succeeded, but exact exclusive ownership can't be proven. | Inspect the returned file and client message IDs. Don't retry automatically. |
+| `created` | Complete Slack state proves the exclusive one-file draft association. | No recovery is required. |
+
+Updating a proved one-file draft sends the exact same file ID and reproves the
+new revision. An ambiguous update returns `draft_mutation_uncertain` and isn't
+retried. Deleting a proved one-file draft sends one deletion request with file
+deletion enabled and reports success only after the draft is absent and
+`files.info` reports the file as not found or deleted. An unknown deletion
+outcome also returns `draft_mutation_uncertain`.
+
+Publishing a one-file draft uses Slack's browser `files.share` contract with
+the exact draft and file IDs plus a fresh UUID v4 client message ID. Lurkline
+doesn't retry that request. It reads the exact message and file state before it
+reports success. Slack normally removes the draft atomically; if the draft
+remains after a proved publication, Lurkline issues one file-preserving cleanup
+request. If publication can't be proven, Lurkline returns
+`publication_uncertain`. A post-success cleanup failure returns the sent
+message with a warning and never reposts it.
 
 Slack's draft methods are private and more likely to change than documented
 Slack methods. Refresh Lurkline or the browser credentials if Slack changes
@@ -625,7 +696,7 @@ their contract.
 Send a root message from standard input:
 
 ```sh
-printf '%s\n' 'Release **0.7.0** is ready.' \
+printf '%s\n' 'Release **0.8.0** is ready.' \
   | lurkline message send platform --confirm --json
 ```
 
@@ -716,8 +787,9 @@ upload paths must be relative to that root. Lurkline opens the root once at
 server startup and rejects path escapes, replacements, and symbolic links.
 Downloads don't require `--allow-write` because they don't mutate Slack.
 
-Lurkline lists the upload tool only when both capabilities are configured. To
-enable uploads, configure the file root and the write gate:
+Lurkline lists the upload and one-file-draft creation tools only when both
+capabilities are configured. To enable them, configure the file root and the
+write gate:
 
 ```json
 {
@@ -741,6 +813,12 @@ Each `slack_upload_file` call must also set `confirm` to `true`. Its `path`
 field names one regular file beneath the configured root; file bytes never
 enter the MCP JSON payload.
 
+Each `slack_create_file_draft` call also requires `confirm: true`. Its
+`markdown` field contains the draft text, and its relative `path` identifies
+the single local file. Updating, deleting, or publishing an existing one-file
+draft doesn't require `--file-root` because those operations use the file
+already stored in Slack.
+
 Omit `--profile work` to use `LURKLINE_PROFILE` or the registry default. The
 MCP server and CLI resolve credentials through the same path.
 
@@ -763,7 +841,8 @@ The following table maps common tasks to CLI commands and MCP tools:
 | Add or remove a reaction | `lurkline reactions add`, `remove` | `slack_add_reaction`, `slack_remove_reaction` |
 | Find workspace users | `lurkline users find` | `slack_find_users` |
 | List or inspect drafts | `lurkline drafts list`, `get` | `slack_list_drafts`, `slack_get_draft` |
-| Create or update a draft | `lurkline drafts create`, `update` | `slack_create_draft`, `slack_update_draft` |
+| Create or update a text draft | `lurkline drafts create`, `update` | `slack_create_draft`, `slack_update_draft` |
+| Create a one-file draft | `lurkline drafts create-file` | `slack_create_file_draft` |
 | Delete a draft | `lurkline drafts delete` | `slack_delete_draft` |
 | Publish a draft | `lurkline drafts send` | `slack_send_draft` |
 | Send a root message or reply | `lurkline message send`, `thread reply` | `slack_send_message` |
@@ -781,6 +860,7 @@ The following table lists primary and auxiliary bounds:
 | --- | ---: | --- |
 | Markdown input | 40,000 bytes | Local operation |
 | Draft list | One page of 100 | No conversation discovery |
+| One-file draft proof | One file and one destination | 10 active-draft pages of 100; six bounded reads per reconciliation phase, with at most 7.75 seconds of draft-state delay |
 | Conversation list | One page of 200 | Up to 20 user pages of 200 for DMs |
 | Conversation find | 100 | 20 conversation pages and 20 user pages of 200 |
 | Message search | One page of 100 | With `--in`: 20 conversation pages; exact names can also scan 20 user pages |
@@ -828,8 +908,8 @@ The browser token and `d=` cookie carry your Slack user authority. Lurkline:
 - Rejects API redirects, validates file redirects, and bounds request input,
   response output, and streamed file bytes.
 - Keeps MCP writes disabled unless the operator passes `--allow-write`.
-- Requires per-call confirmation for publication, deletion, reaction, and
-  file-upload mutations.
+- Requires per-call confirmation for publication, deletion, reaction,
+  file-upload, and file-draft creation mutations.
 - Escapes control characters in human-readable output.
 - Keeps MCP protocol output separate from diagnostics.
 
@@ -853,11 +933,11 @@ Lurkline doesn't provide:
 - Automatic browser credential extraction or refresh.
 - Bot or OAuth authentication.
 - Credential helper protocols or external helper execution.
-- Arbitrary Block Kit, attachment authoring, files in drafts, or
+- Arbitrary Block Kit, attachment authoring, multiple files in one draft, or
   multi-destination drafts.
 - Sent-message editing or deletion.
-- Batch uploads, snippets, remote files, public file links, file deletion,
-  scheduled messages, workflows, or canvases.
+- Batch uploads, snippets, remote files, public file links, standalone file
+  deletion, scheduled messages, workflows, or canvases.
 - Conversation creation.
 - Automatic retry after an uncertain publication.
 - Local caching, unread-state persistence, or background synchronization.

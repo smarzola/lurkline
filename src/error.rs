@@ -82,6 +82,13 @@ pub enum Error {
     )]
     PublicationUncertain { client_msg_id: String },
     #[error(
+        "Slack draft {action} outcome is unknown for {draft_id}; do not retry automatically; reread the exact draft and file state before deciding what to do"
+    )]
+    DraftMutationUncertain {
+        draft_id: String,
+        action: &'static str,
+    },
+    #[error(
         "Slack reaction outcome is unknown for {channel_id} at {message_ts} ({name}); do not retry automatically; read the exact message before deciding whether to retry"
     )]
     ReactionUncertain {

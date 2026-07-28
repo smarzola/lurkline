@@ -513,6 +513,23 @@ impl SlackApi for SlackHttpClient {
         .await
     }
 
+    async fn files_complete_draft_upload(
+        &self,
+        file_id: &str,
+        title: Option<&str>,
+    ) -> Result<RawFileUploadCompletion> {
+        let file = match title {
+            Some(title) => serde_json::json!({"id": file_id, "title": title}),
+            None => serde_json::json!({"id": file_id}),
+        };
+        self.post_mutation_form(
+            "files.completeUpload",
+            "lurkline-files-draft-upload-complete",
+            &[("files", encode_json(&[file])?)],
+        )
+        .await
+    }
+
     async fn reactions_get(
         &self,
         channel: &str,
@@ -589,8 +606,9 @@ impl SlackApi for SlackHttpClient {
         client_msg_id: &str,
         destinations: &[DraftDestination],
         blocks: &[Value],
+        file_ids: &[String],
     ) -> Result<RawDraftResponse> {
-        self.post_form(
+        self.post_mutation_form(
             "drafts.create",
             "lurkline-drafts-create",
             &[
@@ -598,7 +616,7 @@ impl SlackApi for SlackHttpClient {
                 ("client_msg_id", client_msg_id.into()),
                 ("attachments", "[]".into()),
                 ("destinations", encode_json(destinations)?),
-                ("file_ids", "[]".into()),
+                ("file_ids", encode_json(file_ids)?),
                 ("is_from_composer", "true".into()),
             ],
         )
@@ -611,8 +629,9 @@ impl SlackApi for SlackHttpClient {
         last_updated_ts: &str,
         destinations: &[DraftDestination],
         blocks: &[Value],
+        file_ids: &[String],
     ) -> Result<RawDraftResponse> {
-        self.post_form(
+        self.post_mutation_form(
             "drafts.update",
             "lurkline-drafts-update",
             &[
@@ -621,7 +640,7 @@ impl SlackApi for SlackHttpClient {
                 ("attachments", "[]".into()),
                 ("destinations", encode_json(destinations)?),
                 ("draft_id", draft_id.into()),
-                ("file_ids", "[]".into()),
+                ("file_ids", encode_json(file_ids)?),
                 ("is_from_composer", "true".into()),
             ],
         )
@@ -632,14 +651,15 @@ impl SlackApi for SlackHttpClient {
         &self,
         draft_id: &str,
         last_updated_ts: &str,
+        skip_file_deletion: bool,
     ) -> Result<RawMutationResponse> {
-        self.post_form(
+        self.post_mutation_form(
             "drafts.delete",
             "lurkline-drafts-delete",
             &[
                 ("client_last_updated_ts", last_updated_ts.into()),
                 ("draft_id", draft_id.into()),
-                ("skip_file_deletion", "false".into()),
+                ("skip_file_deletion", skip_file_deletion.to_string()),
             ],
         )
         .await
@@ -647,28 +667,49 @@ impl SlackApi for SlackHttpClient {
 
     async fn chat_post_message(
         &self,
-        channel: &str,
-        thread_ts: Option<&str>,
-        broadcast: bool,
-        client_msg_id: &str,
-        text: &str,
-        blocks: &[Value],
+        request: &crate::service::ChatPostMessageRequest<'_>,
     ) -> Result<RawPostMessageResponse> {
         let mut fields = vec![
-            ("channel", channel.into()),
-            ("blocks", encode_json(blocks)?),
-            ("client_msg_id", client_msg_id.into()),
-            ("text", text.into()),
+            ("channel", request.channel.into()),
+            ("blocks", encode_json(request.blocks)?),
+            ("client_msg_id", request.client_msg_id.into()),
+            ("text", request.text.into()),
             ("include_channel_perm_error", "true".into()),
             ("skip_dlp_user_warning", "false".into()),
         ];
-        if let Some(thread_ts) = thread_ts {
+        if let Some(thread_ts) = request.thread_ts {
             fields.push(("thread_ts", thread_ts.into()));
         }
-        if broadcast {
+        if request.broadcast {
             fields.push(("reply_broadcast", "true".into()));
         }
         self.post_publication_form("chat.postMessage", "lurkline-message-send", &fields)
+            .await
+    }
+
+    async fn files_share(
+        &self,
+        request: &crate::service::FileShareRequest<'_>,
+    ) -> Result<RawMutationResponse> {
+        let mut fields = vec![
+            ("files", request.file_id.into()),
+            ("channel", request.channel.into()),
+            ("client_context_team_id", self.config.team_id.clone()),
+            ("client_msg_id", request.client_msg_id.into()),
+            ("draft_id", request.draft_id.into()),
+            ("blocks", encode_json(request.blocks)?),
+            ("unfurl", "[]".into()),
+            ("resharing_aware", "true".into()),
+            ("skip_dlp_user_warning", "false".into()),
+            ("from_share_modal", "false".into()),
+        ];
+        if let Some(thread_ts) = request.thread_ts {
+            fields.push(("thread_ts", thread_ts.into()));
+        }
+        if request.broadcast {
+            fields.push(("broadcast", "true".into()));
+        }
+        self.post_publication_form("files.share", "send_composer_message", &fields)
             .await
     }
 
@@ -1566,6 +1607,27 @@ mod tests {
             serde_json::from_str::<Value>(multipart_text_field(&body, "files").unwrap()).unwrap(),
             serde_json::json!([{"id": "F123", "title": "Quarterly report"}])
         );
+
+        let (client, capture) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"files":[{"id":"F123"}]}"#.to_vec(),
+            64 * 1024,
+        )
+        .await;
+        client
+            .files_complete_draft_upload("F123", Some("Private draft file"))
+            .await
+            .unwrap();
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/files.completeUpload");
+        assert_eq!(
+            serde_json::from_str::<Value>(multipart_text_field(&body, "files").unwrap()).unwrap(),
+            serde_json::json!([{"id": "F123", "title": "Private draft file"}])
+        );
+        for field in ["channel", "channel_id", "client_msg_id", "thread_ts"] {
+            assert_eq!(multipart_text_field(&body, field), None, "{field}");
+        }
     }
 
     #[tokio::test]
@@ -1719,6 +1781,7 @@ mod tests {
                 "00000000-0000-4000-8000-000000000001",
                 std::slice::from_ref(&destination),
                 &blocks,
+                &[],
             )
             .await
             .unwrap();
@@ -1748,7 +1811,13 @@ mod tests {
 
         let (client, capture) = server(StatusCode::OK, draft_response.to_vec(), 64 * 1024).await;
         client
-            .drafts_update("DR123", "2000", std::slice::from_ref(&destination), &blocks)
+            .drafts_update(
+                "DR123",
+                "2000",
+                std::slice::from_ref(&destination),
+                &blocks,
+                &[],
+            )
             .await
             .unwrap();
         let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
@@ -1759,21 +1828,63 @@ mod tests {
             multipart_text_field(&body, "client_last_updated_ts"),
             Some("2000")
         );
+        assert_eq!(multipart_text_field(&body, "file_ids"), Some("[]"));
 
-        let (client, capture) = server(StatusCode::OK, br#"{"ok":true}"#.to_vec(), 64 * 1024).await;
-        client.drafts_delete("DR123", "2000").await.unwrap();
-        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
-        let body = String::from_utf8_lossy(&raw_body);
-        assert_eq!(uri.path(), "/api/drafts.delete");
-        assert_eq!(multipart_text_field(&body, "draft_id"), Some("DR123"));
-        assert_eq!(
-            multipart_text_field(&body, "client_last_updated_ts"),
-            Some("2000")
-        );
-        assert_eq!(
-            multipart_text_field(&body, "skip_file_deletion"),
-            Some("false")
-        );
+        for skip_file_deletion in [false, true] {
+            let (client, capture) =
+                server(StatusCode::OK, br#"{"ok":true}"#.to_vec(), 64 * 1024).await;
+            client
+                .drafts_delete("DR123", "2000", skip_file_deletion)
+                .await
+                .unwrap();
+            let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+            let body = String::from_utf8_lossy(&raw_body);
+            assert_eq!(uri.path(), "/api/drafts.delete");
+            assert_eq!(multipart_text_field(&body, "draft_id"), Some("DR123"));
+            assert_eq!(
+                multipart_text_field(&body, "client_last_updated_ts"),
+                Some("2000")
+            );
+            assert_eq!(
+                multipart_text_field(&body, "skip_file_deletion"),
+                Some(if skip_file_deletion { "true" } else { "false" })
+            );
+        }
+
+        for method in ["create", "update"] {
+            let (client, capture) =
+                server(StatusCode::OK, draft_response.to_vec(), 64 * 1024).await;
+            let file_ids = vec!["F123".to_owned()];
+            if method == "create" {
+                client
+                    .drafts_create(
+                        "00000000-0000-4000-8000-000000000001",
+                        std::slice::from_ref(&destination),
+                        &blocks,
+                        &file_ids,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .drafts_update(
+                        "DR123",
+                        "2000",
+                        std::slice::from_ref(&destination),
+                        &blocks,
+                        &file_ids,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let (_, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+            let body = String::from_utf8_lossy(&raw_body);
+            assert_eq!(
+                serde_json::from_str::<Value>(multipart_text_field(&body, "file_ids").unwrap())
+                    .unwrap(),
+                serde_json::json!(["F123"])
+            );
+        }
     }
 
     #[tokio::test]
@@ -1804,14 +1915,14 @@ mod tests {
             .into_bytes();
             let (client, capture) = server(StatusCode::OK, response, 64 * 1024).await;
             client
-                .chat_post_message(
-                    "C123",
+                .chat_post_message(&crate::service::ChatPostMessageRequest {
+                    channel: "C123",
                     thread_ts,
                     broadcast,
-                    "00000000-0000-4000-8000-000000000001",
-                    "synthetic",
-                    &blocks,
-                )
+                    client_msg_id: "00000000-0000-4000-8000-000000000001",
+                    text: "synthetic",
+                    blocks: &blocks,
+                })
                 .await
                 .unwrap();
 
@@ -1842,6 +1953,70 @@ mod tests {
                     .unwrap(),
                 Value::Array(blocks.clone())
             );
+            assert_eq!(multipart_text_field(&body, "file_ids"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_browser_compatible_file_share_form() {
+        let blocks = vec![serde_json::json!({
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [{"type": "text", "text": "synthetic"}]
+            }]
+        })];
+        for (thread_ts, broadcast) in [(None, false), (Some("100.000001"), true)] {
+            let (client, capture) =
+                server(StatusCode::OK, br#"{"ok":true}"#.to_vec(), 64 * 1024).await;
+            client
+                .files_share(&crate::service::FileShareRequest {
+                    channel: "C123",
+                    thread_ts,
+                    broadcast,
+                    client_msg_id: "00000000-0000-4000-8000-000000000001",
+                    draft_id: "DR123",
+                    blocks: &blocks,
+                    file_id: "F123",
+                })
+                .await
+                .unwrap();
+            let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+            let body = String::from_utf8_lossy(&raw_body);
+            assert_eq!(uri.path(), "/api/files.share");
+            assert_eq!(multipart_text_field(&body, "files"), Some("F123"));
+            assert_eq!(multipart_text_field(&body, "channel"), Some("C123"));
+            assert_eq!(
+                multipart_text_field(&body, "client_context_team_id"),
+                Some("T000TEST")
+            );
+            assert_eq!(multipart_text_field(&body, "draft_id"), Some("DR123"));
+            assert_eq!(
+                multipart_text_field(&body, "client_msg_id"),
+                Some("00000000-0000-4000-8000-000000000001")
+            );
+            assert_eq!(multipart_text_field(&body, "thread_ts"), thread_ts);
+            assert_eq!(
+                multipart_text_field(&body, "broadcast"),
+                broadcast.then_some("true")
+            );
+            assert_eq!(multipart_text_field(&body, "unfurl"), Some("[]"));
+            assert_eq!(multipart_text_field(&body, "resharing_aware"), Some("true"));
+            assert_eq!(
+                multipart_text_field(&body, "skip_dlp_user_warning"),
+                Some("false")
+            );
+            assert_eq!(
+                multipart_text_field(&body, "from_share_modal"),
+                Some("false")
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(multipart_text_field(&body, "blocks").unwrap())
+                    .unwrap(),
+                Value::Array(blocks.clone())
+            );
+            assert_eq!(multipart_text_field(&body, "text"), None);
+            assert_eq!(multipart_text_field(&body, "file_ids"), None);
         }
     }
 
@@ -1853,15 +2028,16 @@ mod tests {
             64 * 1024,
         )
         .await;
+        let blocks = vec![serde_json::json!({"type": "rich_text", "elements": []})];
         let error = client
-            .chat_post_message(
-                "C123",
-                None,
-                false,
-                "00000000-0000-4000-8000-000000000001",
-                "synthetic",
-                &[serde_json::json!({"type": "rich_text", "elements": []})],
-            )
+            .chat_post_message(&crate::service::ChatPostMessageRequest {
+                channel: "C123",
+                thread_ts: None,
+                broadcast: false,
+                client_msg_id: "00000000-0000-4000-8000-000000000001",
+                text: "synthetic",
+                blocks: &blocks,
+            })
             .await
             .unwrap_err();
         assert!(matches!(

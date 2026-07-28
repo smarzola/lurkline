@@ -601,6 +601,48 @@ async fn raw_json_rpc_exposes_and_guards_enabled_file_uploads() {
     assert_eq!(upload["annotations"]["destructiveHint"], false);
     assert_eq!(upload["annotations"]["idempotentHint"], false);
     assert_eq!(upload["annotations"]["openWorldHint"], true);
+    let create_file_draft = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "slack_create_file_draft")
+        .expect("enabled file-draft tool");
+    for property in [
+        "conversation",
+        "path",
+        "thread_ts",
+        "broadcast",
+        "markdown",
+        "title",
+        "alt_text",
+        "max_bytes",
+        "confirm",
+    ] {
+        assert!(
+            create_file_draft["inputSchema"]["properties"][property].is_object(),
+            "missing file-draft input property {property}"
+        );
+    }
+    let output_schema = serde_json::to_string(&create_file_draft["outputSchema"]).unwrap();
+    for stage in [
+        "allocation_uncertain",
+        "file_completion_uncertain",
+        "draft_not_created",
+        "draft_creation_uncertain",
+        "created",
+    ] {
+        assert!(output_schema.contains(stage), "{stage}");
+    }
+    assert_eq!(
+        create_file_draft["annotations"],
+        json!({
+            "title": "Create one-file Slack draft",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": true
+        })
+    );
 
     let unconfirmed = call_tool(
         &mut stdin,
@@ -619,6 +661,24 @@ async fn raw_json_rpc_exposes_and_guards_enabled_file_uploads() {
         unconfirmed["result"]["structuredContent"]["error"]["code"],
         "confirmation_required"
     );
+    let unconfirmed = call_tool(
+        &mut stdin,
+        &mut stdout,
+        104,
+        "slack_create_file_draft",
+        json!({
+            "conversation": "C123",
+            "path": "missing.txt",
+            "markdown": "synthetic",
+            "confirm": false
+        }),
+    )
+    .await;
+    assert_eq!(unconfirmed["result"]["isError"], true);
+    assert_eq!(
+        unconfirmed["result"]["structuredContent"]["error"]["code"],
+        "confirmation_required"
+    );
 
     let unsafe_path = call_tool(
         &mut stdin,
@@ -628,6 +688,24 @@ async fn raw_json_rpc_exposes_and_guards_enabled_file_uploads() {
         json!({
             "conversation": "C123",
             "path": "../outside.txt",
+            "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(unsafe_path["result"]["isError"], true);
+    assert_eq!(
+        unsafe_path["result"]["structuredContent"]["error"]["code"],
+        "local_file"
+    );
+    let unsafe_path = call_tool(
+        &mut stdin,
+        &mut stdout,
+        105,
+        "slack_create_file_draft",
+        json!({
+            "conversation": "C123",
+            "path": "../outside.txt",
+            "markdown": "synthetic",
             "confirm": true
         }),
     )

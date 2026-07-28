@@ -22,14 +22,14 @@ use crate::{
     model::{
         Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
         ConversationSearchTruncationReason, CustomEmojiKind, CustomEmojiList, DoctorReport, Draft,
-        DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport, FileReference,
-        FileUploadReport, InboxReport, Message, MessagePage, MessageSearchPage,
-        ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage, UnreadReport,
-        UserSearchReport, UserSearchTruncationReason,
+        DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
+        FileDraftCreateReport, FileReference, FileUploadReport, InboxReport, Message, MessagePage,
+        MessageSearchPage, ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage,
+        UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
     service::{
-        DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES, MAX_CONVERSATIONS,
-        MAX_FILE_DOWNLOAD_BYTES, MAX_FILE_UPLOAD_BYTES, MAX_USERS, SlackService,
+        DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES, FileDraftCreateRequest,
+        MAX_CONVERSATIONS, MAX_FILE_DOWNLOAD_BYTES, MAX_FILE_UPLOAD_BYTES, MAX_USERS, SlackService,
     },
 };
 
@@ -387,6 +387,35 @@ pub enum DraftsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Create a one-file draft from bounded Markdown on standard input.
+    CreateFile {
+        /// Slack conversation ID or exact name; use # or @ to force a colliding name.
+        conversation: String,
+        /// Local regular file with a UTF-8 basename of at most 255 bytes.
+        #[arg(long)]
+        path: std::path::PathBuf,
+        /// Existing thread root timestamp. Omit for a root-message draft.
+        #[arg(long)]
+        thread_ts: Option<String>,
+        /// Also send the eventual reply to the conversation. Requires --thread-ts.
+        #[arg(long)]
+        broadcast: bool,
+        /// Optional Slack title: 1 to 255 UTF-8 bytes without control characters.
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional image alt text: 1 to 1,000 UTF-8 bytes without control characters.
+        #[arg(long)]
+        alt_text: Option<String>,
+        /// Maximum source bytes to read, up to 1 GiB.
+        #[arg(long, default_value_t = DEFAULT_FILE_UPLOAD_BYTES, value_parser = clap::value_parser!(u64).range(1..=MAX_FILE_UPLOAD_BYTES))]
+        max_bytes: u64,
+        /// Confirm creation of the private Slack file and draft.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Replace a supported draft's content from bounded Markdown on standard input.
     Update {
         /// Slack server draft ID.
@@ -708,6 +737,55 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
             )
         }
         Command::Drafts {
+            command:
+                DraftsCommand::CreateFile {
+                    conversation,
+                    path,
+                    thread_ts,
+                    broadcast,
+                    title,
+                    alt_text,
+                    max_bytes,
+                    confirm,
+                    json,
+                },
+        } => {
+            if !confirm {
+                return Err(Error::ConfirmationRequired {
+                    action: "file draft creation",
+                });
+            }
+            let file_name = validate_cli_upload_path(&path)?;
+            SlackService::validate_file_draft_request(
+                &conversation,
+                thread_ts.as_deref(),
+                broadcast,
+                title.as_deref(),
+                alt_text.as_deref(),
+                &file_name,
+            )?;
+            let markdown = read_markdown_stdin()?;
+            render_markdown(&markdown)?;
+            let source = prepare_cli_upload(&path, max_bytes)?;
+            print_file_draft_create(
+                service
+                    .create_file_draft(
+                        FileDraftCreateRequest {
+                            conversation: &conversation,
+                            thread_ts: thread_ts.as_deref(),
+                            broadcast,
+                            markdown: &markdown,
+                            title: title.as_deref(),
+                            alt_text: alt_text.as_deref(),
+                            confirmed: confirm,
+                        },
+                        source,
+                    )
+                    .await?,
+                json,
+            )
+        }
+        Command::Drafts {
             command: DraftsCommand::Update { draft_id, json },
         } => {
             let markdown = read_markdown_stdin()?;
@@ -895,6 +973,56 @@ fn print_file_upload(report: FileUploadReport, json: bool) -> Result<()> {
     }
 }
 
+fn print_file_draft_create(report: FileDraftCreateReport, json: bool) -> Result<()> {
+    if json {
+        print_json(&report)
+    } else {
+        println!("{}", format_file_draft_create(&report));
+        Ok(())
+    }
+}
+
+fn format_file_draft_create(report: &FileDraftCreateReport) -> String {
+    match report {
+        FileDraftCreateReport::AllocationUncertain => "allocation_uncertain".into(),
+        FileDraftCreateReport::Allocated { file_id } => {
+            format!("allocated\t{}", escape_human(file_id))
+        }
+        FileDraftCreateReport::SourceChanged { file_id } => {
+            format!("source_changed\t{}", escape_human(file_id))
+        }
+        FileDraftCreateReport::TransferUncertain { file_id } => {
+            format!("transfer_uncertain\t{}", escape_human(file_id))
+        }
+        FileDraftCreateReport::FileCompletionUncertain { file_id } => {
+            format!("file_completion_uncertain\t{}", escape_human(file_id))
+        }
+        FileDraftCreateReport::DraftNotCreated { file_id, reason } => format!(
+            "draft_not_created\t{}\t{}",
+            escape_human(file_id),
+            escape_human(reason)
+        ),
+        FileDraftCreateReport::DraftCreationUncertain {
+            file_id,
+            client_msg_id,
+        } => format!(
+            "draft_creation_uncertain\t{}\t{}",
+            escape_human(file_id),
+            escape_human(client_msg_id)
+        ),
+        FileDraftCreateReport::Created {
+            draft,
+            file,
+            reconciled,
+        } => format!(
+            "created\t{}\t{}\treconciled={}",
+            escape_human(&draft.id),
+            escape_human(&file.id),
+            reconciled
+        ),
+    }
+}
+
 fn format_file_upload(report: &FileUploadReport) -> String {
     match report {
         FileUploadReport::AllocationUncertain => "allocation_uncertain".into(),
@@ -1033,10 +1161,10 @@ fn print_draft_row(draft: &Draft) {
                 .and_then(|destination| destination.thread_ts.as_deref())
                 .unwrap_or("root")
         ),
-        if draft.is_supported {
-            "supported"
-        } else {
-            "unsupported"
+        match draft.file_association {
+            Some(FileDraftAssociation::Unverified) => "file-unverified",
+            Some(FileDraftAssociation::Verified) | None if draft.is_supported => "supported",
+            _ => "unsupported",
         },
         escape_human(&draft.text)
     );
@@ -1077,7 +1205,7 @@ fn print_draft_send(report: DraftSendReport, json: bool) -> Result<()> {
     );
     if let Some(warning) = report.cleanup_warning {
         eprintln!(
-            "warning: message was sent, but draft {} at revision {} was not deleted: {}",
+            "warning: message was sent, but deletion of draft {} at revision {} was not confirmed: {}",
             escape_human(&warning.draft_id),
             escape_human(&warning.last_updated_ts),
             escape_human(&warning.reason)
@@ -1752,6 +1880,39 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from([
                 "lurkline",
+                "drafts",
+                "create-file",
+                "@smarzola",
+                "--path",
+                "synthetic.txt",
+                "--thread-ts",
+                "100.000001",
+                "--broadcast",
+                "--title",
+                "Synthetic",
+                "--alt-text",
+                "Synthetic test file",
+                "--max-bytes",
+                "1024",
+                "--confirm",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Drafts {
+                command: DraftsCommand::CreateFile {
+                    max_bytes: 1024,
+                    confirm: true,
+                    json: true,
+                    broadcast: true,
+                    thread_ts: Some(_),
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
                 "files",
                 "upload",
                 "@smarzola",
@@ -1933,6 +2094,13 @@ mod tests {
             }),
             "transfer_uncertain\tF123"
         );
+        assert_eq!(
+            format_file_draft_create(&FileDraftCreateReport::DraftNotCreated {
+                file_id: "F123".into(),
+                reason: "safe\nreason".into(),
+            }),
+            "draft_not_created\tF123\tsafe\\nreason"
+        );
 
         let emoji = CustomEmojiList {
             emoji: vec![
@@ -1995,6 +2163,18 @@ mod tests {
             serde_json::to_value(FileUploadReport::AllocationUncertain).unwrap(),
             serde_json::json!({
                 "stage": "allocation_uncertain"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(FileDraftCreateReport::DraftCreationUncertain {
+                file_id: "F123".into(),
+                client_msg_id: "00000000-0000-4000-8000-000000000001".into(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "stage": "draft_creation_uncertain",
+                "file_id": "F123",
+                "client_msg_id": "00000000-0000-4000-8000-000000000001"
             })
         );
 
