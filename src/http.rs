@@ -3,10 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{
-    Client, StatusCode,
+    Body, Client, StatusCode,
     header::{
-        ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, LOCATION, ORIGIN,
-        REFERER,
+        ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue,
+        LOCATION, ORIGIN, REFERER,
     },
     multipart::Form,
     redirect::Policy,
@@ -17,12 +17,13 @@ use serde_json::Value;
 use crate::{
     config::Config,
     error::{Error, Result},
-    local_file::BoundedDownload,
+    local_file::{BoundedDownload, UploadPass, UploadSource},
     model::{
         ClientCountsPayload, DraftDestination, RawAuthTestResponse, RawConversationsPage,
-        RawDraftResponse, RawDraftsPage, RawEmojiResponse, RawFileResponse, RawMessagePage,
-        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
-        RawReactionItemResponse, RawUsersPage,
+        RawDraftResponse, RawDraftsPage, RawEmojiResponse, RawFileResponse,
+        RawFileUploadAllocation, RawFileUploadCompletion, RawMessagePage, RawMessageSearchResponse,
+        RawMessagesList, RawMutationResponse, RawPostMessageResponse, RawReactionItemResponse,
+        RawUsersPage,
     },
     service::SlackApi,
 };
@@ -32,6 +33,7 @@ pub(crate) struct SlackHttpClient {
     config: Arc<Config>,
     client: Client,
     download_client: Client,
+    upload_client: Client,
 }
 
 impl SlackHttpClient {
@@ -52,10 +54,18 @@ impl SlackHttpClient {
             .map_err(|_| Error::Transport {
                 method: "client.build",
             })?;
+        let upload_client = Client::builder()
+            .redirect(Policy::none())
+            .timeout(config.timeout)
+            .build()
+            .map_err(|_| Error::Transport {
+                method: "client.build",
+            })?;
         Ok(Self {
             config: Arc::new(config),
             client,
             download_client,
+            upload_client,
         })
     }
 
@@ -364,6 +374,139 @@ impl SlackApi for SlackHttpClient {
         .await
     }
 
+    async fn files_get_upload_url_external(
+        &self,
+        filename: &str,
+        length: u64,
+        alt_text: Option<&str>,
+    ) -> Result<RawFileUploadAllocation> {
+        let mut fields = vec![
+            ("filename", filename.into()),
+            ("length", length.to_string()),
+        ];
+        if let Some(alt_text) = alt_text {
+            fields.push(("alt_txt", alt_text.into()));
+        }
+        self.post_mutation_form(
+            "files.getUploadURLExternal",
+            "lurkline-files-upload-allocate",
+            &fields,
+        )
+        .await
+    }
+
+    async fn upload_external_file(
+        &self,
+        upload_url: &str,
+        source: &mut UploadSource,
+    ) -> Result<UploadPass> {
+        const MAX_UPLOAD_ACK_BYTES: usize = 64 * 1024;
+        if upload_url.len() > 8_192 || upload_url.chars().any(char::is_control) {
+            return Err(Error::InvalidResponse {
+                method: "files.uploadExternal",
+            });
+        }
+        let url = url::Url::parse(upload_url).map_err(|_| Error::InvalidResponse {
+            method: "files.uploadExternal",
+        })?;
+        let allow_test_loopback = cfg!(test)
+            && self.config.base_url.host_str() == Some("127.0.0.1")
+            && self.config.base_url.scheme() == "http";
+        validate_external_upload_url(&url, allow_test_loopback)?;
+        let content_length = source.size();
+        let (stream, receipt) = source.upload_stream()?;
+        let response = self
+            .upload_client
+            .post(url)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(CONTENT_LENGTH, content_length)
+            .body(Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    Error::Timeout {
+                        method: "files.uploadExternal",
+                    }
+                } else {
+                    Error::Transport {
+                        method: "files.uploadExternal",
+                    }
+                }
+            })?;
+        if response.status() != StatusCode::OK {
+            return Err(Error::HttpStatus {
+                method: "files.uploadExternal",
+                status: response.status().as_u16(),
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_UPLOAD_ACK_BYTES as u64)
+        {
+            return Err(Error::ResponseTooLarge {
+                method: "files.uploadExternal",
+                limit: MAX_UPLOAD_ACK_BYTES,
+            });
+        }
+        let mut bytes_read = 0_usize;
+        let mut response_stream = response.bytes_stream();
+        while let Some(chunk) = response_stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                if error.is_timeout() {
+                    Error::Timeout {
+                        method: "files.uploadExternal",
+                    }
+                } else {
+                    Error::Transport {
+                        method: "files.uploadExternal",
+                    }
+                }
+            })?;
+            bytes_read = bytes_read
+                .checked_add(chunk.len())
+                .ok_or(Error::ResponseTooLarge {
+                    method: "files.uploadExternal",
+                    limit: MAX_UPLOAD_ACK_BYTES,
+                })?;
+            if bytes_read > MAX_UPLOAD_ACK_BYTES {
+                return Err(Error::ResponseTooLarge {
+                    method: "files.uploadExternal",
+                    limit: MAX_UPLOAD_ACK_BYTES,
+                });
+            }
+        }
+        receipt.await.map_err(|_| Error::InvalidResponse {
+            method: "files.uploadExternal",
+        })
+    }
+
+    async fn files_complete_upload_external(
+        &self,
+        file_id: &str,
+        title: Option<&str>,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<RawFileUploadCompletion> {
+        let file = match title {
+            Some(title) => serde_json::json!({"id": file_id, "title": title}),
+            None => serde_json::json!({"id": file_id}),
+        };
+        let mut fields = vec![
+            ("files", encode_json(&[file])?),
+            ("channel_id", channel_id.into()),
+        ];
+        if let Some(thread_ts) = thread_ts {
+            fields.push(("thread_ts", thread_ts.into()));
+        }
+        self.post_mutation_form(
+            "files.completeUploadExternal",
+            "lurkline-files-upload-complete",
+            &fields,
+        )
+        .await
+    }
+
     async fn reactions_get(
         &self,
         channel: &str,
@@ -659,6 +802,26 @@ fn validate_file_download_origin(url: &url::Url, allow_test_loopback: bool) -> R
     Ok(())
 }
 
+fn validate_external_upload_url(url: &url::Url, allow_test_loopback: bool) -> Result<()> {
+    let host = url.host_str().unwrap_or_default();
+    let valid_origin = (url.scheme() == "https"
+        && host == "files.slack.com"
+        && url.port_or_known_default() == Some(443))
+        || (allow_test_loopback && url.scheme() == "http" && host == "127.0.0.1");
+    if !valid_origin
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !url.path().starts_with("/upload/v1/")
+        || url.path() == "/upload/v1/"
+    {
+        return Err(Error::InvalidResponse {
+            method: "files.uploadExternal",
+        });
+    }
+    Ok(())
+}
+
 fn encode_json(value: &(impl serde::Serialize + ?Sized)) -> Result<String> {
     serde_json::to_string(value).map_err(|_| Error::Output)
 }
@@ -868,6 +1031,42 @@ mod tests {
         (SlackHttpClient::new(config).unwrap(), capture, base_url)
     }
 
+    async fn upload_server(status: StatusCode, body: Vec<u8>) -> (SlackHttpClient, Capture, Url) {
+        let capture = Capture {
+            request: Arc::new(Mutex::new(None)),
+            response_status: status,
+            response_body: Arc::new(body),
+        };
+        let app = Router::new()
+            .route("/upload/v1/{file}", post(handler))
+            .with_state(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = Url::parse(&format!("http://{address}/")).unwrap();
+        let config = Config::for_test(base_url.clone(), 64 * 1024);
+        (SlackHttpClient::new(config).unwrap(), capture, base_url)
+    }
+
+    fn upload_source(bytes: &[u8]) -> (std::path::PathBuf, UploadSource) {
+        let directory = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "lurkline-http-upload-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("source.bin"), bytes).unwrap();
+        let root = crate::local_file::McpFileRoot::open(&directory).unwrap();
+        let source = root
+            .prepare_upload(std::path::Path::new("source.bin"), bytes.len() as u64)
+            .unwrap();
+        (directory, source)
+    }
+
     #[tokio::test]
     async fn sends_browser_session_request_shape() {
         let (client, capture) = server(
@@ -989,6 +1188,73 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn external_upload_streams_exact_bytes_without_browser_credentials() {
+        let (client, capture, base_url) = upload_server(StatusCode::OK, b"OK - 14".to_vec()).await;
+        let (directory, mut source) = upload_source(b"synthetic file");
+        let pass = client
+            .upload_external_file(
+                base_url.join("upload/v1/F123?sig=secret").unwrap().as_str(),
+                &mut source,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pass.bytes_read, 14);
+        assert!(source.upload_pass_matches(&pass).unwrap());
+        let (uri, headers, body) = capture.request.lock().unwrap().clone().unwrap();
+        assert_eq!(uri.path(), "/upload/v1/F123");
+        assert_eq!(uri.query(), Some("sig=secret"));
+        assert_eq!(body, b"synthetic file");
+        assert_eq!(headers.get(CONTENT_LENGTH).unwrap(), "14");
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        for forbidden in [AUTHORIZATION, COOKIE, ORIGIN, REFERER] {
+            assert!(headers.get(forbidden).is_none());
+        }
+        drop(source);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_upload_rejects_redirects_and_oversized_acknowledgements() {
+        let (client, _, base_url) = upload_server(StatusCode::FOUND, Vec::new()).await;
+        let (directory, mut source) = upload_source(b"synthetic");
+        assert!(matches!(
+            client
+                .upload_external_file(
+                    base_url.join("upload/v1/F123").unwrap().as_str(),
+                    &mut source
+                )
+                .await,
+            Err(Error::HttpStatus {
+                method: "files.uploadExternal",
+                status: 302
+            })
+        ));
+        drop(source);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        let (client, _, base_url) = upload_server(StatusCode::OK, vec![b'x'; 64 * 1024 + 1]).await;
+        let (directory, mut source) = upload_source(b"synthetic");
+        assert!(matches!(
+            client
+                .upload_external_file(
+                    base_url.join("upload/v1/F123").unwrap().as_str(),
+                    &mut source
+                )
+                .await,
+            Err(Error::ResponseTooLarge {
+                method: "files.uploadExternal",
+                limit: 65536
+            })
+        ));
+        drop(source);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn private_download_rejects_non_slack_origins_and_embedded_credentials() {
         for value in [
@@ -1008,6 +1274,29 @@ mod tests {
         let valid = Url::parse("https://files.slack.com/files-pri/T-F/download/name").unwrap();
         assert!(validate_credentialed_download_url(&valid, false).is_ok());
         assert!(validate_redirect_download_url(&valid, false).is_ok());
+    }
+
+    #[test]
+    fn external_upload_rejects_unsafe_or_malformed_slack_urls() {
+        for value in [
+            "http://files.slack.com/upload/v1/F123",
+            "https://example.com/upload/v1/F123",
+            "https://slack.com/upload/v1/F123",
+            "https://other.files.slack.com/upload/v1/F123",
+            "https://user@files.slack.com/upload/v1/F123",
+            "https://files.slack.com:444/upload/v1/F123",
+            "https://files.slack.com/upload/v1/F123#fragment",
+            "https://files.slack.com/upload/v1/",
+            "https://files.slack.com/files-pri/F123",
+        ] {
+            let url = Url::parse(value).unwrap();
+            assert!(
+                validate_external_upload_url(&url, false).is_err(),
+                "{value}"
+            );
+        }
+        let valid = Url::parse("https://files.slack.com/upload/v1/F123?sig=secret").unwrap();
+        assert!(validate_external_upload_url(&valid, false).is_ok());
     }
 
     #[tokio::test]
@@ -1176,6 +1465,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn sends_external_upload_allocation_and_completion_shapes() {
+        let (client, capture) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"upload_url":"https://files.slack.com/upload/v1/F123?sig=secret","file_id":"F123"}"#
+                .to_vec(),
+            64 * 1024,
+        )
+        .await;
+        let allocation = client
+            .files_get_upload_url_external("report.txt", 42, Some("accessible report"))
+            .await
+            .unwrap();
+        assert_eq!(allocation.file_id, "F123");
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/files.getUploadURLExternal");
+        assert_eq!(multipart_text_field(&body, "filename"), Some("report.txt"));
+        assert_eq!(multipart_text_field(&body, "length"), Some("42"));
+        assert_eq!(
+            multipart_text_field(&body, "alt_txt"),
+            Some("accessible report")
+        );
+
+        let (client, capture) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"files":[{"id":"F123"}]}"#.to_vec(),
+            64 * 1024,
+        )
+        .await;
+        client
+            .files_complete_upload_external(
+                "F123",
+                Some("Quarterly report"),
+                "C123",
+                Some("100.000001"),
+            )
+            .await
+            .unwrap();
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/files.completeUploadExternal");
+        assert_eq!(multipart_text_field(&body, "channel_id"), Some("C123"));
+        assert_eq!(multipart_text_field(&body, "thread_ts"), Some("100.000001"));
+        assert_eq!(
+            serde_json::from_str::<Value>(multipart_text_field(&body, "files").unwrap()).unwrap(),
+            serde_json::json!([{"id": "F123", "title": "Quarterly report"}])
+        );
     }
 
     #[tokio::test]

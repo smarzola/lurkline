@@ -6,26 +6,27 @@ use std::{
 
 use async_trait::async_trait;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
     config::Config,
     error::{Error, Result},
-    local_file::{BoundedDownload, DownloadDurability},
+    local_file::{BoundedDownload, DownloadDurability, UploadPass, UploadSource},
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     model::{
         ClientCountsPayload, Conversation, ConversationKind, ConversationPage,
         ConversationSearchReport, ConversationSearchTruncationReason, CustomEmoji, CustomEmojiKind,
         CustomEmojiList, DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport,
         DraftDestination, DraftPage, DraftSendReport, FileDownloadReport, FileReference, FileShare,
-        FileShareVisibility, InboxConversation, InboxReport, Message, MessagePage,
-        MessageSearchMatch, MessageSearchPage, RawAuthTestResponse, RawConversation,
+        FileShareVisibility, FileUploadReport, InboxConversation, InboxReport, Message,
+        MessagePage, MessageSearchMatch, MessageSearchPage, RawAuthTestResponse, RawConversation,
         RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision, RawDraftsPage,
-        RawEmojiResponse, RawFile, RawFileResponse, RawMessage, RawMessagePage,
-        RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList, RawMutationResponse,
-        RawPostMessageResponse, RawReaction, RawReactionItemResponse, RawUnread, RawUser,
-        RawUsersPage, Reaction, ReactionMutationReport, SentMessage, ThreadPage,
-        UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
-        UserSearchTruncationReason,
+        RawEmojiResponse, RawFile, RawFileResponse, RawFileUploadAllocation,
+        RawFileUploadCompletion, RawMessage, RawMessagePage, RawMessageSearchMatch,
+        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
+        RawReaction, RawReactionItemResponse, RawUnread, RawUser, RawUsersPage, Reaction,
+        ReactionMutationReport, SentMessage, ThreadPage, UnreadConversation, UnreadReport,
+        UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
     },
 };
 
@@ -41,6 +42,11 @@ const MAX_USER_PAGES: usize = 20;
 pub(crate) const MAX_DRAFTS: usize = 100;
 pub(crate) const DEFAULT_FILE_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
 pub(crate) const MAX_FILE_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_FILE_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_FILE_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_FILE_UPLOAD_NAME_BYTES: usize = 255;
+const MAX_FILE_UPLOAD_TITLE_BYTES: usize = 255;
+const MAX_FILE_UPLOAD_ALT_TEXT_BYTES: usize = 1_000;
 const MAX_DRAFT_DESTINATION_USERS: usize = 100;
 const MAX_ATTACHMENTS_PER_MESSAGE: usize = 100;
 const MAX_FILES_PER_MESSAGE: usize = 100;
@@ -134,6 +140,39 @@ pub(crate) trait SlackApi: Send + Sync {
         let _ = (download_url, target);
         Err(Error::InvalidResponse {
             method: "files.download",
+        })
+    }
+    async fn files_get_upload_url_external(
+        &self,
+        filename: &str,
+        length: u64,
+        alt_text: Option<&str>,
+    ) -> Result<RawFileUploadAllocation> {
+        let _ = (filename, length, alt_text);
+        Err(Error::InvalidResponse {
+            method: "files.getUploadURLExternal",
+        })
+    }
+    async fn upload_external_file(
+        &self,
+        upload_url: &str,
+        source: &mut UploadSource,
+    ) -> Result<UploadPass> {
+        let _ = (upload_url, source);
+        Err(Error::InvalidResponse {
+            method: "files.uploadExternal",
+        })
+    }
+    async fn files_complete_upload_external(
+        &self,
+        file_id: &str,
+        title: Option<&str>,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<RawFileUploadCompletion> {
+        let _ = (file_id, title, channel_id, thread_ts);
+        Err(Error::InvalidResponse {
+            method: "files.completeUploadExternal",
         })
     }
     async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
@@ -290,6 +329,130 @@ impl SlackService {
             durability_warning: (commit.durability == DownloadDurability::DirectorySyncWarning)
                 .then(|| "file committed, but the parent directory could not be synced".into()),
         })
+    }
+
+    pub(crate) async fn upload_file(
+        &self,
+        conversation: &str,
+        thread_ts: Option<&str>,
+        title: Option<&str>,
+        alt_text: Option<&str>,
+        mut source: UploadSource,
+        confirm: bool,
+    ) -> Result<FileUploadReport> {
+        if !confirm {
+            return Err(Error::ConfirmationRequired {
+                action: "file upload",
+            });
+        }
+        Self::validate_upload_request(
+            conversation,
+            thread_ts,
+            title,
+            alt_text,
+            source.file_name(),
+        )?;
+        let channel_id = self.resolve_conversation_id(conversation).await?;
+        if source.size() > MAX_FILE_UPLOAD_BYTES {
+            return Err(Error::invalid_input(
+                "max_bytes",
+                "Slack file is larger than the 1 GiB hard limit",
+            ));
+        }
+
+        let raw_allocation = match self
+            .api
+            .files_get_upload_url_external(source.file_name(), source.size(), alt_text)
+            .await
+        {
+            Ok(allocation) => allocation,
+            Err(error) if upload_allocation_error_is_ambiguous(&error) => {
+                return Ok(FileUploadReport::AllocationUncertain);
+            }
+            Err(error) => return Err(error),
+        };
+        if !is_valid_file_id(&raw_allocation.file_id) {
+            return Ok(FileUploadReport::AllocationUncertain);
+        }
+        let file_id = raw_allocation.file_id;
+        let upload_url = Zeroizing::new(raw_allocation.upload_url);
+        if !is_safe_upload_url(&upload_url) {
+            return Ok(FileUploadReport::Allocated { file_id });
+        }
+        if !matches!(source.is_stable(), Ok(true)) {
+            return Ok(FileUploadReport::SourceChanged { file_id });
+        }
+
+        let upload_pass = match self
+            .api
+            .upload_external_file(&upload_url, &mut source)
+            .await
+        {
+            Ok(upload_pass) => upload_pass,
+            Err(_) => return Ok(FileUploadReport::TransferUncertain { file_id }),
+        };
+        if !matches!(source.upload_pass_matches(&upload_pass), Ok(true)) {
+            return Ok(FileUploadReport::SourceChanged { file_id });
+        }
+
+        let completion = self
+            .api
+            .files_complete_upload_external(&file_id, title, &channel_id, thread_ts)
+            .await;
+        let completion_acknowledged = completion
+            .as_ref()
+            .is_ok_and(|completion| completion_has_exact_file(completion, &file_id));
+        let reconciled = !completion_acknowledged;
+
+        let file = match self.api.files_info(&file_id).await {
+            Ok(raw) if raw.file.id == file_id => match normalize_file(raw.file, "files.info") {
+                Ok(file) => file,
+                Err(_) => return Ok(FileUploadReport::CompletionUncertain { file_id }),
+            },
+            _ => return Ok(FileUploadReport::CompletionUncertain { file_id }),
+        };
+        let share = file
+            .shares
+            .as_ref()
+            .and_then(|shares| {
+                shares.iter().find(|share| {
+                    share.channel_id == channel_id
+                        && match thread_ts {
+                            Some(thread_ts) => share.thread_ts.as_deref() == Some(thread_ts),
+                            None => share.thread_ts.is_none(),
+                        }
+                })
+            })
+            .cloned();
+        match share {
+            Some(share) => Ok(FileUploadReport::Shared {
+                file: Box::new(file),
+                share,
+                reconciled,
+            }),
+            None => Ok(FileUploadReport::CompletionUncertain { file_id }),
+        }
+    }
+
+    pub(crate) fn validate_upload_request(
+        conversation: &str,
+        thread_ts: Option<&str>,
+        title: Option<&str>,
+        alt_text: Option<&str>,
+        file_name: &str,
+    ) -> Result<()> {
+        validate_conversation_reference(conversation)?;
+        validate_upload_input("filename", file_name, MAX_FILE_UPLOAD_NAME_BYTES)?;
+        if let Some(title) = title {
+            validate_upload_input("title", title, MAX_FILE_UPLOAD_TITLE_BYTES)?;
+        }
+        if let Some(alt_text) = alt_text {
+            validate_upload_input("alt_text", alt_text, MAX_FILE_UPLOAD_ALT_TEXT_BYTES)?;
+        }
+        if let Some(thread_ts) = thread_ts {
+            validate_timestamp("thread_ts", thread_ts)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn add_reaction(
@@ -2206,6 +2369,52 @@ fn is_safe_metadata_url(value: &str) -> bool {
             .is_some_and(|url| url.scheme() == "https" && url.host_str().is_some())
 }
 
+fn is_safe_upload_url(value: &str) -> bool {
+    if value.len() > 8_192 || value.chars().any(char::is_control) {
+        return false;
+    }
+    url::Url::parse(value).ok().is_some_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("files.slack.com")
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+            && url
+                .path()
+                .strip_prefix("/upload/v1/")
+                .is_some_and(|suffix| !suffix.is_empty())
+    })
+}
+
+fn validate_upload_input(field: &'static str, value: &str, maximum: usize) -> Result<()> {
+    if value.trim().is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
+        return Err(Error::invalid_input(
+            field,
+            "must contain bounded non-control text",
+        ));
+    }
+    Ok(())
+}
+
+fn upload_allocation_error_is_ambiguous(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::HttpStatus { .. }
+            | Error::ResponseTooLarge { .. }
+            | Error::InvalidResponse { .. }
+            | Error::Timeout { .. }
+            | Error::Transport { .. }
+    ) || matches!(
+        error,
+        Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
+    )
+}
+
+fn completion_has_exact_file(completion: &RawFileUploadCompletion, file_id: &str) -> bool {
+    completion.files.len() == 1 && completion.files[0].id == file_id
+}
+
 fn normalize_user(raw: RawUser) -> User {
     let real_name = if raw.profile.real_name.is_empty() {
         raw.real_name
@@ -2522,6 +2731,8 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
+    use futures_util::StreamExt;
+
     use super::*;
     use crate::model::{
         RawChannelMessages, RawConversation, RawConversationsPage, RawFile,
@@ -2564,6 +2775,13 @@ mod tests {
         reaction_get_count: Arc<Mutex<usize>>,
         reaction_calls: Arc<Mutex<Vec<String>>>,
         download_bytes: Vec<u8>,
+        upload_allocation: RawFileUploadAllocation,
+        upload_allocation_error: Option<&'static str>,
+        upload_transfer_error: bool,
+        upload_mutate_pass: bool,
+        upload_completion: RawFileUploadCompletion,
+        upload_completion_error: bool,
+        upload_calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2858,6 +3076,71 @@ mod tests {
             Ok(())
         }
 
+        async fn files_get_upload_url_external(
+            &self,
+            _filename: &str,
+            _length: u64,
+            _alt_text: Option<&str>,
+        ) -> Result<RawFileUploadAllocation> {
+            self.upload_calls.lock().unwrap().push("allocate");
+            match self.upload_allocation_error {
+                Some("timeout") => Err(Error::Timeout {
+                    method: "files.getUploadURLExternal",
+                }),
+                Some("denied") => Err(Error::SlackApi {
+                    method: "files.getUploadURLExternal",
+                    code: "not_allowed".into(),
+                }),
+                Some(_) => Err(Error::InvalidResponse {
+                    method: "files.getUploadURLExternal",
+                }),
+                None => Ok(self.upload_allocation.clone()),
+            }
+        }
+
+        async fn upload_external_file(
+            &self,
+            _upload_url: &str,
+            source: &mut UploadSource,
+        ) -> Result<UploadPass> {
+            self.upload_calls.lock().unwrap().push("transfer");
+            if self.upload_transfer_error {
+                return Err(Error::Transport {
+                    method: "files.uploadExternal",
+                });
+            }
+            let (mut stream, receipt) = source.upload_stream()?;
+            while let Some(chunk) = stream.next().await {
+                chunk.map_err(|_| Error::Transport {
+                    method: "files.uploadExternal",
+                })?;
+            }
+            let mut pass = receipt.await.map_err(|_| Error::InvalidResponse {
+                method: "files.uploadExternal",
+            })?;
+            if self.upload_mutate_pass {
+                pass.digest[0] ^= 0xff;
+            }
+            Ok(pass)
+        }
+
+        async fn files_complete_upload_external(
+            &self,
+            _file_id: &str,
+            _title: Option<&str>,
+            _channel_id: &str,
+            _thread_ts: Option<&str>,
+        ) -> Result<RawFileUploadCompletion> {
+            self.upload_calls.lock().unwrap().push("complete");
+            if self.upload_completion_error {
+                Err(Error::Timeout {
+                    method: "files.completeUploadExternal",
+                })
+            } else {
+                Ok(self.upload_completion.clone())
+            }
+        }
+
         async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
             self.draft_calls.lock().unwrap().push(DraftCall::List {
                 next_ts: next_ts.map(str::to_owned),
@@ -3070,6 +3353,21 @@ mod tests {
             reaction_get_count: Arc::new(Mutex::new(0)),
             reaction_calls: Arc::new(Mutex::new(Vec::new())),
             download_bytes: b"safe".to_vec(),
+            upload_allocation: RawFileUploadAllocation {
+                upload_url: "https://files.slack.com/upload/v1/FUPLOAD?sig=synthetic".into(),
+                file_id: "FUPLOAD".into(),
+            },
+            upload_allocation_error: None,
+            upload_transfer_error: false,
+            upload_mutate_pass: false,
+            upload_completion: RawFileUploadCompletion {
+                files: vec![RawFile {
+                    id: "FUPLOAD".into(),
+                    ..RawFile::default()
+                }],
+            },
+            upload_completion_error: false,
+            upload_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -3078,6 +3376,54 @@ mod tests {
         let mut service = SlackService::new(api, &config);
         service.now_millis = || Ok("9000123".into());
         service
+    }
+
+    struct UploadFixture(std::path::PathBuf);
+
+    impl UploadFixture {
+        fn new(bytes: &[u8]) -> Self {
+            let path = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "lurkline-service-upload-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("source.txt"), bytes).unwrap();
+            Self(path)
+        }
+
+        fn source(&self) -> UploadSource {
+            let root = crate::local_file::McpFileRoot::open(&self.0).unwrap();
+            root.prepare_upload(std::path::Path::new("source.txt"), 1024)
+                .unwrap()
+        }
+    }
+
+    impl Drop for UploadFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn uploaded_file(thread_ts: Option<&str>) -> RawFile {
+        RawFile {
+            id: "FUPLOAD".into(),
+            name: Some("source.txt".into()),
+            size: Some(9),
+            shares: Some(crate::model::RawFileShares {
+                private: BTreeMap::from([(
+                    "C123".into(),
+                    vec![crate::model::RawFileShare {
+                        ts: "200.000001".into(),
+                        thread_ts: thread_ts.map(str::to_owned),
+                    }],
+                )]),
+                ..crate::model::RawFileShares::default()
+            }),
+            ..RawFile::default()
+        }
     }
 
     fn entry(id: &str, has_unreads: bool, mentions: u64) -> RawUnread {
@@ -5370,6 +5716,296 @@ mod tests {
         ));
         assert!(!directory.join("unknown-size").exists());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_verifies_exact_root_and_thread_shares() {
+        for thread_ts in [None, Some("100.000001")] {
+            let fixture = UploadFixture::new(b"synthetic");
+            let mut api = fake_api();
+            api.file_response = RawFileResponse {
+                file: uploaded_file(thread_ts),
+            };
+            let calls = api.upload_calls.clone();
+            let report = service(api)
+                .upload_file(
+                    "C123",
+                    thread_ts,
+                    Some("Synthetic"),
+                    Some("Synthetic test file"),
+                    fixture.source(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let FileUploadReport::Shared {
+                file,
+                share,
+                reconciled,
+            } = report
+            else {
+                panic!("an exact files.info share must prove success");
+            };
+            assert_eq!(file.id, "FUPLOAD");
+            assert_eq!(share.channel_id, "C123");
+            assert_eq!(share.thread_ts.as_deref(), thread_ts);
+            assert!(!reconciled);
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                ["allocate", "transfer", "complete"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_returns_secret_safe_recovery_stages_without_blind_retries() {
+        let fixture = UploadFixture::new(b"synthetic");
+        let mut api = fake_api();
+        api.upload_allocation_error = Some("timeout");
+        let calls = api.upload_calls.clone();
+        assert_eq!(
+            service(api)
+                .upload_file("C123", None, None, None, fixture.source(), true)
+                .await
+                .unwrap(),
+            FileUploadReport::AllocationUncertain
+        );
+        assert_eq!(calls.lock().unwrap().as_slice(), ["allocate"]);
+
+        let mut api = fake_api();
+        api.upload_allocation.file_id = "invalid".into();
+        assert_eq!(
+            service(api)
+                .upload_file("C123", None, None, None, fixture.source(), true)
+                .await
+                .unwrap(),
+            FileUploadReport::AllocationUncertain
+        );
+
+        let mut api = fake_api();
+        api.upload_allocation_error = Some("denied");
+        assert!(matches!(
+            service(api)
+                .upload_file("C123", None, None, None, fixture.source(), true)
+                .await,
+            Err(Error::SlackApi {
+                method: "files.getUploadURLExternal",
+                ..
+            })
+        ));
+
+        let mut api = fake_api();
+        api.upload_allocation.upload_url = "https://example.com/upload/v1/FUPLOAD".into();
+        let calls = api.upload_calls.clone();
+        assert_eq!(
+            service(api)
+                .upload_file("C123", None, None, None, fixture.source(), true)
+                .await
+                .unwrap(),
+            FileUploadReport::Allocated {
+                file_id: "FUPLOAD".into()
+            }
+        );
+        assert_eq!(calls.lock().unwrap().as_slice(), ["allocate"]);
+
+        let mut api = fake_api();
+        api.upload_transfer_error = true;
+        let calls = api.upload_calls.clone();
+        assert_eq!(
+            service(api)
+                .upload_file("C123", None, None, None, fixture.source(), true)
+                .await
+                .unwrap(),
+            FileUploadReport::TransferUncertain {
+                file_id: "FUPLOAD".into()
+            }
+        );
+        assert_eq!(calls.lock().unwrap().as_slice(), ["allocate", "transfer"]);
+
+        let mut api = fake_api();
+        api.upload_mutate_pass = true;
+        let calls = api.upload_calls.clone();
+        assert_eq!(
+            service(api)
+                .upload_file("C123", None, None, None, fixture.source(), true)
+                .await
+                .unwrap(),
+            FileUploadReport::SourceChanged {
+                file_id: "FUPLOAD".into()
+            }
+        );
+        assert_eq!(calls.lock().unwrap().as_slice(), ["allocate", "transfer"]);
+    }
+
+    #[tokio::test]
+    async fn upload_reconciles_ambiguous_completion_once_with_exact_file_state() {
+        for malformed_ack in [false, true] {
+            let fixture = UploadFixture::new(b"synthetic");
+            let mut api = fake_api();
+            api.file_response = RawFileResponse {
+                file: uploaded_file(None),
+            };
+            if malformed_ack {
+                api.upload_completion.files = vec![RawFile {
+                    id: "FOTHER".into(),
+                    ..RawFile::default()
+                }];
+            } else {
+                api.upload_completion_error = true;
+            }
+            let calls = api.upload_calls.clone();
+            let report = service(api)
+                .upload_file("C123", None, None, None, fixture.source(), true)
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                report,
+                FileUploadReport::Shared {
+                    reconciled: true,
+                    ..
+                }
+            ));
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                ["allocate", "transfer", "complete"]
+            );
+        }
+
+        let fixture = UploadFixture::new(b"synthetic");
+        let mut api = fake_api();
+        api.file_response = RawFileResponse {
+            file: RawFile {
+                id: "FUPLOAD".into(),
+                shares: Some(crate::model::RawFileShares::default()),
+                ..RawFile::default()
+            },
+        };
+        let report = service(api)
+            .upload_file("C123", None, None, None, fixture.source(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            FileUploadReport::CompletionUncertain {
+                file_id: "FUPLOAD".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_confirmation_precedes_all_slack_mutations() {
+        let fixture = UploadFixture::new(b"synthetic");
+        let api = fake_api();
+        let calls = api.upload_calls.clone();
+        assert!(matches!(
+            service(api)
+                .upload_file("C123", None, None, None, fixture.source(), false)
+                .await,
+            Err(Error::ConfirmationRequired {
+                action: "file upload"
+            })
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn upload_request_validation_is_pure_and_enforces_exact_metadata_bounds() {
+        let file_name = "f".repeat(MAX_FILE_UPLOAD_NAME_BYTES);
+        let title = "t".repeat(MAX_FILE_UPLOAD_TITLE_BYTES);
+        let alt_text = "a".repeat(MAX_FILE_UPLOAD_ALT_TEXT_BYTES);
+        assert!(
+            SlackService::validate_upload_request(
+                "C123",
+                Some("100.000001"),
+                Some(&title),
+                Some(&alt_text),
+                &file_name,
+            )
+            .is_ok()
+        );
+
+        for (field, result) in [
+            (
+                "conversation",
+                SlackService::validate_upload_request("\n", None, None, None, "source.txt"),
+            ),
+            (
+                "thread_ts",
+                SlackService::validate_upload_request(
+                    "C123",
+                    Some("invalid"),
+                    None,
+                    None,
+                    "source.txt",
+                ),
+            ),
+            (
+                "filename",
+                SlackService::validate_upload_request(
+                    "C123",
+                    None,
+                    None,
+                    None,
+                    &"f".repeat(MAX_FILE_UPLOAD_NAME_BYTES + 1),
+                ),
+            ),
+            (
+                "title",
+                SlackService::validate_upload_request(
+                    "C123",
+                    None,
+                    Some(&"t".repeat(MAX_FILE_UPLOAD_TITLE_BYTES + 1)),
+                    None,
+                    "source.txt",
+                ),
+            ),
+            (
+                "alt_text",
+                SlackService::validate_upload_request(
+                    "C123",
+                    None,
+                    None,
+                    Some(&"a".repeat(MAX_FILE_UPLOAD_ALT_TEXT_BYTES + 1)),
+                    "source.txt",
+                ),
+            ),
+        ] {
+            assert!(
+                matches!(result, Err(Error::InvalidInput { field: actual, .. }) if actual == field)
+            );
+        }
+
+        for (field, value) in [
+            ("filename", "bad\nname"),
+            ("title", "bad\ttitle"),
+            ("alt_text", "bad\0alt"),
+        ] {
+            let result = match field {
+                "filename" => {
+                    SlackService::validate_upload_request("C123", None, None, None, value)
+                }
+                "title" => SlackService::validate_upload_request(
+                    "C123",
+                    None,
+                    Some(value),
+                    None,
+                    "source.txt",
+                ),
+                "alt_text" => SlackService::validate_upload_request(
+                    "C123",
+                    None,
+                    None,
+                    Some(value),
+                    "source.txt",
+                ),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(result, Err(Error::InvalidInput { field: actual, .. }) if actual == field)
+            );
+        }
     }
 
     #[tokio::test]

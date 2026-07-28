@@ -179,12 +179,24 @@ fn version_and_help_expose_the_complete_cli_without_configuration() {
     assert!(draft_delete.contains("--confirm"));
 
     let files = stdout(&["files", "--help"]);
-    for command in ["info", "download"] {
+    for command in ["info", "download", "upload"] {
         assert!(files.contains(command), "files help omitted {command}");
     }
     let download = stdout(&["files", "download", "--help"]);
     for option in ["--output", "--max-bytes", "--json"] {
         assert!(download.contains(option), "download help omitted {option}");
+    }
+    let upload = stdout(&["files", "upload", "--help"]);
+    for option in [
+        "--path",
+        "--thread-ts",
+        "--title",
+        "--alt-text",
+        "--max-bytes",
+        "--confirm",
+        "--json",
+    ] {
+        assert!(upload.contains(option), "upload help omitted {option}");
     }
     let reactions = stdout(&["reactions", "--help"]);
     for command in ["add", "remove"] {
@@ -412,6 +424,65 @@ fn file_and_reaction_process_guards_fail_before_network_access() {
             "error: confirmation is required for reaction mutation\n",
             "{action}"
         );
+    }
+
+    let upload = run_with_credentials(&[
+        "files",
+        "upload",
+        "C123",
+        "--path",
+        "/path/that/must/not/be/opened",
+    ]);
+    assert!(!upload.status.success());
+    assert!(upload.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(upload.stderr).unwrap(),
+        "error: confirmation is required for file upload\n"
+    );
+
+    for (args, expected) in [
+        (
+            vec![
+                "files",
+                "upload",
+                "C123",
+                "--path",
+                "/path/that/must/not/be/opened",
+                "--thread-ts",
+                "invalid",
+                "--confirm",
+            ],
+            "error: invalid thread_ts: must be a Slack message timestamp\n",
+        ),
+        (
+            vec![
+                "files",
+                "upload",
+                "",
+                "--path",
+                "/path/that/must/not/be/opened",
+                "--confirm",
+            ],
+            "error: invalid conversation: must be a Slack conversation ID or a 1 to 128 character name\n",
+        ),
+        (
+            vec![
+                "files",
+                "upload",
+                "C123",
+                "--path",
+                "/path/that/must/not/be/opened",
+                "--title",
+                "bad\ntitle",
+                "--confirm",
+            ],
+            "error: invalid title: must contain bounded non-control text\n",
+        ),
+    ] {
+        let output = run_with_credentials(&args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
     }
 
     let invalid_file = run_with_credentials(&["files", "info", "not-a-file"]);

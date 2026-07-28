@@ -167,6 +167,17 @@ pub(crate) struct RawFileResponse {
     pub file: RawFile,
 }
 
+#[derive(Clone, Deserialize)]
+pub(crate) struct RawFileUploadAllocation {
+    pub upload_url: String,
+    pub file_id: String,
+}
+
+#[derive(Clone, Deserialize)]
+pub(crate) struct RawFileUploadCompletion {
+    pub files: Vec<RawFile>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawEmojiResponse {
     #[serde(default)]
@@ -703,6 +714,27 @@ pub struct FileDownloadReport {
     pub bytes_written: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durability_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum FileUploadReport {
+    /// Slack may have allocated an upload, but returned no safe recovery key.
+    AllocationUncertain,
+    /// Slack allocated a file ID, but no file bytes were sent.
+    Allocated { file_id: String },
+    /// Slack allocated a file ID, but the local source changed before completion.
+    SourceChanged { file_id: String },
+    /// Slack allocated a file ID, but byte acceptance cannot be proven.
+    TransferUncertain { file_id: String },
+    /// Slack received the bytes, but target sharing cannot be proven.
+    CompletionUncertain { file_id: String },
+    /// Exact `files.info` state proves the file is shared to the requested target.
+    Shared {
+        file: Box<FileReference>,
+        share: FileShare,
+        reconciled: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

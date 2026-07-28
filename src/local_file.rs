@@ -1,12 +1,17 @@
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use futures_util::{Stream, stream};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::{io::AsyncReadExt, sync::oneshot};
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const TEMPORARY_ATTEMPTS: usize = 128;
@@ -24,6 +29,10 @@ pub(crate) enum LocalFileError {
     Symlink,
     #[error("a local path component is not a directory")]
     NotDirectory,
+    #[error("the upload source is not a regular file")]
+    NotRegularFile,
+    #[error("the upload source is empty")]
+    EmptyUpload,
     #[error("the download destination already exists")]
     DestinationExists,
     #[error("the download destination parent changed before commit")]
@@ -64,6 +73,15 @@ pub(crate) struct DownloadCommit {
     pub(crate) durability: DownloadDurability,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UploadPass {
+    pub(crate) bytes_read: u64,
+    pub(crate) digest: [u8; 32],
+}
+
+pub(crate) type UploadByteStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<Vec<u8>, io::Error>> + Send>>;
+
 /// An MCP file-system capability rooted at a directory descriptor opened once
 /// during server startup.
 pub(crate) struct McpFileRoot {
@@ -90,6 +108,19 @@ impl McpFileRoot {
             .map_err(|error| LocalFileError::io("clone file root", error))?;
         prepare_download(anchor, components, byte_limit)
     }
+
+    pub(crate) fn prepare_upload(
+        &self,
+        relative_path: &Path,
+        byte_limit: u64,
+    ) -> Result<UploadSource> {
+        let components = parse_relative(relative_path, false)?;
+        let anchor = self
+            .directory
+            .try_clone()
+            .map_err(|error| LocalFileError::io("clone file root", error))?;
+        prepare_upload(anchor, components, byte_limit)
+    }
 }
 
 pub(crate) fn validate_mcp_download_path(path: &Path) -> Result<()> {
@@ -105,6 +136,20 @@ pub(crate) fn validate_cli_download_path(path: &Path) -> Result<()> {
     .map(|_| ())
 }
 
+pub(crate) fn validate_mcp_upload_path(path: &Path) -> Result<String> {
+    let components = parse_relative(path, false)?;
+    upload_file_name(&components)
+}
+
+pub(crate) fn validate_cli_upload_path(path: &Path) -> Result<String> {
+    let components = if path.is_absolute() {
+        parse_absolute(path, false)
+    } else {
+        parse_relative(path, false)
+    }?;
+    upload_file_name(&components)
+}
+
 /// Prepare a direct CLI download. Absolute paths are anchored at an opened `/`
 /// descriptor; relative paths are anchored at an opened current-directory
 /// descriptor.
@@ -116,6 +161,127 @@ pub(crate) fn prepare_cli_download(path: &Path, byte_limit: u64) -> Result<Bound
     };
     let anchor = open_anchor(anchor_name)?;
     prepare_download(anchor, components, byte_limit)
+}
+
+/// Prepare a direct CLI upload. The source remains bound to the opened file
+/// descriptor and its descriptor-anchored visible path for every stability
+/// check.
+pub(crate) fn prepare_cli_upload(path: &Path, byte_limit: u64) -> Result<UploadSource> {
+    let (anchor_name, components) = if path.is_absolute() {
+        (ROOT, parse_absolute(path, false)?)
+    } else {
+        (CURRENT_DIRECTORY, parse_relative(path, false)?)
+    };
+    let anchor = open_anchor(anchor_name)?;
+    prepare_upload(anchor, components, byte_limit)
+}
+
+pub(crate) struct UploadSource {
+    anchor: File,
+    parent: File,
+    parent_components: Vec<CString>,
+    source_name: CString,
+    file_name: String,
+    file: File,
+    snapshot: FileSnapshot,
+    preflight: UploadPass,
+    byte_limit: u64,
+}
+
+impl UploadSource {
+    pub(crate) fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.snapshot.size
+    }
+
+    pub(crate) fn is_stable(&self) -> Result<bool> {
+        if file_snapshot(&self.file)? != self.snapshot {
+            return Ok(false);
+        }
+        let visible_parent = open_directories(&self.anchor, &self.parent_components)?;
+        if directory_identity(&visible_parent)? != directory_identity(&self.parent)? {
+            return Ok(false);
+        }
+        let visible_file = open_regular_file_at(visible_parent.as_raw_fd(), &self.source_name)?;
+        Ok(file_snapshot(&visible_file)? == self.snapshot)
+    }
+
+    pub(crate) fn upload_stream(
+        &mut self,
+    ) -> Result<(UploadByteStream, oneshot::Receiver<UploadPass>)> {
+        self.file
+            .rewind()
+            .map_err(|error| LocalFileError::io("rewind upload source", error))?;
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|error| LocalFileError::io("clone upload source", error))?;
+        let (sender, receiver) = oneshot::channel();
+        let state = UploadStreamState {
+            file: tokio::fs::File::from_std(file),
+            hasher: Sha256::new(),
+            bytes_read: 0,
+            byte_limit: self.byte_limit,
+            expected_bytes: self.snapshot.size,
+            sender: Some(sender),
+        };
+        let stream = stream::try_unfold(state, |mut state| async move {
+            let mut chunk = vec![0_u8; 64 * 1024];
+            let read = state.file.read(&mut chunk).await?;
+            if read == 0 {
+                if let Some(sender) = state.sender.take() {
+                    let _ = sender.send(UploadPass {
+                        bytes_read: state.bytes_read,
+                        digest: state.hasher.finalize().into(),
+                    });
+                }
+                return Ok(None);
+            }
+            chunk.truncate(read);
+            state.bytes_read = state.bytes_read.checked_add(read as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "upload size overflow")
+            })?;
+            if state.bytes_read > state.byte_limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upload size limit exceeded",
+                ));
+            }
+            if state.bytes_read > state.expected_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upload source grew during transfer",
+                ));
+            }
+            state.hasher.update(&chunk);
+            if state.bytes_read == state.expected_bytes
+                && let Some(sender) = state.sender.take()
+            {
+                let _ = sender.send(UploadPass {
+                    bytes_read: state.bytes_read,
+                    digest: state.hasher.clone().finalize().into(),
+                });
+            }
+            Ok(Some((chunk, state)))
+        });
+        Ok((Box::pin(stream), receiver))
+    }
+
+    pub(crate) fn upload_pass_matches(&self, pass: &UploadPass) -> Result<bool> {
+        Ok(pass == &self.preflight && self.is_stable()?)
+    }
+}
+
+struct UploadStreamState {
+    file: tokio::fs::File,
+    hasher: Sha256,
+    bytes_read: u64,
+    byte_limit: u64,
+    expected_bytes: u64,
+    sender: Option<oneshot::Sender<UploadPass>>,
 }
 
 /// A bounded, descriptor-anchored download that owns its temporary file.
@@ -259,6 +425,82 @@ fn prepare_download(
     })
 }
 
+fn prepare_upload(
+    anchor: File,
+    mut components: Vec<CString>,
+    byte_limit: u64,
+) -> Result<UploadSource> {
+    let source_name = components
+        .pop()
+        .ok_or(LocalFileError::InvalidPath("a file name is required"))?;
+    let file_name = std::str::from_utf8(source_name.to_bytes())
+        .map_err(|_| LocalFileError::InvalidPath("the file name must be valid UTF-8"))?
+        .to_owned();
+    let parent = open_directories(&anchor, &components)?;
+    let mut file = open_regular_file_at(parent.as_raw_fd(), &source_name)?;
+    let snapshot = file_snapshot(&file)?;
+    if snapshot.size == 0 {
+        return Err(LocalFileError::EmptyUpload);
+    }
+    if snapshot.size > byte_limit {
+        return Err(LocalFileError::SizeLimit { limit: byte_limit });
+    }
+    let preflight = digest_upload(&mut file, byte_limit)?;
+    if preflight.bytes_read != snapshot.size || file_snapshot(&file)? != snapshot {
+        return Err(LocalFileError::io(
+            "verify upload source",
+            io::Error::other("upload source changed during preflight"),
+        ));
+    }
+    Ok(UploadSource {
+        anchor,
+        parent,
+        parent_components: components,
+        source_name,
+        file_name,
+        file,
+        snapshot,
+        preflight,
+        byte_limit,
+    })
+}
+
+fn upload_file_name(components: &[CString]) -> Result<String> {
+    let source_name = components
+        .last()
+        .ok_or(LocalFileError::InvalidPath("a file name is required"))?;
+    std::str::from_utf8(source_name.to_bytes())
+        .map(str::to_owned)
+        .map_err(|_| LocalFileError::InvalidPath("the file name must be valid UTF-8"))
+}
+
+fn digest_upload(file: &mut File, byte_limit: u64) -> Result<UploadPass> {
+    file.rewind()
+        .map_err(|error| LocalFileError::io("rewind upload source", error))?;
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0_u64;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| LocalFileError::io("read upload source", error))?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(read as u64)
+            .ok_or(LocalFileError::SizeLimit { limit: byte_limit })?;
+        if bytes_read > byte_limit {
+            return Err(LocalFileError::SizeLimit { limit: byte_limit });
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(UploadPass {
+        bytes_read,
+        digest: hasher.finalize().into(),
+    })
+}
+
 const ROOT: &CStr = c"/";
 const CURRENT_DIRECTORY: &CStr = c".";
 
@@ -312,6 +554,37 @@ fn open_directory_at(parent: RawFd, name: &CStr) -> Result<File> {
         return Err(LocalFileError::NotDirectory);
     }
     Ok(directory)
+}
+
+fn open_regular_file_at(parent: RawFd, name: &CStr) -> Result<File> {
+    let descriptor = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ELOOP) => Err(LocalFileError::Symlink),
+            _ => Err(LocalFileError::io("open upload source", error)),
+        };
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if !file_identity(&file)?.is_regular {
+        return Err(LocalFileError::NotRegularFile);
+    }
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0
+    {
+        return Err(LocalFileError::io(
+            "configure upload source",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(file)
 }
 
 fn ensure_destination_absent(parent: &File, destination: &CStr) -> Result<()> {
@@ -406,6 +679,41 @@ struct FileIdentity {
     inode: libc::ino_t,
     is_directory: bool,
     is_regular: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileSnapshot {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+fn file_snapshot(file: &File) -> Result<FileSnapshot> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| LocalFileError::io("inspect upload source", error))?;
+    if !metadata.file_type().is_file() {
+        return Err(LocalFileError::NotRegularFile);
+    }
+    Ok(FileSnapshot {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
 }
 
 fn file_identity(file: &File) -> Result<FileIdentity> {
@@ -563,8 +871,13 @@ fn validate_total_path_length(bytes: &[u8]) -> Result<()> {
 mod tests {
     use std::ffi::OsStr;
     use std::fs;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{PermissionsExt, symlink},
+    };
     use std::path::{Path, PathBuf};
+
+    use futures_util::StreamExt;
 
     use super::*;
 
@@ -638,6 +951,21 @@ mod tests {
         assert!(validate_cli_download_path(Path::new("/a/b")).is_ok());
         assert!(validate_mcp_download_path(Path::new("a/b")).is_ok());
         assert!(validate_mcp_download_path(Path::new("/a/b")).is_err());
+        assert_eq!(
+            validate_cli_upload_path(Path::new("a/source.txt")).unwrap(),
+            "source.txt"
+        );
+        assert_eq!(
+            validate_mcp_upload_path(Path::new("a/source.txt")).unwrap(),
+            "source.txt"
+        );
+        let non_utf8 = OsStr::from_bytes(b"source-\xff");
+        assert!(matches!(
+            validate_cli_upload_path(Path::new(non_utf8)),
+            Err(LocalFileError::InvalidPath(
+                "the file name must be valid UTF-8"
+            ))
+        ));
 
         let oversized_component = "x".repeat(MAX_LOCAL_COMPONENT_BYTES + 1);
         assert!(matches!(
@@ -687,6 +1015,14 @@ mod tests {
         ));
         assert!(matches!(
             capability.prepare_download(Path::new("real/leaf-link"), 10),
+            Err(LocalFileError::Symlink)
+        ));
+        assert!(matches!(
+            capability.prepare_upload(Path::new("ancestor-link/source"), 10),
+            Err(LocalFileError::Symlink | LocalFileError::NotDirectory)
+        ));
+        assert!(matches!(
+            capability.prepare_upload(Path::new("real/leaf-link"), 10),
             Err(LocalFileError::Symlink)
         ));
     }
@@ -849,5 +1185,96 @@ mod tests {
         );
         assert_eq!(fs::read(root.path().join("output")).unwrap(), b"safe");
         assert_directory_only_contains(root.path(), &["output"]);
+    }
+
+    #[test]
+    fn upload_requires_a_nonempty_bounded_regular_file() {
+        let root = TestDirectory::new("upload-types");
+        fs::write(root.path().join("empty"), b"").unwrap();
+        fs::write(root.path().join("large"), b"12345").unwrap();
+        fs::create_dir(root.path().join("directory")).unwrap();
+        let fifo_path = root.path().join("fifo");
+        let fifo = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let capability = McpFileRoot::open(root.path()).unwrap();
+
+        assert!(matches!(
+            capability.prepare_upload(Path::new("empty"), 10),
+            Err(LocalFileError::EmptyUpload)
+        ));
+        assert!(matches!(
+            capability.prepare_upload(Path::new("large"), 4),
+            Err(LocalFileError::SizeLimit { limit: 4 })
+        ));
+        assert!(matches!(
+            capability.prepare_upload(Path::new("directory"), 10),
+            Err(LocalFileError::NotRegularFile)
+        ));
+        assert!(matches!(
+            capability.prepare_upload(Path::new("fifo"), 10),
+            Err(LocalFileError::NotRegularFile)
+        ));
+    }
+
+    #[tokio::test]
+    async fn upload_stream_is_exact_and_matches_the_preflight_pass() {
+        let root = TestDirectory::new("upload-stream");
+        fs::write(root.path().join("source"), b"streamed bytes").unwrap();
+        let capability = McpFileRoot::open(root.path()).unwrap();
+        let mut source = capability.prepare_upload(Path::new("source"), 100).unwrap();
+
+        assert_eq!(source.file_name(), "source");
+        assert_eq!(source.size(), 14);
+        assert!(source.is_stable().unwrap());
+        let (mut stream, receipt) = source.upload_stream().unwrap();
+        let mut received = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        let pass = receipt.await.unwrap();
+
+        assert_eq!(received, b"streamed bytes");
+        assert_eq!(pass.bytes_read, source.size());
+        assert!(source.upload_pass_matches(&pass).unwrap());
+    }
+
+    #[test]
+    fn upload_stability_detects_ancestor_and_leaf_replacement() {
+        let root = TestDirectory::new("upload-replacement");
+        fs::create_dir(root.path().join("parent")).unwrap();
+        fs::write(root.path().join("parent/source"), b"safe").unwrap();
+        let capability = McpFileRoot::open(root.path()).unwrap();
+        let ancestor_source = capability
+            .prepare_upload(Path::new("parent/source"), 10)
+            .unwrap();
+
+        fs::rename(root.path().join("parent"), root.path().join("old-parent")).unwrap();
+        fs::create_dir(root.path().join("parent")).unwrap();
+        fs::write(root.path().join("parent/source"), b"safe").unwrap();
+        assert!(!ancestor_source.is_stable().unwrap());
+
+        fs::write(root.path().join("leaf"), b"safe").unwrap();
+        let leaf_source = capability.prepare_upload(Path::new("leaf"), 10).unwrap();
+        fs::rename(root.path().join("leaf"), root.path().join("old-leaf")).unwrap();
+        fs::write(root.path().join("leaf"), b"safe").unwrap();
+        assert!(!leaf_source.is_stable().unwrap());
+    }
+
+    #[tokio::test]
+    async fn upload_pass_detects_same_size_content_mutation() {
+        let root = TestDirectory::new("upload-mutation");
+        let path = root.path().join("source");
+        fs::write(&path, b"before").unwrap();
+        let capability = McpFileRoot::open(root.path()).unwrap();
+        let mut source = capability.prepare_upload(Path::new("source"), 10).unwrap();
+
+        fs::write(&path, b"after!").unwrap();
+        let (mut stream, receipt) = source.upload_stream().unwrap();
+        while let Some(chunk) = stream.next().await {
+            chunk.unwrap();
+        }
+        let pass = receipt.await.unwrap();
+        assert_eq!(pass.bytes_read, 6);
+        assert!(!source.upload_pass_matches(&pass).unwrap());
     }
 }

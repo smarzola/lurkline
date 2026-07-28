@@ -143,6 +143,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_send_draft",
             "slack_send_message",
             "slack_update_draft",
+            "slack_upload_file",
         ])
     );
     for tool_name in [
