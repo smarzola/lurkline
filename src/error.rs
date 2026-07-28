@@ -59,6 +59,8 @@ pub enum Error {
     MarkdownInputRead,
     #[error("Slack writes are disabled; start the MCP server with --allow-write")]
     WriteNotAllowed,
+    #[error("local file tools are disabled; start the MCP server with --file-root ABSOLUTE_PATH")]
+    FileRootRequired,
     #[error("confirmation is required for {action}")]
     ConfirmationRequired { action: &'static str },
     #[error("Slack browser session is expired or invalid; copy fresh browser credentials")]
@@ -79,6 +81,24 @@ pub enum Error {
         "Slack publication outcome is unknown for client message {client_msg_id}; do not retry automatically; verify the message in Slack before deciding whether to retry"
     )]
     PublicationUncertain { client_msg_id: String },
+    #[error(
+        "Slack reaction outcome is unknown for {channel_id} at {message_ts} ({name}); do not retry automatically; read the exact message before deciding whether to retry"
+    )]
+    ReactionUncertain {
+        channel_id: String,
+        message_ts: String,
+        name: String,
+    },
+    #[error(
+        "Slack reaction is confirmed not applied for {channel_id} at {message_ts} ({name}); the exact state is known and a deliberate retry is safe"
+    )]
+    ReactionNotApplied {
+        channel_id: String,
+        message_ts: String,
+        name: String,
+    },
+    #[error("local file operation failed: {operation}")]
+    LocalFile { operation: String },
     #[error("{resource} was not found")]
     NotFound { resource: &'static str },
     #[error("could not resolve {resource} within the {limit}-item scan limit")]

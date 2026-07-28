@@ -42,6 +42,20 @@ fn run_with_stdin(args: &[&str], input: &[u8]) -> Output {
     child.wait_with_output().unwrap()
 }
 
+fn run_with_credentials(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lurkline"))
+        .args(args)
+        .env("HOME", isolated_home())
+        .env("SLACK_BASE_URL", "https://example.slack.com")
+        .env("SLACK_TEAM_ID", "T000TEST")
+        .env("SLACK_TOKEN", "xoxc-cli-test-secret")
+        .env("SLACK_COOKIE", "d=xoxd-cli-test-secret")
+        .env("LURKLINE_TIMEOUT_MS", "500")
+        .env_remove("LURKLINE_PROFILE")
+        .output()
+        .unwrap()
+}
+
 fn stdout(args: &[&str]) -> String {
     let output = run(args);
     assert!(
@@ -53,7 +67,7 @@ fn stdout(args: &[&str]) -> String {
 }
 
 #[test]
-fn version_and_help_expose_the_complete_v050_cli_without_configuration() {
+fn version_and_help_expose_the_complete_cli_without_configuration() {
     assert_eq!(
         stdout(&["--version"]).trim(),
         format!("lurkline {}", env!("CARGO_PKG_VERSION"))
@@ -69,6 +83,9 @@ fn version_and_help_expose_the_complete_v050_cli_without_configuration() {
         "channel",
         "thread",
         "drafts",
+        "files",
+        "emoji",
+        "reactions",
         "mcp",
     ] {
         assert!(root.contains(command), "root help omitted {command}");
@@ -161,8 +178,27 @@ fn version_and_help_expose_the_complete_v050_cli_without_configuration() {
     let draft_delete = stdout(&["drafts", "delete", "--help"]);
     assert!(draft_delete.contains("--confirm"));
 
+    let files = stdout(&["files", "--help"]);
+    for command in ["info", "download"] {
+        assert!(files.contains(command), "files help omitted {command}");
+    }
+    let download = stdout(&["files", "download", "--help"]);
+    for option in ["--output", "--max-bytes", "--json"] {
+        assert!(download.contains(option), "download help omitted {option}");
+    }
+    let reactions = stdout(&["reactions", "--help"]);
+    for command in ["add", "remove"] {
+        assert!(
+            reactions.contains(command),
+            "reaction help omitted {command}"
+        );
+        assert!(stdout(&["reactions", command, "--help"]).contains("--confirm"));
+    }
+    assert!(stdout(&["emoji", "list", "--help"]).contains("--json"));
+
     let mcp = stdout(&["mcp", "--help"]);
     assert!(mcp.contains("--allow-write"));
+    assert!(mcp.contains("--file-root"));
 }
 
 #[test]
@@ -363,4 +399,76 @@ fn invalid_search_query_fails_before_a_slack_request() {
         String::from_utf8(output.stderr).unwrap(),
         "error: invalid query: must contain 1 to 512 non-control characters\n"
     );
+}
+
+#[test]
+fn file_and_reaction_process_guards_fail_before_network_access() {
+    for action in ["add", "remove"] {
+        let output = run_with_credentials(&["reactions", action, "C123", "100.000001", "eyes"]);
+        assert!(!output.status.success(), "{action}");
+        assert!(output.stdout.is_empty(), "{action}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "error: confirmation is required for reaction mutation\n",
+            "{action}"
+        );
+    }
+
+    let invalid_file = run_with_credentials(&["files", "info", "not-a-file"]);
+    assert!(!invalid_file.status.success());
+    assert!(invalid_file.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(invalid_file.stderr).unwrap(),
+        "error: invalid file_id: must be a Slack file identifier\n"
+    );
+
+    let invalid_path = run_with_credentials(&[
+        "files",
+        "download",
+        "F123",
+        "--output",
+        "../must-not-escape",
+    ]);
+    assert!(!invalid_path.status.success());
+    assert!(invalid_path.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(invalid_path.stderr).unwrap(),
+        "error: local file operation failed: invalid local path: parent path components are not allowed\n"
+    );
+
+    let oversized_leaf = "x".repeat(256);
+    let oversized_path =
+        run_with_credentials(&["files", "download", "F123", "--output", &oversized_leaf]);
+    assert!(!oversized_path.status.success());
+    assert!(oversized_path.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(oversized_path.stderr).unwrap(),
+        "error: local file operation failed: invalid local path: path component exceeds the 255-byte limit\n"
+    );
+
+    let output_path = format!(
+        "/tmp/lurkline-must-not-create-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let invalid_bound = run_with_credentials(&[
+        "files",
+        "download",
+        "F123",
+        "--output",
+        &output_path,
+        "--max-bytes",
+        "0",
+    ]);
+    assert_eq!(invalid_bound.status.code(), Some(2));
+    assert!(invalid_bound.stdout.is_empty());
+    assert!(
+        String::from_utf8(invalid_bound.stderr)
+            .unwrap()
+            .contains("invalid value '0' for '--max-bytes")
+    );
+    assert!(!std::path::Path::new(&output_path).exists());
 }

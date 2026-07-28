@@ -77,6 +77,8 @@ pub(crate) struct RawMessage {
     #[serde(default)]
     pub blocks: Option<Vec<Value>>,
     #[serde(default)]
+    pub attachments: Option<Vec<Value>>,
+    #[serde(default)]
     pub reply_count: u64,
     #[serde(default)]
     pub latest_reply: Option<String>,
@@ -92,6 +94,8 @@ pub(crate) struct RawReaction {
     pub name: String,
     #[serde(default)]
     pub count: u64,
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -99,13 +103,90 @@ pub(crate) struct RawFile {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
-    pub name: String,
+    pub name: Option<String>,
     #[serde(default)]
-    pub mimetype: String,
+    pub title: Option<String>,
     #[serde(default)]
-    pub size: u64,
+    pub mimetype: Option<String>,
+    #[serde(default)]
+    pub filetype: Option<String>,
+    #[serde(default)]
+    pub pretty_type: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub file_access: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+    #[serde(default)]
+    pub editable: Option<bool>,
+    #[serde(default)]
+    pub is_external: Option<bool>,
+    #[serde(default)]
+    pub is_public: Option<bool>,
+    #[serde(default)]
+    pub public_url_shared: Option<bool>,
+    #[serde(default)]
+    pub url_private: Option<String>,
     #[serde(default)]
     pub url_private_download: Option<String>,
+    #[serde(default)]
+    pub permalink: Option<String>,
+    #[serde(default)]
+    pub shares: Option<RawFileShares>,
+    #[serde(default)]
+    pub has_more_shares: Option<bool>,
+    #[serde(default)]
+    pub skipped_shares: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawFileShares {
+    #[serde(default)]
+    pub public: BTreeMap<String, Vec<RawFileShare>>,
+    #[serde(default)]
+    pub private: BTreeMap<String, Vec<RawFileShare>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawFileShare {
+    #[serde(default)]
+    pub ts: String,
+    #[serde(default)]
+    pub thread_ts: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawFileResponse {
+    pub file: RawFile,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawEmojiResponse {
+    #[serde(default)]
+    pub emoji: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawAuthTestResponse {
+    #[serde(default)]
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawReactionItemResponse {
+    #[serde(default, rename = "type")]
+    pub item_type: String,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub message: Option<RawMessage>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -180,6 +261,12 @@ pub(crate) struct RawMessageSearchMatch {
     pub text: String,
     #[serde(default)]
     pub blocks: Option<Vec<Value>>,
+    #[serde(default)]
+    pub attachments: Option<Vec<Value>>,
+    #[serde(default)]
+    pub reactions: Vec<RawReaction>,
+    #[serde(default)]
+    pub files: Vec<RawFile>,
     #[serde(default)]
     pub permalink: Option<String>,
 }
@@ -371,6 +458,11 @@ pub struct MessageSearchMatch {
     /// Raw Slack Block Kit JSON. `None` means Slack omitted `blocks`; an empty
     /// vector means Slack explicitly returned an empty array.
     pub blocks: Option<Vec<Value>>,
+    /// Raw Slack legacy-attachment JSON. `None` means Slack omitted the field;
+    /// an empty vector means Slack explicitly returned an empty array.
+    pub attachments: Option<Vec<Value>>,
+    pub reactions: Vec<Reaction>,
+    pub files: Vec<FileReference>,
     pub permalink: Option<String>,
 }
 
@@ -512,6 +604,10 @@ pub struct Message {
     pub text: String,
     /// Raw Slack Block Kit JSON. Unknown block and element fields are retained.
     pub blocks: Option<Vec<Value>>,
+    /// Raw Slack legacy-attachment JSON. Unknown nested fields are retained.
+    /// `None` means Slack omitted the field; an empty vector means Slack
+    /// explicitly returned an empty array.
+    pub attachments: Option<Vec<Value>>,
     pub reply_count: u64,
     pub latest_reply: Option<String>,
     pub reactions: Vec<Reaction>,
@@ -522,15 +618,91 @@ pub struct Message {
 pub struct Reaction {
     pub name: String,
     pub count: u64,
+    /// Slack may return fewer user IDs than `count`.
+    pub user_ids: Vec<String>,
+    pub user_ids_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct FileReference {
     pub id: String,
-    pub name: String,
-    pub mimetype: String,
-    pub size: u64,
+    pub name: Option<String>,
+    pub title: Option<String>,
+    pub mimetype: Option<String>,
+    pub filetype: Option<String>,
+    pub pretty_type: Option<String>,
+    pub mode: Option<String>,
+    pub file_access: Option<String>,
+    pub uploader_id: Option<String>,
+    pub size: Option<u64>,
+    pub created: Option<u64>,
+    pub timestamp: Option<u64>,
+    pub editable: Option<bool>,
+    pub is_external: Option<bool>,
+    pub is_public: Option<bool>,
+    pub public_url_shared: Option<bool>,
+    pub private_url: Option<String>,
     pub download_url: Option<String>,
+    pub permalink: Option<String>,
+    /// `None` means Slack omitted share metadata; `Some([])` is explicitly empty.
+    pub shares: Option<Vec<FileShare>>,
+    /// Whether `shares` is present and Slack did not report omitted entries.
+    pub shares_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileShareVisibility {
+    Public,
+    Private,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct FileShare {
+    pub visibility: FileShareVisibility,
+    pub channel_id: String,
+    pub ts: String,
+    pub thread_ts: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomEmojiKind {
+    Image,
+    Alias,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CustomEmoji {
+    pub name: String,
+    pub kind: CustomEmojiKind,
+    pub image_url: Option<String>,
+    pub alias_for: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CustomEmojiList {
+    pub emoji: Vec<CustomEmoji>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ReactionMutationReport {
+    pub channel_id: String,
+    pub message_ts: String,
+    pub name: String,
+    pub target_present: bool,
+    pub present: bool,
+    pub changed: bool,
+    pub reconciled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct FileDownloadReport {
+    pub file: FileReference,
+    pub output_path: String,
+    pub bytes_written: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durability_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

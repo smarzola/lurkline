@@ -13,15 +13,21 @@ use crate::{
     curl_import::{MAX_CURL_BYTES, parse_copy_as_curl},
     error::{Error, Result},
     http::SlackHttpClient,
+    local_file::{prepare_cli_download, validate_cli_download_path},
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     mcp,
     model::{
         Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
-        ConversationSearchTruncationReason, DoctorReport, Draft, DraftDeleteReport, DraftPage,
-        DraftSendReport, InboxReport, Message, MessagePage, MessageSearchPage, RenderedMessage,
-        SentMessage, ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        ConversationSearchTruncationReason, CustomEmojiKind, CustomEmojiList, DoctorReport, Draft,
+        DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport, FileReference,
+        InboxReport, Message, MessagePage, MessageSearchPage, ReactionMutationReport,
+        RenderedMessage, SentMessage, ThreadPage, UnreadReport, UserSearchReport,
+        UserSearchTruncationReason,
     },
-    service::{MAX_CONVERSATIONS, MAX_USERS, SlackService},
+    service::{
+        DEFAULT_FILE_DOWNLOAD_BYTES, MAX_CONVERSATIONS, MAX_FILE_DOWNLOAD_BYTES, MAX_USERS,
+        SlackService,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -99,6 +105,21 @@ pub enum Command {
         #[command(subcommand)]
         command: DraftsCommand,
     },
+    /// Inspect and download private Slack files.
+    Files {
+        #[command(subcommand)]
+        command: FilesCommand,
+    },
+    /// Discover workspace custom emoji.
+    Emoji {
+        #[command(subcommand)]
+        command: EmojiCommand,
+    },
+    /// Add or remove emoji reactions on exact messages.
+    Reactions {
+        #[command(subcommand)]
+        command: ReactionsCommand,
+    },
     /// Find workspace users.
     Users {
         #[command(subcommand)]
@@ -109,6 +130,79 @@ pub enum Command {
         /// Enable draft and message write tools. Reads remain available by default.
         #[arg(long)]
         allow_write: bool,
+        /// Absolute local directory exposed to file tools.
+        #[arg(long)]
+        file_root: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FilesCommand {
+    /// Fetch bounded metadata for one Slack file.
+    Info {
+        /// Slack file identifier.
+        file_id: String,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download one private Slack file without overwriting an existing path.
+    Download {
+        /// Slack file identifier.
+        file_id: String,
+        /// Explicit local output path.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Maximum bytes to write, up to 1 GiB.
+        #[arg(long, default_value_t = DEFAULT_FILE_DOWNLOAD_BYTES, value_parser = clap::value_parser!(u64).range(1..=MAX_FILE_DOWNLOAD_BYTES))]
+        max_bytes: u64,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EmojiCommand {
+    /// List bounded workspace custom emoji and aliases.
+    List {
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReactionsCommand {
+    /// Ensure an emoji reaction is present on one exact message.
+    Add {
+        /// Slack conversation ID or exact name.
+        conversation: String,
+        /// Exact Slack message timestamp.
+        message_ts: String,
+        /// Emoji name, with or without surrounding colons.
+        name: String,
+        /// Confirm the Slack mutation.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ensure an emoji reaction is absent from one exact message.
+    Remove {
+        /// Slack conversation ID or exact name.
+        conversation: String,
+        /// Exact Slack message timestamp.
+        message_ts: String,
+        /// Emoji name, with or without surrounding colons.
+        name: String,
+        /// Confirm the Slack mutation.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -606,11 +700,178 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                     json,
                 },
         } => print_draft_send(service.send_draft(&draft_id, confirm).await?, json),
+        Command::Files {
+            command: FilesCommand::Info { file_id, json },
+        } => print_file(service.get_file(&file_id).await?, json),
+        Command::Files {
+            command:
+                FilesCommand::Download {
+                    file_id,
+                    output,
+                    max_bytes,
+                    json,
+                },
+        } => {
+            validate_cli_download_path(&output)?;
+            let file = service.get_file(&file_id).await?;
+            let size = file.size.ok_or(Error::NotFound {
+                resource: "Slack file size",
+            })?;
+            if size > max_bytes {
+                return Err(Error::invalid_input(
+                    "max_bytes",
+                    "is smaller than the Slack file size",
+                ));
+            }
+            let target = prepare_cli_download(&output, max_bytes)?;
+            let output_path = output.to_string_lossy().into_owned();
+            print_file_download(
+                service.download_file(file, target, output_path).await?,
+                json,
+            )
+        }
+        Command::Emoji {
+            command: EmojiCommand::List { json },
+        } => print_custom_emoji(service.list_custom_emoji().await?, json),
+        Command::Reactions {
+            command:
+                ReactionsCommand::Add {
+                    conversation,
+                    message_ts,
+                    name,
+                    confirm,
+                    json,
+                },
+        } => print_reaction_mutation(
+            service
+                .add_reaction(&conversation, &message_ts, &name, confirm)
+                .await?,
+            json,
+        ),
+        Command::Reactions {
+            command:
+                ReactionsCommand::Remove {
+                    conversation,
+                    message_ts,
+                    name,
+                    confirm,
+                    json,
+                },
+        } => print_reaction_mutation(
+            service
+                .remove_reaction(&conversation, &message_ts, &name, confirm)
+                .await?,
+            json,
+        ),
         Command::Users {
             command: UsersCommand::Find { query, limit, json },
         } => print_users(service.find_users(&query, limit).await?, json),
-        Command::Mcp { allow_write } => mcp::serve_stdio(service, allow_write).await,
+        Command::Mcp {
+            allow_write,
+            file_root,
+        } => mcp::serve_stdio(service, allow_write, file_root).await,
     }
+}
+
+fn print_file(file: FileReference, json: bool) -> Result<()> {
+    if json {
+        print_json(&file)
+    } else {
+        println!("{}", format_file(&file));
+        Ok(())
+    }
+}
+
+fn format_file(file: &FileReference) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}",
+        escape_human(&file.id),
+        file.size
+            .map(|size| size.to_string())
+            .unwrap_or_else(|| "-".into()),
+        escape_human(file.mimetype.as_deref().unwrap_or("-")),
+        escape_human(file.name.as_deref().unwrap_or("-")),
+        escape_human(file.download_url.as_deref().unwrap_or("-"))
+    )
+}
+
+fn print_file_download(report: FileDownloadReport, json: bool) -> Result<()> {
+    if json {
+        print_json(&report)
+    } else {
+        println!("{}", format_file_download(&report));
+        if let Some(warning) = &report.durability_warning {
+            eprintln!("warning: {}", escape_human(warning));
+        }
+        Ok(())
+    }
+}
+
+fn format_file_download(report: &FileDownloadReport) -> String {
+    format!(
+        "downloaded\t{}\t{}\t{}",
+        escape_human(&report.file.id),
+        report.bytes_written,
+        escape_human(&report.output_path)
+    )
+}
+
+fn print_custom_emoji(list: CustomEmojiList, json: bool) -> Result<()> {
+    if json {
+        print_json(&list)
+    } else {
+        let output = format_custom_emoji(&list);
+        if !output.is_empty() {
+            println!("{output}");
+        }
+        Ok(())
+    }
+}
+
+fn format_custom_emoji(list: &CustomEmojiList) -> String {
+    list.emoji
+        .iter()
+        .map(|emoji| {
+            let kind = match emoji.kind {
+                CustomEmojiKind::Image => "image",
+                CustomEmojiKind::Alias => "alias",
+            };
+            let target = emoji
+                .alias_for
+                .as_deref()
+                .or(emoji.image_url.as_deref())
+                .unwrap_or("-");
+            format!(
+                "{}\t{}\t{}",
+                escape_human(&emoji.name),
+                kind,
+                escape_human(target)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn print_reaction_mutation(report: ReactionMutationReport, json: bool) -> Result<()> {
+    if json {
+        print_json(&report)
+    } else {
+        println!("{}", format_reaction_mutation(&report));
+        Ok(())
+    }
+}
+
+fn format_reaction_mutation(report: &ReactionMutationReport) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\ttarget_present={}\tchanged={}\treconciled={}",
+        if report.present { "present" } else { "absent" },
+        escape_human(&report.channel_id),
+        escape_human(&report.message_ts),
+        escape_human(&report.name),
+        report.target_present,
+        report.changed,
+        report.reconciled
+    )
 }
 
 fn print_rendered(rendered: RenderedMessage, json: bool) -> Result<()> {
@@ -1301,7 +1562,10 @@ mod tests {
             Cli::try_parse_from(["lurkline", "mcp", "--allow-write"])
                 .unwrap()
                 .command,
-            Command::Mcp { allow_write: true }
+            Command::Mcp {
+                allow_write: true,
+                ..
+            }
         ));
         assert!(matches!(
             Cli::try_parse_from([
@@ -1448,6 +1712,9 @@ mod tests {
                 author_name: None,
                 text: "hello\r\x1b".into(),
                 blocks: None,
+                attachments: None,
+                reactions: vec![],
+                files: vec![],
                 permalink: None,
             };
             assert_eq!(
@@ -1455,5 +1722,118 @@ mod tests {
                 format!("100.000001\t{id}\t{name}\tU456\thello\\r\\u{{1b}}")
             );
         }
+    }
+
+    fn synthetic_file() -> FileReference {
+        FileReference {
+            id: "F123".into(),
+            name: Some("report\tfinal.pdf".into()),
+            title: Some("Report".into()),
+            mimetype: Some("application/pdf".into()),
+            filetype: Some("pdf".into()),
+            pretty_type: Some("PDF".into()),
+            mode: Some("hosted".into()),
+            file_access: None,
+            uploader_id: Some("U123".into()),
+            size: Some(42),
+            created: Some(1),
+            timestamp: Some(2),
+            editable: Some(false),
+            is_external: Some(false),
+            is_public: Some(false),
+            public_url_shared: Some(false),
+            private_url: Some("https://files.slack.com/private".into()),
+            download_url: Some("https://files.slack.com/file\nname".into()),
+            permalink: Some("https://workspace.slack.com/files/F123".into()),
+            shares: Some(vec![]),
+            shares_complete: true,
+        }
+    }
+
+    #[test]
+    fn new_human_printers_are_stable_and_escape_untrusted_fields() {
+        let file = synthetic_file();
+        assert_eq!(
+            format_file(&file),
+            "F123\t42\tapplication/pdf\treport\\tfinal.pdf\thttps://files.slack.com/file\\nname"
+        );
+
+        let download = FileDownloadReport {
+            file: file.clone(),
+            output_path: "downloads/report\nfinal.pdf".into(),
+            bytes_written: 42,
+            durability_warning: None,
+        };
+        assert_eq!(
+            format_file_download(&download),
+            "downloaded\tF123\t42\tdownloads/report\\nfinal.pdf"
+        );
+
+        let emoji = CustomEmojiList {
+            emoji: vec![
+                crate::model::CustomEmoji {
+                    name: "party\tparrot".into(),
+                    kind: CustomEmojiKind::Image,
+                    image_url: Some("https://emoji.slack-edge.com/image\nurl".into()),
+                    alias_for: None,
+                },
+                crate::model::CustomEmoji {
+                    name: "shipit".into(),
+                    kind: CustomEmojiKind::Alias,
+                    image_url: None,
+                    alias_for: Some("rocket".into()),
+                },
+            ],
+        };
+        assert_eq!(
+            format_custom_emoji(&emoji),
+            "party\\tparrot\timage\thttps://emoji.slack-edge.com/image\\nurl\nshipit\talias\trocket"
+        );
+
+        let reaction = ReactionMutationReport {
+            channel_id: "C123".into(),
+            message_ts: "100.000001".into(),
+            name: "eyes\nwide".into(),
+            target_present: true,
+            present: true,
+            changed: false,
+            reconciled: true,
+        };
+        assert_eq!(
+            format_reaction_mutation(&reaction),
+            "present\tC123\t100.000001\teyes\\nwide\ttarget_present=true\tchanged=false\treconciled=true"
+        );
+    }
+
+    #[test]
+    fn new_json_models_have_stable_field_names() {
+        let file = serde_json::to_value(synthetic_file()).unwrap();
+        assert_eq!(file["id"], "F123");
+        assert_eq!(file["size"], 42);
+        assert_eq!(file["shares"], serde_json::json!([]));
+        assert_eq!(file["shares_complete"], true);
+
+        let reaction = serde_json::to_value(ReactionMutationReport {
+            channel_id: "C123".into(),
+            message_ts: "100.000001".into(),
+            name: "eyes".into(),
+            target_present: false,
+            present: false,
+            changed: true,
+            reconciled: false,
+        })
+        .unwrap();
+        assert_eq!(
+            reaction,
+            serde_json::json!({
+                "channel_id": "C123",
+                "message_ts": "100.000001",
+                "name": "eyes",
+                "target_present": false,
+                "present": false,
+                "changed": true,
+                "reconciled": false
+            })
+        );
     }
 }

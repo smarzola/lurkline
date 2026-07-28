@@ -33,6 +33,29 @@ async fn response_with_id(
     .expect("MCP response timeout")
 }
 
+async fn call_tool(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    send(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments
+            }
+        }),
+    )
+    .await;
+    response_with_id(stdout, id).await
+}
+
 #[tokio::test]
 async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lurkline"))
@@ -41,7 +64,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         .env("SLACK_TEAM_ID", "T000TEST")
         .env("SLACK_TOKEN", "xoxc-mcp-test-secret")
         .env("SLACK_COOKIE", "d=xoxd-mcp-test-secret; b=test")
-        .env_remove("LURKLINE_TIMEOUT_MS")
+        .env("LURKLINE_TIMEOUT_MS", "500")
         .env_remove("LURKLINE_MAX_RESPONSE_BYTES")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -97,19 +120,24 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     assert_eq!(
         names,
         std::collections::BTreeSet::from([
+            "slack_add_reaction",
             "slack_doctor",
             "slack_create_draft",
             "slack_delete_draft",
+            "slack_download_file",
             "slack_find_conversations",
             "slack_find_users",
             "slack_get_draft",
+            "slack_get_file",
             "slack_get_message",
             "slack_list_conversations",
+            "slack_list_custom_emoji",
             "slack_list_drafts",
             "slack_list_unreads",
             "slack_read_channel",
             "slack_read_inbox",
             "slack_read_thread",
+            "slack_remove_reaction",
             "slack_render_markdown",
             "slack_search_messages",
             "slack_send_draft",
@@ -272,6 +300,125 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
                 "message": "Slack writes are disabled; start the MCP server with --allow-write"
             }
         })
+    );
+
+    for (id, name) in [(25, "slack_add_reaction"), (26, "slack_remove_reaction")] {
+        let response = call_tool(
+            &mut stdin,
+            &mut stdout,
+            id,
+            name,
+            json!({
+                "conversation": "C123",
+                "message_ts": "100.000001",
+                "name": "eyes",
+                "confirm": true
+            }),
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"], "write_not_allowed",
+            "{name}"
+        );
+    }
+
+    let download_disabled = call_tool(
+        &mut stdin,
+        &mut stdout,
+        27,
+        "slack_download_file",
+        json!({
+            "file_id": "F123",
+            "path": "synthetic.txt",
+            "max_bytes": 1024
+        }),
+    )
+    .await;
+    assert_eq!(download_disabled["result"]["isError"], true);
+    assert_eq!(
+        download_disabled["result"]["structuredContent"]["error"]["code"],
+        "file_root_required"
+    );
+
+    let invalid_download_path = call_tool(
+        &mut stdin,
+        &mut stdout,
+        30,
+        "slack_download_file",
+        json!({
+            "file_id": "F123",
+            "path": "../synthetic.txt",
+            "max_bytes": 1024
+        }),
+    )
+    .await;
+    assert_eq!(invalid_download_path["result"]["isError"], true);
+    assert_eq!(
+        invalid_download_path["result"]["structuredContent"]["error"]["code"],
+        "local_file"
+    );
+
+    let oversized_download_path = call_tool(
+        &mut stdin,
+        &mut stdout,
+        31,
+        "slack_download_file",
+        json!({
+            "file_id": "F123",
+            "path": "x".repeat(4097),
+            "max_bytes": 1024
+        }),
+    )
+    .await;
+    assert_eq!(oversized_download_path["result"]["isError"], true);
+    assert_eq!(
+        oversized_download_path["result"]["structuredContent"]["error"]["code"],
+        "local_file"
+    );
+    assert!(
+        oversized_download_path["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("4096-byte limit")
+    );
+
+    let invalid_file = call_tool(
+        &mut stdin,
+        &mut stdout,
+        28,
+        "slack_get_file",
+        json!({"file_id": "not-a-file"}),
+    )
+    .await;
+    assert_eq!(invalid_file["result"]["isError"], true);
+    assert_eq!(
+        invalid_file["result"]["structuredContent"]["error"]["code"],
+        "invalid_input"
+    );
+
+    let custom_emoji = call_tool(
+        &mut stdin,
+        &mut stdout,
+        29,
+        "slack_list_custom_emoji",
+        json!({}),
+    )
+    .await;
+    assert_eq!(custom_emoji["result"]["isError"], true);
+    assert!(
+        [
+            "authentication",
+            "http_status",
+            "invalid_response",
+            "timeout",
+            "transport"
+        ]
+        .contains(
+            &custom_emoji["result"]["structuredContent"]["error"]["code"]
+                .as_str()
+                .unwrap()
+        )
     );
 
     send(

@@ -9,12 +9,16 @@ Use Lurkline to:
 
 - Discover channels, direct messages (DMs), and group DMs.
 - Search messages and read bounded unread, history, and thread snapshots.
-- Preserve Slack's raw message blocks for lossless rich-text reads.
+- Preserve Slack's raw message blocks and legacy attachments losslessly.
+- Inspect file metadata, custom emoji, and potentially partial reaction users.
+- Download private Slack files to explicit, non-existing local paths.
+- Add or remove confirmed emoji reactions idempotently.
 - Render bounded Markdown as Slack `rich_text`.
 - Create, update, inspect, delete, and publish Slack drafts.
 - Send confirmed root messages and thread replies.
 
-Lurkline reads by default. CLI publication and deletion require `--confirm`.
+Lurkline reads by default. CLI publication, deletion, and reaction mutations
+require `--confirm`.
 The MCP server rejects every write unless you start it with
 `--allow-write`; publication and deletion then also require `confirm: true`.
 
@@ -64,11 +68,12 @@ history. Don't save it in a file, shell history, issue, or chat.
 The following safeguards apply to Slack writes:
 
 - `drafts create` and `drafts update` are explicit CLI write commands.
-- `drafts delete`, `drafts send`, `message send`, and `thread reply` require
-  `--confirm`.
+- `drafts delete`, `drafts send`, `message send`, `thread reply`, and reaction
+  add/remove require `--confirm`.
 - MCP draft mutations and publications require the server's `--allow-write`
   option.
-- MCP deletion and publication also require `confirm: true` in each tool call.
+- MCP deletion, publication, and reaction mutations also require
+  `confirm: true` in each tool call.
 - Every message publication uses a fresh UUID v4 client message ID.
 - Draft publication posts first and deletes the draft only after Slack returns
   a valid acknowledgement.
@@ -98,9 +103,9 @@ For example, run the following commands to verify and install the macOS ARM64
 archive:
 
 ```sh
-shasum -a 256 -c lurkline-v0.5.0-macos-aarch64.tar.gz.sha256
-tar -xzf lurkline-v0.5.0-macos-aarch64.tar.gz
-sudo install lurkline-v0.5.0-macos-aarch64/lurkline /usr/local/bin/lurkline
+shasum -a 256 -c lurkline-v0.6.0-macos-aarch64.tar.gz.sha256
+tar -xzf lurkline-v0.6.0-macos-aarch64.tar.gz
+sudo install lurkline-v0.6.0-macos-aarch64/lurkline /usr/local/bin/lurkline
 lurkline --version
 ```
 
@@ -220,9 +225,9 @@ files use mode `0600`.
 
 ### Re-import profiles after upgrading
 
-Lurkline v0.5.0 keeps profile names and default selection from v0.4.1, but it
-doesn't migrate stored credentials. Re-import each profile from a fresh browser
-request:
+Profiles created by v0.4.1 or earlier keep their names and default selection,
+but their stored credentials aren't migrated. Re-import each profile from a
+fresh browser request:
 
 ```sh
 pbpaste | lurkline auth import-curl --profile work
@@ -367,15 +372,81 @@ lurkline message get platform 1712345678.000100
 lurkline users find alice --limit 20
 ```
 
-Message and search JSON preserve Slack's raw `blocks` array alongside the
-normalized fallback `text`. Unknown nested block fields remain unchanged.
-`null` means Slack omitted `blocks`; `[]` means Slack returned an empty array.
+Message and search JSON preserve Slack's raw `blocks` and legacy
+`attachments` arrays alongside normalized fields. Unknown nested fields remain
+unchanged. For either field, `null` means Slack omitted it and `[]` means Slack
+returned an explicit empty array.
 
-Message results also normalize author, thread, reaction, and file-reference
-fields. File references can include private download URLs. Lurkline doesn't
-download files.
+Message results also normalize author, thread, reaction, and file metadata.
+Reaction `user_ids` can be shorter than `count`; check `user_ids_complete`
+before treating that list as exhaustive. Slack guarantees that the
+authenticated user remains present when that user reacted. Nullable or omitted
+file metadata remains `null`; sparse Slack Connect placeholders expose
+`mode: "file_access"` and `file_access: "check_file_info"` without inventing
+names, sizes, timestamps, or uploader IDs. File `shares` is `null` when Slack
+omits it and `[]` only when Slack returns an explicit empty object. Treat
+shares as exhaustive only when `shares_complete` is `true`; Slack's
+`has_more_shares` and `skipped_shares` indicators make it `false`.
 
 Add `--json` to a data-returning command for structured JSON.
+
+## Inspect files, emoji, and reactions
+
+Fetch bounded metadata for an exact Slack file:
+
+```sh
+lurkline files info F0123456789 --json
+```
+
+Download a private file to an explicit path:
+
+```sh
+lurkline files download F0123456789 \
+  --output ./downloads/report.pdf \
+  --max-bytes 104857600 \
+  --json
+```
+
+The output path must not exist. Lurkline opens every parent through directory
+descriptors, rejects empty, `.`, `..`, and symbolic-link components, creates a
+mode-`0600` temporary file, streams within the requested bound, syncs it, and
+atomically commits without replacement. A failure before the commit removes
+the temporary file. A parent-directory sync failure after the commit returns
+success with a durability warning. Local paths are limited to 4,096 bytes, 64
+components, and 255 bytes per component.
+
+Lurkline obtains the download URL from `files.info`; callers can't supply one.
+The response must include both an exact byte size and a private download URL.
+It uses a separate file client. The first validated
+`https://files.slack.com` request carries the browser token and cookie because
+Slack requires both for private file bytes. A successful response must have the
+observed `application/force-download` media type before any bytes are written.
+Any validated redirect is followed without either credential. Redirects away
+from that exact origin, non-HTTPS URLs, embedded URL credentials, and more than
+three hops fail.
+
+List custom emoji and aliases:
+
+```sh
+lurkline emoji list --json
+```
+
+Ensure a reaction is present or absent:
+
+```sh
+lurkline reactions add platform 1712345678.000100 eyes --confirm --json
+lurkline reactions remove platform 1712345678.000100 eyes --confirm --json
+lurkline reactions add platform 1712345678.000100 \
+  'thumbsup::skin-tone-6' --confirm --json
+```
+
+Reaction operations read the exact target state first. Already-satisfied
+requests succeed without a write. After a mutation or ambiguous transport
+result, Lurkline reads the exact message again. A known non-target state returns
+`reaction_not_applied`, for which a deliberate retry is safe. An unreadable
+state returns `reaction_uncertain`; inspect the message before retrying.
+
+Legacy attachments remain read-only. File upload arrives in a later release.
 
 ## Render Markdown
 
@@ -418,7 +489,7 @@ lurkline drafts get DR123 --json
 Create a root-message draft from standard input:
 
 ```sh
-printf '%s\n' 'Review **release 0.5.0**.' \
+printf '%s\n' 'Review **release 0.6.0**.' \
   | lurkline drafts create platform
 ```
 
@@ -468,7 +539,7 @@ their contract.
 Send a root message from standard input:
 
 ```sh
-printf '%s\n' 'Release **0.5.0** is ready.' \
+printf '%s\n' 'Release **0.6.0** is ready.' \
   | lurkline message send platform --confirm --json
 ```
 
@@ -535,6 +606,29 @@ To expose write tools, explicitly add `--allow-write`:
 }
 ```
 
+To expose local downloads, configure one absolute file root:
+
+```json
+{
+  "mcpServers": {
+    "lurkline": {
+      "command": "lurkline",
+      "args": [
+        "--profile",
+        "work",
+        "mcp",
+        "--file-root",
+        "/Users/me/SlackDownloads"
+      ]
+    }
+  }
+}
+```
+
+MCP download paths must be relative to that root. Lurkline opens the root once
+at server startup and rejects path escapes, replacements, and symbolic links.
+File downloads don't require `--allow-write` because they don't mutate Slack.
+
 Omit `--profile work` to use `LURKLINE_PROFILE` or the registry default. The
 MCP server and CLI resolve credentials through the same path.
 
@@ -551,6 +645,9 @@ The following table maps common tasks to CLI commands and MCP tools:
 | Read conversation history | `lurkline channel read` | `slack_read_channel` |
 | Read a thread | `lurkline thread read` | `slack_read_thread` |
 | Fetch an exact message | `lurkline message get` | `slack_get_message` |
+| Get or download a file | `lurkline files info`, `download` | `slack_get_file`, `slack_download_file` |
+| List custom emoji | `lurkline emoji list` | `slack_list_custom_emoji` |
+| Add or remove a reaction | `lurkline reactions add`, `remove` | `slack_add_reaction`, `slack_remove_reaction` |
 | Find workspace users | `lurkline users find` | `slack_find_users` |
 | List or inspect drafts | `lurkline drafts list`, `get` | `slack_list_drafts`, `slack_get_draft` |
 | Create or update a draft | `lurkline drafts create`, `update` | `slack_create_draft`, `slack_update_draft` |
@@ -578,6 +675,10 @@ The following table lists primary and auxiliary bounds:
 | Channel history | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Thread replies | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Exact message | One message | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
+| File metadata | One file | No discovery for a file ID |
+| File download | 100 MiB default; 1 GiB hard limit | Path: 4,096 bytes, 64 components, 255 bytes each; three validated redirect hops |
+| Custom emoji | 10,000 | No pagination |
+| Message reactions | 100 reaction names; 1,000 returned users each | User list can be partial |
 | User find | 100 | 20 user pages of 200 |
 
 Opaque cursors are limited to 2,048 non-control characters. Repeated response
@@ -601,11 +702,16 @@ The browser token and `d=` cookie carry your Slack user authority. Lurkline:
   process-environment override.
 - Stores only normalized credential fields, never the copied cURL request.
 - Zeroizes owned secret buffers where practical and redacts diagnostics.
-- Sends credentials only to a root HTTPS origin for a single-label
-  `*.slack.com` workspace.
-- Rejects redirects and bounds request input and response output.
+- Sends browser Web API method credentials only to the configured single-label
+  `*.slack.com` workspace origin.
+- Uses a separate file client, sends the token and cookie only on the first
+  exact `https://files.slack.com` download request after live validation, and
+  strips both from redirects.
+- Rejects API redirects, validates file redirects, and bounds request input,
+  response output, and streamed file bytes.
 - Keeps MCP writes disabled unless the operator passes `--allow-write`.
-- Requires per-call confirmation for publication and deletion.
+- Requires per-call confirmation for publication, deletion, and reaction
+  mutations.
 - Escapes control characters in human-readable output.
 - Keeps MCP protocol output separate from diagnostics.
 
@@ -629,9 +735,10 @@ Lurkline doesn't provide:
 - Automatic browser credential extraction or refresh.
 - Bot or OAuth authentication.
 - Credential helper protocols or external helper execution.
-- Arbitrary Block Kit, attachments, files, or multi-destination drafts.
+- Arbitrary Block Kit, attachment authoring, files in drafts, or
+  multi-destination drafts.
 - Sent-message editing or deletion.
-- Reactions, file uploads, scheduled messages, workflows, or canvases.
+- File uploads, file deletion, scheduled messages, workflows, or canvases.
 - Conversation creation.
 - Automatic retry after an uncertain publication.
 - Local caching, unread-state persistence, or background synchronization.

@@ -10,17 +10,22 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     error::{Error, Result},
+    local_file::{BoundedDownload, DownloadDurability},
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     model::{
         ClientCountsPayload, Conversation, ConversationKind, ConversationPage,
-        ConversationSearchReport, ConversationSearchTruncationReason, DoctorReport, Draft,
-        DraftCleanupWarning, DraftDeleteReport, DraftDestination, DraftPage, DraftSendReport,
-        FileReference, InboxConversation, InboxReport, Message, MessagePage, MessageSearchMatch,
-        MessageSearchPage, RawConversation, RawConversationsPage, RawDraft, RawDraftResponse,
-        RawDraftRevision, RawDraftsPage, RawMessage, RawMessagePage, RawMessageSearchMatch,
-        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
-        RawUnread, RawUser, RawUsersPage, Reaction, SentMessage, ThreadPage, UnreadConversation,
-        UnreadReport, UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
+        ConversationSearchReport, ConversationSearchTruncationReason, CustomEmoji, CustomEmojiKind,
+        CustomEmojiList, DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport,
+        DraftDestination, DraftPage, DraftSendReport, FileDownloadReport, FileReference, FileShare,
+        FileShareVisibility, InboxConversation, InboxReport, Message, MessagePage,
+        MessageSearchMatch, MessageSearchPage, RawAuthTestResponse, RawConversation,
+        RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision, RawDraftsPage,
+        RawEmojiResponse, RawFile, RawFileResponse, RawMessage, RawMessagePage,
+        RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList, RawMutationResponse,
+        RawPostMessageResponse, RawReaction, RawReactionItemResponse, RawUnread, RawUser,
+        RawUsersPage, Reaction, ReactionMutationReport, SentMessage, ThreadPage,
+        UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
+        UserSearchTruncationReason,
     },
 };
 
@@ -34,7 +39,15 @@ const MAX_CONVERSATION_PAGES: usize = 20;
 const USERS_PAGE_SIZE: usize = 200;
 const MAX_USER_PAGES: usize = 20;
 pub(crate) const MAX_DRAFTS: usize = 100;
+pub(crate) const DEFAULT_FILE_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_FILE_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DRAFT_DESTINATION_USERS: usize = 100;
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 100;
+const MAX_FILES_PER_MESSAGE: usize = 100;
+const MAX_FILE_SHARES: usize = 1_000;
+const MAX_REACTIONS_PER_MESSAGE: usize = 100;
+const MAX_REACTION_USERS: usize = 1_000;
+const MAX_CUSTOM_EMOJI: usize = 10_000;
 
 #[async_trait]
 pub(crate) trait SlackApi: Send + Sync {
@@ -65,6 +78,64 @@ pub(crate) trait SlackApi: Send + Sync {
         limit: usize,
     ) -> Result<RawMessageSearchResponse>;
     async fn users_list(&self, cursor: Option<&str>, limit: usize) -> Result<RawUsersPage>;
+    async fn auth_test(&self) -> Result<RawAuthTestResponse> {
+        Err(Error::InvalidResponse {
+            method: "auth.test",
+        })
+    }
+    async fn emoji_list(&self) -> Result<RawEmojiResponse> {
+        Err(Error::InvalidResponse {
+            method: "emoji.list",
+        })
+    }
+    async fn files_info(&self, file_id: &str) -> Result<RawFileResponse> {
+        let _ = file_id;
+        Err(Error::InvalidResponse {
+            method: "files.info",
+        })
+    }
+    async fn reactions_get(
+        &self,
+        channel: &str,
+        message_ts: &str,
+    ) -> Result<RawReactionItemResponse> {
+        let _ = (channel, message_ts);
+        Err(Error::InvalidResponse {
+            method: "reactions.get",
+        })
+    }
+    async fn reactions_add(
+        &self,
+        channel: &str,
+        message_ts: &str,
+        name: &str,
+    ) -> Result<RawMutationResponse> {
+        let _ = (channel, message_ts, name);
+        Err(Error::InvalidResponse {
+            method: "reactions.add",
+        })
+    }
+    async fn reactions_remove(
+        &self,
+        channel: &str,
+        message_ts: &str,
+        name: &str,
+    ) -> Result<RawMutationResponse> {
+        let _ = (channel, message_ts, name);
+        Err(Error::InvalidResponse {
+            method: "reactions.remove",
+        })
+    }
+    async fn download_private_file(
+        &self,
+        download_url: &str,
+        target: &mut BoundedDownload,
+    ) -> Result<()> {
+        let _ = (download_url, target);
+        Err(Error::InvalidResponse {
+            method: "files.download",
+        })
+    }
     async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
         let _ = (next_ts, limit);
         Err(Error::InvalidResponse {
@@ -156,6 +227,206 @@ impl SlackService {
             team_id: self.team_id.clone(),
             workspace_url: self.workspace_url.clone(),
         })
+    }
+
+    pub(crate) async fn list_custom_emoji(&self) -> Result<CustomEmojiList> {
+        let raw = self.api.emoji_list().await?;
+        if raw.emoji.len() > MAX_CUSTOM_EMOJI {
+            return Err(Error::InvalidResponse {
+                method: "emoji.list",
+            });
+        }
+        let mut emoji = raw
+            .emoji
+            .into_iter()
+            .map(|(name, value)| normalize_custom_emoji(name, value))
+            .collect::<Result<Vec<_>>>()?;
+        emoji.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(CustomEmojiList { emoji })
+    }
+
+    pub(crate) async fn get_file(&self, file_id: &str) -> Result<FileReference> {
+        validate_file_id(file_id)?;
+        let file = normalize_file(self.api.files_info(file_id).await?.file, "files.info")?;
+        if file.id != file_id {
+            return Err(Error::InvalidResponse {
+                method: "files.info",
+            });
+        }
+        Ok(file)
+    }
+
+    pub(crate) async fn download_file(
+        &self,
+        file: FileReference,
+        mut target: BoundedDownload,
+        output_path: String,
+    ) -> Result<FileDownloadReport> {
+        let expected_size = file.size.ok_or(Error::NotFound {
+            resource: "Slack file size",
+        })?;
+        if expected_size > MAX_FILE_DOWNLOAD_BYTES {
+            return Err(Error::invalid_input(
+                "max_bytes",
+                "Slack file is larger than the 1 GiB hard limit",
+            ));
+        }
+        let download_url = file.download_url.as_deref().ok_or(Error::NotFound {
+            resource: "Slack file download",
+        })?;
+        self.api
+            .download_private_file(download_url, &mut target)
+            .await?;
+        if target.bytes_written() != expected_size {
+            return Err(Error::InvalidResponse {
+                method: "files.download",
+            });
+        }
+        let commit = target.commit()?;
+        Ok(FileDownloadReport {
+            file,
+            output_path,
+            bytes_written: commit.bytes_written,
+            durability_warning: (commit.durability == DownloadDurability::DirectorySyncWarning)
+                .then(|| "file committed, but the parent directory could not be synced".into()),
+        })
+    }
+
+    pub(crate) async fn add_reaction(
+        &self,
+        conversation: &str,
+        message_ts: &str,
+        name: &str,
+        confirmed: bool,
+    ) -> Result<ReactionMutationReport> {
+        self.set_reaction(conversation, message_ts, name, true, confirmed)
+            .await
+    }
+
+    pub(crate) async fn remove_reaction(
+        &self,
+        conversation: &str,
+        message_ts: &str,
+        name: &str,
+        confirmed: bool,
+    ) -> Result<ReactionMutationReport> {
+        self.set_reaction(conversation, message_ts, name, false, confirmed)
+            .await
+    }
+
+    async fn set_reaction(
+        &self,
+        conversation: &str,
+        message_ts: &str,
+        name: &str,
+        target_present: bool,
+        confirmed: bool,
+    ) -> Result<ReactionMutationReport> {
+        require_confirmation("reaction mutation", confirmed)?;
+        validate_timestamp("message_ts", message_ts)?;
+        let name = validate_reaction_name(name)?;
+        let channel_id = self.resolve_conversation_id(conversation).await?;
+        let user_id = self.api.auth_test().await?.user_id;
+        if !is_valid_user_id(&user_id) {
+            return Err(Error::InvalidResponse {
+                method: "auth.test",
+            });
+        }
+        let before = self
+            .reaction_is_present(&channel_id, message_ts, &name, &user_id)
+            .await?;
+        if before == target_present {
+            return Ok(ReactionMutationReport {
+                channel_id,
+                message_ts: message_ts.to_owned(),
+                name,
+                target_present,
+                present: target_present,
+                changed: false,
+                reconciled: false,
+            });
+        }
+
+        let mutation = if target_present {
+            self.api.reactions_add(&channel_id, message_ts, &name).await
+        } else {
+            self.api
+                .reactions_remove(&channel_id, message_ts, &name)
+                .await
+        };
+        let ambiguous_mutation = match mutation {
+            Ok(_) => false,
+            Err(Error::SlackApi { method, code })
+                if (method == "reactions.add" && code == "already_reacted")
+                    || (method == "reactions.remove" && code == "no_reaction") =>
+            {
+                return Ok(ReactionMutationReport {
+                    channel_id,
+                    message_ts: message_ts.to_owned(),
+                    name,
+                    target_present,
+                    present: target_present,
+                    changed: false,
+                    reconciled: true,
+                });
+            }
+            Err(error) if reaction_error_is_ambiguous(&error) => true,
+            Err(error) => return Err(error),
+        };
+
+        match self
+            .reaction_is_present(&channel_id, message_ts, &name, &user_id)
+            .await
+        {
+            Ok(present) if present == target_present => Ok(ReactionMutationReport {
+                channel_id,
+                message_ts: message_ts.to_owned(),
+                name,
+                target_present,
+                present,
+                changed: true,
+                reconciled: ambiguous_mutation,
+            }),
+            Ok(_) => Err(Error::ReactionNotApplied {
+                channel_id,
+                message_ts: message_ts.to_owned(),
+                name,
+            }),
+            Err(_) => Err(Error::ReactionUncertain {
+                channel_id,
+                message_ts: message_ts.to_owned(),
+                name,
+            }),
+        }
+    }
+
+    async fn reaction_is_present(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+        name: &str,
+        user_id: &str,
+    ) -> Result<bool> {
+        let response = self.api.reactions_get(channel_id, message_ts).await?;
+        if response.item_type != "message" || response.channel.as_deref() != Some(channel_id) {
+            return Err(Error::InvalidResponse {
+                method: "reactions.get",
+            });
+        }
+        let message = response.message.ok_or(Error::InvalidResponse {
+            method: "reactions.get",
+        })?;
+        if message.ts != message_ts {
+            return Err(Error::InvalidResponse {
+                method: "reactions.get",
+            });
+        }
+        let normalized = normalize_message(channel_id, message, "reactions.get")?;
+        Ok(normalized
+            .reactions
+            .iter()
+            .find(|reaction| reaction.name == name)
+            .is_some_and(|reaction| reaction.user_ids.iter().any(|id| id == user_id)))
     }
 
     pub(crate) async fn list_drafts(
@@ -803,13 +1074,23 @@ impl SlackService {
                 method: "messages.list",
             });
         }
-        candidates
+        let mut matches = candidates
             .into_iter()
-            .find(|message| message.ts == message_ts)
-            .map(|message| normalize_message(&channel, message))
-            .ok_or(Error::NotFound {
+            .filter(|message| message.ts == message_ts);
+        let Some(first) = matches.next() else {
+            return Err(Error::NotFound {
                 resource: "Slack message",
-            })
+            });
+        };
+        let first = normalize_message(&channel, first, "messages.list")?;
+        for duplicate in matches {
+            if normalize_message(&channel, duplicate, "messages.list")? != first {
+                return Err(Error::InvalidResponse {
+                    method: "messages.list",
+                });
+            }
+        }
+        Ok(first)
     }
 
     pub(crate) async fn find_users(&self, query: &str, limit: usize) -> Result<UserSearchReport> {
@@ -1288,6 +1569,9 @@ fn normalize_search_matches(
                 author_name,
                 text: raw.text,
                 blocks: raw.blocks,
+                attachments: normalize_attachments(raw.attachments, "search.messages")?,
+                reactions: normalize_reactions(raw.reactions, "search.messages")?,
+                files: normalize_files(raw.files, "search.messages")?,
                 permalink,
             })
         })
@@ -1332,11 +1616,11 @@ fn normalize_messages(
     {
         return Err(Error::InvalidResponse { method });
     }
-    Ok(messages
+    messages
         .into_iter()
         .take(limit)
-        .map(|message| normalize_message(channel, message))
-        .collect())
+        .map(|message| normalize_message(channel, message, method))
+        .collect::<Result<Vec<_>>>()
 }
 
 fn normalize_draft(raw: RawDraft, method: &'static str) -> Result<Draft> {
@@ -1429,7 +1713,7 @@ fn normalize_sent_message(
     }
     Ok(SentMessage {
         client_msg_id,
-        message: normalize_message(channel_id, response.message),
+        message: normalize_message(channel_id, response.message, "chat.postMessage")?,
     })
 }
 
@@ -1608,8 +1892,220 @@ fn require_supported_draft(draft: &Draft) -> Result<()> {
     }
 }
 
-fn normalize_message(channel: &str, message: RawMessage) -> Message {
-    Message {
+fn normalize_attachments(
+    attachments: Option<Vec<serde_json::Value>>,
+    method: &'static str,
+) -> Result<Option<Vec<serde_json::Value>>> {
+    if attachments
+        .as_ref()
+        .is_some_and(|attachments| attachments.len() > MAX_ATTACHMENTS_PER_MESSAGE)
+    {
+        return Err(Error::InvalidResponse { method });
+    }
+    Ok(attachments)
+}
+
+fn normalize_reactions(reactions: Vec<RawReaction>, method: &'static str) -> Result<Vec<Reaction>> {
+    if reactions.len() > MAX_REACTIONS_PER_MESSAGE {
+        return Err(Error::InvalidResponse { method });
+    }
+    let mut names = HashSet::with_capacity(reactions.len());
+    reactions
+        .into_iter()
+        .map(|reaction| {
+            let name = validate_reaction_name(&reaction.name)
+                .map_err(|_| Error::InvalidResponse { method })?;
+            if !names.insert(name.clone())
+                || reaction.users.len() > MAX_REACTION_USERS
+                || reaction.count < reaction.users.len() as u64
+                || reaction
+                    .users
+                    .iter()
+                    .any(|user_id| !is_valid_user_id(user_id))
+            {
+                return Err(Error::InvalidResponse { method });
+            }
+            let mut user_ids = reaction.users;
+            user_ids.sort();
+            user_ids.dedup();
+            if reaction.count < user_ids.len() as u64 {
+                return Err(Error::InvalidResponse { method });
+            }
+            Ok(Reaction {
+                name,
+                count: reaction.count,
+                user_ids_complete: reaction.count == user_ids.len() as u64,
+                user_ids,
+            })
+        })
+        .collect()
+}
+
+fn normalize_files(files: Vec<RawFile>, method: &'static str) -> Result<Vec<FileReference>> {
+    if files.len() > MAX_FILES_PER_MESSAGE {
+        return Err(Error::InvalidResponse { method });
+    }
+    files
+        .into_iter()
+        .map(|file| normalize_file(file, method))
+        .collect()
+}
+
+fn normalize_file(raw: RawFile, method: &'static str) -> Result<FileReference> {
+    if !is_valid_file_id(&raw.id)
+        || !is_bounded_optional_text(raw.name.as_deref(), 1_024)
+        || !is_bounded_optional_text(raw.title.as_deref(), 1_024)
+        || !is_bounded_optional_text(raw.mimetype.as_deref(), 256)
+        || !is_bounded_optional_text(raw.filetype.as_deref(), 128)
+        || !is_bounded_optional_text(raw.pretty_type.as_deref(), 256)
+        || !is_bounded_optional_text(raw.mode.as_deref(), 64)
+        || !is_bounded_optional_text(raw.file_access.as_deref(), 128)
+        || raw
+            .user
+            .as_deref()
+            .is_some_and(|user_id| !user_id.is_empty() && !is_valid_user_id(user_id))
+    {
+        return Err(Error::InvalidResponse { method });
+    }
+    for candidate in [
+        raw.url_private.as_deref(),
+        raw.url_private_download.as_deref(),
+        raw.permalink.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !is_safe_metadata_url(candidate) {
+            return Err(Error::InvalidResponse { method });
+        }
+    }
+
+    let shares = if let Some(raw_shares) = raw.shares {
+        let share_channels = raw_shares
+            .public
+            .len()
+            .saturating_add(raw_shares.private.len());
+        let share_count = raw_shares
+            .public
+            .values()
+            .chain(raw_shares.private.values())
+            .map(Vec::len)
+            .sum::<usize>();
+        if share_channels > MAX_FILE_SHARES || share_count > MAX_FILE_SHARES {
+            return Err(Error::InvalidResponse { method });
+        }
+        let mut shares = Vec::with_capacity(share_count);
+        append_file_shares(
+            &mut shares,
+            raw_shares.public,
+            FileShareVisibility::Public,
+            method,
+        )?;
+        append_file_shares(
+            &mut shares,
+            raw_shares.private,
+            FileShareVisibility::Private,
+            method,
+        )?;
+        shares.sort_by(|left, right| {
+            left.channel_id
+                .cmp(&right.channel_id)
+                .then_with(|| left.ts.cmp(&right.ts))
+                .then_with(|| left.thread_ts.cmp(&right.thread_ts))
+        });
+        Some(shares)
+    } else {
+        None
+    };
+    let shares_complete =
+        shares.is_some() && raw.has_more_shares != Some(true) && raw.skipped_shares != Some(true);
+
+    Ok(FileReference {
+        id: raw.id,
+        name: raw.name,
+        title: raw.title,
+        mimetype: raw.mimetype,
+        filetype: raw.filetype,
+        pretty_type: raw.pretty_type,
+        mode: raw.mode,
+        file_access: raw.file_access,
+        uploader_id: raw.user.filter(|user_id| !user_id.is_empty()),
+        size: raw.size,
+        created: raw.created,
+        timestamp: raw.timestamp,
+        editable: raw.editable,
+        is_external: raw.is_external,
+        is_public: raw.is_public,
+        public_url_shared: raw.public_url_shared,
+        private_url: raw.url_private,
+        download_url: raw.url_private_download,
+        permalink: raw.permalink,
+        shares,
+        shares_complete,
+    })
+}
+
+fn append_file_shares(
+    target: &mut Vec<FileShare>,
+    source: std::collections::BTreeMap<String, Vec<crate::model::RawFileShare>>,
+    visibility: FileShareVisibility,
+    method: &'static str,
+) -> Result<()> {
+    for (channel_id, shares) in source {
+        if !is_valid_any_conversation_id(&channel_id) {
+            return Err(Error::InvalidResponse { method });
+        }
+        for share in shares {
+            if !is_valid_timestamp(&share.ts)
+                || share
+                    .thread_ts
+                    .as_deref()
+                    .is_some_and(|thread_ts| !is_valid_timestamp(thread_ts))
+            {
+                return Err(Error::InvalidResponse { method });
+            }
+            target.push(FileShare {
+                visibility,
+                channel_id: channel_id.clone(),
+                ts: share.ts,
+                thread_ts: share.thread_ts,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn normalize_custom_emoji(name: String, value: String) -> Result<CustomEmoji> {
+    let name = validate_emoji_name(&name).map_err(|_| Error::InvalidResponse {
+        method: "emoji.list",
+    })?;
+    if let Some(alias) = value.strip_prefix("alias:") {
+        return Ok(CustomEmoji {
+            name,
+            kind: CustomEmojiKind::Alias,
+            image_url: None,
+            alias_for: Some(
+                validate_emoji_name(alias).map_err(|_| Error::InvalidResponse {
+                    method: "emoji.list",
+                })?,
+            ),
+        });
+    }
+    if !is_safe_metadata_url(&value) {
+        return Err(Error::InvalidResponse {
+            method: "emoji.list",
+        });
+    }
+    Ok(CustomEmoji {
+        name,
+        kind: CustomEmojiKind::Image,
+        image_url: Some(value),
+        alias_for: None,
+    })
+}
+
+fn normalize_message(channel: &str, message: RawMessage, method: &'static str) -> Result<Message> {
+    Ok(Message {
         channel_id: channel.to_owned(),
         ts: message.ts,
         thread_ts: message.thread_ts,
@@ -1617,28 +2113,97 @@ fn normalize_message(channel: &str, message: RawMessage) -> Message {
         author_name: message.username,
         text: message.text,
         blocks: message.blocks,
+        attachments: normalize_attachments(message.attachments, method)?,
         reply_count: message.reply_count,
         latest_reply: message.latest_reply,
-        reactions: message
-            .reactions
-            .into_iter()
-            .map(|reaction| Reaction {
-                name: reaction.name,
-                count: reaction.count,
-            })
-            .collect(),
-        files: message
-            .files
-            .into_iter()
-            .map(|file| FileReference {
-                id: file.id,
-                name: file.name,
-                mimetype: file.mimetype,
-                size: file.size,
-                download_url: file.url_private_download,
-            })
-            .collect(),
+        reactions: normalize_reactions(message.reactions, method)?,
+        files: normalize_files(message.files, method)?,
+    })
+}
+
+fn reaction_error_is_ambiguous(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::HttpStatus { .. }
+            | Error::ResponseTooLarge { .. }
+            | Error::InvalidResponse { .. }
+            | Error::Timeout { .. }
+            | Error::Transport { .. }
+    ) || matches!(
+        error,
+        Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
+    )
+}
+
+fn validate_file_id(file_id: &str) -> Result<()> {
+    if is_valid_file_id(file_id) {
+        Ok(())
+    } else {
+        Err(Error::invalid_input(
+            "file_id",
+            "must be a Slack file identifier",
+        ))
     }
+}
+
+fn is_valid_file_id(file_id: &str) -> bool {
+    file_id.starts_with('F')
+        && (2..=64).contains(&file_id.len())
+        && file_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn validate_emoji_name(name: &str) -> Result<String> {
+    let name = name.trim_matches(':');
+    if is_valid_basic_emoji_name(name) {
+        Ok(name.to_owned())
+    } else {
+        Err(Error::invalid_input(
+            "name",
+            "must be a 1 to 100 character Slack emoji name",
+        ))
+    }
+}
+
+fn validate_reaction_name(name: &str) -> Result<String> {
+    let normalized = name.trim_matches(':');
+    let valid = if let Some((base, tone)) = normalized.split_once("::skin-tone-") {
+        !base.contains(':')
+            && is_valid_basic_emoji_name(base)
+            && matches!(tone.as_bytes(), [b'2'..=b'6'])
+    } else {
+        is_valid_basic_emoji_name(normalized)
+    };
+    if valid && normalized.len() <= 120 {
+        Ok(normalized.to_owned())
+    } else {
+        Err(Error::invalid_input(
+            "name",
+            "must be a Slack emoji name, optionally followed by ::skin-tone-2 through ::skin-tone-6",
+        ))
+    }
+}
+
+fn is_valid_basic_emoji_name(name: &str) -> bool {
+    (1..=100).contains(&name.len())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'+')
+        })
+}
+
+fn is_bounded_optional_text(value: Option<&str>, maximum: usize) -> bool {
+    value.is_none_or(|value| is_bounded_untrusted_text(value, maximum))
+}
+
+fn is_bounded_untrusted_text(value: &str, maximum: usize) -> bool {
+    value.len() <= maximum && !value.chars().any(|character| character == '\0')
+}
+
+fn is_safe_metadata_url(value: &str) -> bool {
+    value.len() <= 8_192
+        && !value.chars().any(char::is_control)
+        && url::Url::parse(value)
+            .ok()
+            .is_some_and(|url| url.scheme() == "https" && url.host_str().is_some())
 }
 
 fn normalize_user(raw: RawUser) -> User {
@@ -1986,6 +2551,19 @@ mod tests {
         post_response: Option<RawPostMessageResponse>,
         post_error: Option<String>,
         post_calls: Arc<Mutex<Vec<PostCall>>>,
+        emoji_response: RawEmojiResponse,
+        file_response: RawFileResponse,
+        reaction_present: Arc<Mutex<bool>>,
+        reaction_name: Arc<Mutex<String>>,
+        reaction_error: Option<&'static str>,
+        reaction_apply_before_error: bool,
+        reaction_get_error_after: Option<usize>,
+        reaction_wrong_channel_after: Option<usize>,
+        reaction_wrong_type_after: Option<usize>,
+        reaction_duplicate_after: Option<usize>,
+        reaction_get_count: Arc<Mutex<usize>>,
+        reaction_calls: Arc<Mutex<Vec<String>>>,
+        download_bytes: Vec<u8>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2137,6 +2715,147 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_default())
+        }
+
+        async fn auth_test(&self) -> Result<RawAuthTestResponse> {
+            Ok(RawAuthTestResponse {
+                user_id: "U123".into(),
+            })
+        }
+
+        async fn emoji_list(&self) -> Result<RawEmojiResponse> {
+            Ok(self.emoji_response.clone())
+        }
+
+        async fn files_info(&self, _file_id: &str) -> Result<RawFileResponse> {
+            Ok(self.file_response.clone())
+        }
+
+        async fn reactions_get(
+            &self,
+            channel: &str,
+            message_ts: &str,
+        ) -> Result<RawReactionItemResponse> {
+            self.reaction_calls.lock().unwrap().push("get".into());
+            let mut get_count = self.reaction_get_count.lock().unwrap();
+            *get_count += 1;
+            if self
+                .reaction_get_error_after
+                .is_some_and(|successful_reads| *get_count > successful_reads)
+            {
+                return Err(Error::Transport {
+                    method: "reactions.get",
+                });
+            }
+            let present = *self.reaction_present.lock().unwrap();
+            let name = self.reaction_name.lock().unwrap().clone();
+            let is_after = |threshold: Option<usize>| {
+                threshold.is_some_and(|successful_reads| *get_count > successful_reads)
+            };
+            let mut reactions = present
+                .then(|| RawReaction {
+                    name: name.clone(),
+                    count: 1,
+                    users: vec!["U123".into()],
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            if is_after(self.reaction_duplicate_after) {
+                reactions.push(RawReaction {
+                    name,
+                    count: 1,
+                    users: vec![],
+                });
+            }
+            Ok(RawReactionItemResponse {
+                item_type: if is_after(self.reaction_wrong_type_after) {
+                    "file".into()
+                } else {
+                    "message".into()
+                },
+                channel: Some(
+                    if is_after(self.reaction_wrong_channel_after) {
+                        "COTHER"
+                    } else {
+                        channel
+                    }
+                    .into(),
+                ),
+                message: Some(RawMessage {
+                    ts: message_ts.into(),
+                    reactions,
+                    ..RawMessage::default()
+                }),
+            })
+        }
+
+        async fn reactions_add(
+            &self,
+            _channel: &str,
+            _message_ts: &str,
+            name: &str,
+        ) -> Result<RawMutationResponse> {
+            self.reaction_calls.lock().unwrap().push("add".into());
+            *self.reaction_name.lock().unwrap() = name.into();
+            if self.reaction_error.is_none()
+                || self.reaction_error == Some("already_reacted")
+                || self.reaction_apply_before_error
+            {
+                *self.reaction_present.lock().unwrap() = true;
+            }
+            match self.reaction_error {
+                Some("timeout") => Err(Error::Timeout {
+                    method: "reactions.add",
+                }),
+                Some("invalid_response") => Err(Error::InvalidResponse {
+                    method: "reactions.add",
+                }),
+                Some(code) => Err(Error::SlackApi {
+                    method: "reactions.add",
+                    code: code.into(),
+                }),
+                None => Ok(RawMutationResponse::default()),
+            }
+        }
+
+        async fn reactions_remove(
+            &self,
+            _channel: &str,
+            _message_ts: &str,
+            name: &str,
+        ) -> Result<RawMutationResponse> {
+            self.reaction_calls.lock().unwrap().push("remove".into());
+            *self.reaction_name.lock().unwrap() = name.into();
+            if self.reaction_error.is_none()
+                || self.reaction_error == Some("no_reaction")
+                || self.reaction_apply_before_error
+            {
+                *self.reaction_present.lock().unwrap() = false;
+            }
+            match self.reaction_error {
+                Some("timeout") => Err(Error::Timeout {
+                    method: "reactions.remove",
+                }),
+                Some("invalid_response") => Err(Error::InvalidResponse {
+                    method: "reactions.remove",
+                }),
+                Some(code) => Err(Error::SlackApi {
+                    method: "reactions.remove",
+                    code: code.into(),
+                }),
+                None => Ok(RawMutationResponse::default()),
+            }
+        }
+
+        async fn download_private_file(
+            &self,
+            _download_url: &str,
+            target: &mut BoundedDownload,
+        ) -> Result<()> {
+            for chunk in self.download_bytes.chunks(2) {
+                target.write_chunk(chunk)?;
+            }
+            Ok(())
         }
 
         async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
@@ -2338,6 +3057,19 @@ mod tests {
             post_response: None,
             post_error: None,
             post_calls: Arc::new(Mutex::new(Vec::new())),
+            emoji_response: RawEmojiResponse::default(),
+            file_response: RawFileResponse::default(),
+            reaction_present: Arc::new(Mutex::new(false)),
+            reaction_name: Arc::new(Mutex::new("eyes".into())),
+            reaction_error: None,
+            reaction_apply_before_error: false,
+            reaction_get_error_after: None,
+            reaction_wrong_channel_after: None,
+            reaction_wrong_type_after: None,
+            reaction_duplicate_after: None,
+            reaction_get_count: Arc::new(Mutex::new(0)),
+            reaction_calls: Arc::new(Mutex::new(Vec::new())),
+            download_bytes: b"safe".to_vec(),
         }
     }
 
@@ -2366,13 +3098,15 @@ mod tests {
             reactions: vec![RawReaction {
                 name: "eyes".into(),
                 count: 2,
+                users: vec![],
             }],
             files: vec![RawFile {
                 id: "F123".into(),
-                name: "note.txt".into(),
-                mimetype: "text/plain".into(),
-                size: 12,
+                name: Some("note.txt".into()),
+                mimetype: Some("text/plain".into()),
+                size: Some(12),
                 url_private_download: Some("https://files.slack.com/note.txt".into()),
+                ..RawFile::default()
             }],
             ..RawMessage::default()
         }
@@ -4266,6 +5000,562 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lossless_attachments_cross_history_thread_exact_inbox_and_search_paths() {
+        let unknown = vec![json!({
+            "fallback": "synthetic",
+            "future": {"nested": [1, true, null]},
+            "fields": [{"title": "kept", "unknown": {"x": "y"}}]
+        })];
+        let mut with_unknown = raw_message("100.000001", "fallback");
+        with_unknown.attachments = Some(unknown.clone());
+        let mut with_empty = raw_message("100.000002", "empty");
+        with_empty.attachments = Some(vec![]);
+        let omitted = raw_message("100.000003", "omitted");
+
+        let mut api = fake_api();
+        api.history.messages = vec![with_unknown.clone(), with_empty, omitted];
+        api.replies.messages = vec![with_unknown.clone()];
+        api.message_list
+            .messages
+            .insert("exact".into(), with_unknown.clone());
+        api.counts.channels = vec![entry("C123", true, 1)];
+        api.conversation_pages
+            .get_mut()
+            .unwrap()
+            .push_back(RawConversationsPage {
+                channels: vec![raw_conversation("C123", "general")],
+                ..RawConversationsPage::default()
+            });
+        api.search = RawMessageSearchResponse {
+            query: "fallback".into(),
+            messages: RawMessageSearchMatches {
+                matches: vec![RawMessageSearchMatch {
+                    channel: RawMessageSearchChannel {
+                        id: "C123".into(),
+                        name: "general".into(),
+                    },
+                    ts: "100.000001".into(),
+                    text: "fallback".into(),
+                    attachments: Some(unknown.clone()),
+                    ..RawMessageSearchMatch::default()
+                }],
+                total: 1,
+                ..RawMessageSearchMatches::default()
+            },
+            ..RawMessageSearchResponse::default()
+        };
+        let service = service(api);
+
+        let history = service.read_channel("C123", None, 3).await.unwrap();
+        assert_eq!(history.messages[0].attachments, Some(unknown.clone()));
+        assert_eq!(history.messages[1].attachments, Some(vec![]));
+        assert_eq!(history.messages[2].attachments, None);
+        assert_eq!(
+            service
+                .read_thread("C123", "100.000001", None, 1)
+                .await
+                .unwrap()
+                .messages[0]
+                .attachments,
+            Some(unknown.clone())
+        );
+        assert_eq!(
+            service
+                .get_message("C123", "100.000001")
+                .await
+                .unwrap()
+                .attachments,
+            Some(unknown.clone())
+        );
+        assert_eq!(
+            service.inbox(1, 1).await.unwrap().conversations[0]
+                .messages
+                .messages[0]
+                .attachments,
+            Some(unknown.clone())
+        );
+        assert_eq!(
+            service
+                .search_messages("fallback", None, None, None, None, 1)
+                .await
+                .unwrap()
+                .matches[0]
+                .attachments,
+            Some(unknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn skin_tone_reactions_and_sparse_file_access_cross_every_read_path() {
+        let sparse_file: RawFile = serde_json::from_value(json!({
+            "id": "FCONNECT",
+            "name": null,
+            "mode": "file_access",
+            "file_access": "check_file_info",
+            "created": 0,
+            "timestamp": null,
+            "user": ""
+        }))
+        .unwrap();
+        let skin_tone = RawReaction {
+            name: "thumbsup::skin-tone-6".into(),
+            count: 1,
+            users: vec!["U123".into()],
+        };
+        let mut message = raw_message("100.000001", "synthetic");
+        message.reactions = vec![skin_tone.clone()];
+        message.files = vec![sparse_file.clone()];
+
+        let mut api = fake_api();
+        api.history.messages = vec![message.clone()];
+        api.replies.messages = vec![message.clone()];
+        api.message_list
+            .messages
+            .insert("exact".into(), message.clone());
+        api.counts.channels = vec![entry("C123", true, 1)];
+        api.conversation_pages
+            .get_mut()
+            .unwrap()
+            .push_back(RawConversationsPage {
+                channels: vec![raw_conversation("C123", "general")],
+                ..RawConversationsPage::default()
+            });
+        api.search = RawMessageSearchResponse {
+            query: "synthetic".into(),
+            messages: RawMessageSearchMatches {
+                matches: vec![RawMessageSearchMatch {
+                    channel: RawMessageSearchChannel {
+                        id: "C123".into(),
+                        name: "general".into(),
+                    },
+                    ts: "100.000001".into(),
+                    text: "synthetic".into(),
+                    reactions: vec![skin_tone],
+                    files: vec![sparse_file.clone()],
+                    ..RawMessageSearchMatch::default()
+                }],
+                total: 1,
+                ..RawMessageSearchMatches::default()
+            },
+            ..RawMessageSearchResponse::default()
+        };
+        api.file_response = RawFileResponse { file: sparse_file };
+        let service = service(api);
+
+        let assert_message = |message: &Message| {
+            assert_eq!(message.reactions[0].name, "thumbsup::skin-tone-6");
+            assert_eq!(message.reactions[0].user_ids, ["U123"]);
+            let file = &message.files[0];
+            assert_eq!(file.id, "FCONNECT");
+            assert_eq!(file.name, None);
+            assert_eq!(file.size, None);
+            assert_eq!(file.timestamp, None);
+            assert_eq!(file.uploader_id, None);
+            assert_eq!(file.mode.as_deref(), Some("file_access"));
+            assert_eq!(file.file_access.as_deref(), Some("check_file_info"));
+        };
+
+        assert_message(
+            &service
+                .read_channel("C123", None, 1)
+                .await
+                .unwrap()
+                .messages[0],
+        );
+        assert_message(
+            &service
+                .read_thread("C123", "100.000001", None, 1)
+                .await
+                .unwrap()
+                .messages[0],
+        );
+        assert_message(&service.get_message("C123", "100.000001").await.unwrap());
+        assert_message(
+            &service.inbox(1, 1).await.unwrap().conversations[0]
+                .messages
+                .messages[0],
+        );
+        let search = service
+            .search_messages("synthetic", None, None, None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(search.matches[0].reactions[0].name, "thumbsup::skin-tone-6");
+        assert_eq!(search.matches[0].files[0].size, None);
+        assert_eq!(
+            search.matches[0].files[0].file_access.as_deref(),
+            Some("check_file_info")
+        );
+        let exact_file = service.get_file("FCONNECT").await.unwrap();
+        assert_eq!(exact_file.name, None);
+        assert_eq!(exact_file.timestamp, None);
+        assert_eq!(exact_file.size, None);
+        assert_eq!(exact_file.uploader_id, None);
+    }
+
+    #[tokio::test]
+    async fn file_reaction_and_custom_emoji_reads_are_typed_bounded_and_truthful() {
+        let mut api = fake_api();
+        api.file_response = RawFileResponse {
+            file: RawFile {
+                id: "F123".into(),
+                name: Some("note.txt".into()),
+                title: Some("Note".into()),
+                mimetype: Some("text/plain".into()),
+                filetype: Some("text".into()),
+                pretty_type: Some("Plain Text".into()),
+                mode: Some("hosted".into()),
+                user: Some("U123".into()),
+                size: Some(4),
+                created: Some(1),
+                timestamp: Some(2),
+                url_private: Some("https://files.slack.com/private".into()),
+                url_private_download: Some("https://files.slack.com/download".into()),
+                permalink: Some("https://sferait.slack.com/files/U123/F123".into()),
+                shares: Some(crate::model::RawFileShares {
+                    private: BTreeMap::from([(
+                        "C123".into(),
+                        vec![crate::model::RawFileShare {
+                            ts: "100.000001".into(),
+                            thread_ts: None,
+                        }],
+                    )]),
+                    ..crate::model::RawFileShares::default()
+                }),
+                ..RawFile::default()
+            },
+        };
+        api.emoji_response = RawEmojiResponse {
+            emoji: BTreeMap::from([
+                (
+                    "party".into(),
+                    "https://emoji.slack-edge.com/T/party/id".into(),
+                ),
+                ("shipit".into(), "alias:party".into()),
+            ]),
+        };
+        let service = service(api);
+        let file = service.get_file("F123").await.unwrap();
+        assert_eq!(file.title.as_deref(), Some("Note"));
+        assert_eq!(file.shares.as_ref().unwrap().len(), 1);
+        assert!(file.shares_complete);
+        let emoji = service.list_custom_emoji().await.unwrap();
+        assert_eq!(emoji.emoji.len(), 2);
+        assert_eq!(emoji.emoji[0].kind, CustomEmojiKind::Image);
+        assert_eq!(emoji.emoji[1].alias_for.as_deref(), Some("party"));
+    }
+
+    #[test]
+    fn file_share_metadata_distinguishes_omitted_complete_and_truncated_data() {
+        let omitted = normalize_file(
+            RawFile {
+                id: "F123".into(),
+                ..RawFile::default()
+            },
+            "files.info",
+        )
+        .unwrap();
+        assert_eq!(omitted.shares, None);
+        assert!(!omitted.shares_complete);
+
+        let complete = normalize_file(
+            RawFile {
+                id: "F123".into(),
+                shares: Some(crate::model::RawFileShares::default()),
+                ..RawFile::default()
+            },
+            "files.info",
+        )
+        .unwrap();
+        assert_eq!(complete.shares, Some(vec![]));
+        assert!(complete.shares_complete);
+
+        for (has_more_shares, skipped_shares) in [(Some(true), None), (None, Some(true))] {
+            let truncated = normalize_file(
+                RawFile {
+                    id: "F123".into(),
+                    shares: Some(crate::model::RawFileShares {
+                        private: BTreeMap::from([(
+                            "C123".into(),
+                            vec![crate::model::RawFileShare {
+                                ts: "100.000001".into(),
+                                thread_ts: None,
+                            }],
+                        )]),
+                        ..crate::model::RawFileShares::default()
+                    }),
+                    has_more_shares,
+                    skipped_shares,
+                    ..RawFile::default()
+                },
+                "files.info",
+            )
+            .unwrap();
+            assert_eq!(truncated.shares.as_ref().unwrap().len(), 1);
+            assert!(!truncated.shares_complete);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_requires_exact_metadata_size_before_atomic_commit() {
+        let directory = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "lurkline-service-download-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+        std::fs::create_dir(&directory).unwrap();
+        let root = crate::local_file::McpFileRoot::open(&directory).unwrap();
+
+        let file = FileReference {
+            id: "F123".into(),
+            name: Some("note.txt".into()),
+            title: Some("Note".into()),
+            mimetype: Some("text/plain".into()),
+            filetype: Some("text".into()),
+            pretty_type: Some("Plain Text".into()),
+            mode: Some("hosted".into()),
+            file_access: None,
+            uploader_id: Some("U123".into()),
+            size: Some(4),
+            created: Some(1),
+            timestamp: Some(2),
+            editable: Some(false),
+            is_external: Some(false),
+            is_public: Some(false),
+            public_url_shared: Some(false),
+            private_url: None,
+            download_url: Some("https://files.slack.com/download".into()),
+            permalink: None,
+            shares: Some(vec![]),
+            shares_complete: true,
+        };
+        let target = root
+            .prepare_download(std::path::Path::new("output"), 10)
+            .unwrap();
+        let report = service(fake_api())
+            .download_file(file.clone(), target, "output".into())
+            .await
+            .unwrap();
+        assert_eq!(report.bytes_written, 4);
+        assert_eq!(std::fs::read(directory.join("output")).unwrap(), b"safe");
+
+        let mut mismatch = fake_api();
+        mismatch.download_bytes = b"short".to_vec();
+        let target = root
+            .prepare_download(std::path::Path::new("mismatch"), 10)
+            .unwrap();
+        assert!(matches!(
+            service(mismatch)
+                .download_file(file.clone(), target, "mismatch".into())
+                .await,
+            Err(Error::InvalidResponse {
+                method: "files.download"
+            })
+        ));
+        assert!(!directory.join("mismatch").exists());
+
+        let mut unknown_size = file.clone();
+        unknown_size.size = None;
+        let target = root
+            .prepare_download(std::path::Path::new("unknown-size"), 10)
+            .unwrap();
+        assert!(matches!(
+            service(fake_api())
+                .download_file(unknown_size, target, "unknown-size".into())
+                .await,
+            Err(Error::NotFound {
+                resource: "Slack file size"
+            })
+        ));
+        assert!(!directory.join("unknown-size").exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reaction_mutations_require_confirmation_are_idempotent_and_reconcile_ambiguity() {
+        let api = fake_api();
+        let calls = api.reaction_calls.clone();
+        let state = api.reaction_present.clone();
+        let slack = service(api);
+        assert!(matches!(
+            slack
+                .add_reaction("C123", "100.000001", "eyes", false)
+                .await,
+            Err(Error::ConfirmationRequired { .. })
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+
+        let added = slack
+            .add_reaction("C123", "100.000001", ":eyes:", true)
+            .await
+            .unwrap();
+        assert!(added.target_present);
+        assert!(added.present);
+        assert!(added.changed);
+        assert!(!added.reconciled);
+        assert_eq!(&*calls.lock().unwrap(), &["get", "add", "get"]);
+
+        calls.lock().unwrap().clear();
+        let unchanged = slack
+            .add_reaction("C123", "100.000001", "eyes", true)
+            .await
+            .unwrap();
+        assert!(unchanged.target_present);
+        assert!(!unchanged.changed);
+        assert_eq!(&*calls.lock().unwrap(), &["get"]);
+        assert!(*state.lock().unwrap());
+
+        let mut already = fake_api();
+        already.reaction_error = Some("already_reacted");
+        let calls = already.reaction_calls.clone();
+        let report = service(already)
+            .add_reaction("C123", "100.000001", "eyes", true)
+            .await
+            .unwrap();
+        assert!(report.target_present);
+        assert!(report.present);
+        assert!(!report.changed);
+        assert!(report.reconciled);
+        assert_eq!(&*calls.lock().unwrap(), &["get", "add"]);
+
+        let mut no_reaction = fake_api();
+        *no_reaction.reaction_present.lock().unwrap() = true;
+        no_reaction.reaction_error = Some("no_reaction");
+        let calls = no_reaction.reaction_calls.clone();
+        let report = service(no_reaction)
+            .remove_reaction("C123", "100.000001", "eyes", true)
+            .await
+            .unwrap();
+        assert!(!report.target_present);
+        assert!(!report.present);
+        assert!(!report.changed);
+        assert!(report.reconciled);
+        assert_eq!(&*calls.lock().unwrap(), &["get", "remove"]);
+
+        let skin_tone = service(fake_api())
+            .add_reaction("C123", "100.000001", ":thumbsup::skin-tone-6:", true)
+            .await
+            .unwrap();
+        assert_eq!(skin_tone.name, "thumbsup::skin-tone-6");
+        assert!(skin_tone.present);
+        let skin_api = fake_api();
+        *skin_api.reaction_present.lock().unwrap() = true;
+        *skin_api.reaction_name.lock().unwrap() = "thumbsup::skin-tone-6".into();
+        let removed_skin_tone = service(skin_api)
+            .remove_reaction("C123", "100.000001", ":thumbsup::skin-tone-6:", true)
+            .await
+            .unwrap();
+        assert_eq!(removed_skin_tone.name, "thumbsup::skin-tone-6");
+        assert!(!removed_skin_tone.present);
+
+        for ambiguous_error in [
+            "timeout",
+            "invalid_response",
+            "fatal_error",
+            "internal_error",
+        ] {
+            let mut applied = fake_api();
+            applied.reaction_error = Some(ambiguous_error);
+            applied.reaction_apply_before_error = true;
+            let reconciled = service(applied)
+                .add_reaction("C123", "100.000001", "eyes", true)
+                .await
+                .unwrap();
+            assert!(reconciled.target_present);
+            assert!(reconciled.present);
+            assert!(reconciled.changed);
+            assert!(reconciled.reconciled);
+        }
+
+        for ambiguous_error in [
+            "timeout",
+            "invalid_response",
+            "fatal_error",
+            "internal_error",
+        ] {
+            let mut not_applied = fake_api();
+            not_applied.reaction_error = Some(ambiguous_error);
+            assert!(matches!(
+                service(not_applied)
+                    .add_reaction("C123", "100.000001", "eyes", true)
+                    .await,
+                Err(Error::ReactionNotApplied {
+                    channel_id,
+                    message_ts,
+                    name
+                }) if channel_id == "C123"
+                    && message_ts == "100.000001"
+                    && name == "eyes"
+            ));
+
+            let mut unreadable = fake_api();
+            unreadable.reaction_error = Some(ambiguous_error);
+            unreadable.reaction_apply_before_error = true;
+            unreadable.reaction_get_error_after = Some(1);
+            assert!(matches!(
+                service(unreadable)
+                    .add_reaction("C123", "100.000001", "eyes", true)
+                    .await,
+                Err(Error::ReactionUncertain {
+                    channel_id,
+                    message_ts,
+                    name
+                }) if channel_id == "C123"
+                    && message_ts == "100.000001"
+                && name == "eyes"
+            ));
+        }
+
+        for malformed_kind in 0..3 {
+            let mut malformed = fake_api();
+            match malformed_kind {
+                0 => malformed.reaction_wrong_channel_after = Some(0),
+                1 => malformed.reaction_wrong_type_after = Some(0),
+                2 => {
+                    *malformed.reaction_present.lock().unwrap() = true;
+                    malformed.reaction_duplicate_after = Some(0);
+                }
+                _ => unreachable!(),
+            }
+            let calls = malformed.reaction_calls.clone();
+            assert!(matches!(
+                service(malformed)
+                    .add_reaction("C123", "100.000001", "eyes", true)
+                    .await,
+                Err(Error::InvalidResponse {
+                    method: "reactions.get"
+                })
+            ));
+            assert_eq!(&*calls.lock().unwrap(), &["get"]);
+        }
+
+        for malformed_kind in 0..3 {
+            let mut malformed = fake_api();
+            malformed.reaction_error = Some("timeout");
+            malformed.reaction_apply_before_error = true;
+            match malformed_kind {
+                0 => malformed.reaction_wrong_channel_after = Some(1),
+                1 => malformed.reaction_wrong_type_after = Some(1),
+                2 => malformed.reaction_duplicate_after = Some(1),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                service(malformed)
+                    .add_reaction("C123", "100.000001", "eyes", true)
+                    .await,
+                Err(Error::ReactionUncertain {
+                    channel_id,
+                    message_ts,
+                    name
+                }) if channel_id == "C123"
+                    && message_ts == "100.000001"
+                    && name == "eyes"
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn local_message_truncation_always_sets_has_more() {
         let mut api = fake_api();
         api.history.messages = vec![
@@ -4389,18 +5679,84 @@ mod tests {
                 "author_name": null,
                 "text": "target",
                 "blocks": null,
+                "attachments": null,
                 "reply_count": 0,
                 "latest_reply": null,
-                "reactions": [{"name": "eyes", "count": 2}],
+                "reactions": [{
+                    "name": "eyes",
+                    "count": 2,
+                    "user_ids": [],
+                    "user_ids_complete": false
+                }],
                 "files": [{
                     "id": "F123",
                     "name": "note.txt",
+                    "title": null,
                     "mimetype": "text/plain",
+                    "filetype": null,
+                    "pretty_type": null,
+                    "mode": null,
+                    "file_access": null,
+                    "uploader_id": null,
                     "size": 12,
-                    "download_url": "https://files.slack.com/note.txt"
+                    "created": null,
+                    "timestamp": null,
+                    "editable": null,
+                    "is_external": null,
+                    "is_public": null,
+                    "public_url_shared": null,
+                    "private_url": null,
+                    "download_url": "https://files.slack.com/note.txt",
+                    "permalink": null,
+                    "shares": null,
+                    "shares_complete": false
                 }]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn exact_message_accepts_identical_duplicate_representations() {
+        let mut api = fake_api();
+        let message = raw_message("100.000002", "target");
+        api.message_list.messages = BTreeMap::from([("target".into(), message.clone())]);
+        api.message_list.messages_data = BTreeMap::from([(
+            "C123".into(),
+            RawChannelMessages {
+                messages: vec![message],
+            },
+        )]);
+
+        let message = service(api)
+            .get_message("C123", "100.000002")
+            .await
+            .unwrap();
+        assert_eq!(message.text, "target");
+        assert_eq!(message.files.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_message_rejects_conflicting_duplicate_representations() {
+        let mut api = fake_api();
+        let sparse = raw_message("100.000002", "target");
+        let mut hydrated = sparse.clone();
+        hydrated.attachments = Some(vec![serde_json::json!({
+            "fallback": "synthetic attachment"
+        })]);
+        api.message_list.messages = BTreeMap::from([("target".into(), sparse)]);
+        api.message_list.messages_data = BTreeMap::from([(
+            "C123".into(),
+            RawChannelMessages {
+                messages: vec![hydrated],
+            },
+        )]);
+
+        assert!(matches!(
+            service(api).get_message("C123", "100.000002").await,
+            Err(Error::InvalidResponse {
+                method: "messages.list"
+            })
+        ));
     }
 
     #[tokio::test]
