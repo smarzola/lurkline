@@ -177,9 +177,24 @@ pub(crate) struct RawFileResponse {
 
 #[derive(Clone, Deserialize)]
 pub(crate) struct RawFileUploadAllocation {
-    pub upload_url: String,
-    #[serde(rename = "file")]
-    pub file_id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_string_lossy")]
+    pub upload_url: Option<String>,
+    #[serde(
+        default,
+        rename = "file",
+        deserialize_with = "deserialize_optional_string_lossy"
+    )]
+    pub file_id: Option<String>,
+}
+
+fn deserialize_optional_string_lossy<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
 }
 
 #[derive(Clone, Deserialize)]

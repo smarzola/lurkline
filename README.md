@@ -498,6 +498,7 @@ completion—followed by exact verification:
 1. Call `files.getUploadURL` to allocate a non-secret file ID and a signed
    upload URL.
 2. Stream the exact bytes to the URL with a separate credential-free client.
+   Require Slack's exact `OK - <byte count>` acknowledgement.
 3. Call `files.completeUpload` for the requested root or thread.
 4. Read `files.info` to prove the requested alternative text, when present,
    and membership in the requested conversation.
@@ -523,7 +524,7 @@ Use the returned `stage` to decide what to do next:
 | Stage | Meaning | Recovery |
 | --- | --- | --- |
 | `allocation_uncertain` | Slack might have allocated storage, but no safe file ID was returned. | Don't retry automatically. A deliberate retry can leave an unshared orphan. |
-| `allocated` | Slack returned a file ID, but Lurkline sent no bytes. | Keep the file ID for diagnosis. Start a new upload only deliberately. |
+| `allocated` | Slack returned a file ID, but the upload URL was missing or unsafe, so Lurkline sent no bytes. | Keep the file ID for diagnosis. Start a new upload only deliberately. |
 | `source_changed` | The source changed after allocation. Lurkline didn't complete the upload. | Stabilize the source, then start a new upload deliberately. |
 | `transfer_uncertain` | Slack byte acceptance can't be proven. | Don't upload again automatically. Inspect Slack before deciding. |
 | `completion_uncertain` | The bytes were sent, but the requested share can't be proven. | Inspect the file ID and destination before deciding whether to retry. |

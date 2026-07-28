@@ -386,11 +386,16 @@ impl SlackService {
             }
             Err(error) => return Err(error),
         };
-        if !is_valid_file_id(&raw_allocation.file_id) {
+        let Some(file_id) = raw_allocation
+            .file_id
+            .filter(|file_id| is_valid_file_id(file_id))
+        else {
             return Ok(FileUploadReport::AllocationUncertain);
-        }
-        let file_id = raw_allocation.file_id;
-        let upload_url = Zeroizing::new(raw_allocation.upload_url);
+        };
+        let Some(raw_upload_url) = raw_allocation.upload_url else {
+            return Ok(FileUploadReport::Allocated { file_id });
+        };
+        let upload_url = Zeroizing::new(raw_upload_url);
         if !is_safe_upload_url(&upload_url) {
             return Ok(FileUploadReport::Allocated { file_id });
         }
@@ -2952,6 +2957,7 @@ mod tests {
         upload_allocation: RawFileUploadAllocation,
         upload_allocation_error: Option<&'static str>,
         upload_transfer_error: bool,
+        upload_transfer_invalid_ack: bool,
         upload_mutate_pass: bool,
         upload_completion: RawFileUploadCompletion,
         upload_completion_error: bool,
@@ -3311,6 +3317,11 @@ mod tests {
             let mut pass = receipt.await.map_err(|_| Error::InvalidResponse {
                 method: "files.uploadEdge",
             })?;
+            if self.upload_transfer_invalid_ack {
+                return Err(Error::InvalidResponse {
+                    method: "files.uploadEdge",
+                });
+            }
             if self.upload_mutate_pass {
                 pass.digest[0] ^= 0xff;
             }
@@ -3553,11 +3564,12 @@ mod tests {
             reaction_calls: Arc::new(Mutex::new(Vec::new())),
             download_bytes: b"safe".to_vec(),
             upload_allocation: RawFileUploadAllocation {
-                upload_url: "https://files.slack.com/upload/v1/FUPLOAD?sig=synthetic".into(),
-                file_id: "FUPLOAD".into(),
+                upload_url: Some("https://files.slack.com/upload/v1/FUPLOAD?sig=synthetic".into()),
+                file_id: Some("FUPLOAD".into()),
             },
             upload_allocation_error: None,
             upload_transfer_error: false,
+            upload_transfer_invalid_ack: false,
             upload_mutate_pass: false,
             upload_completion: RawFileUploadCompletion {
                 files: vec![RawFile {
@@ -6380,7 +6392,7 @@ mod tests {
         assert_eq!(calls.lock().unwrap().as_slice(), ["allocate"]);
 
         let mut api = fake_api();
-        api.upload_allocation.file_id = "invalid".into();
+        api.upload_allocation.file_id = Some("invalid".into());
         assert_eq!(
             service(api)
                 .upload_file("C123", None, None, None, fixture.source(), true)
@@ -6402,7 +6414,21 @@ mod tests {
         ));
 
         let mut api = fake_api();
-        api.upload_allocation.upload_url = "https://example.com/upload/v1/FUPLOAD".into();
+        api.upload_allocation.upload_url = None;
+        let calls = api.upload_calls.clone();
+        assert_eq!(
+            service(api)
+                .upload_file("C123", None, None, None, fixture.source(), true)
+                .await
+                .unwrap(),
+            FileUploadReport::Allocated {
+                file_id: "FUPLOAD".into()
+            }
+        );
+        assert_eq!(calls.lock().unwrap().as_slice(), ["allocate"]);
+
+        let mut api = fake_api();
+        api.upload_allocation.upload_url = Some("https://example.com/upload/v1/FUPLOAD".into());
         let calls = api.upload_calls.clone();
         assert_eq!(
             service(api)
@@ -6417,6 +6443,20 @@ mod tests {
 
         let mut api = fake_api();
         api.upload_transfer_error = true;
+        let calls = api.upload_calls.clone();
+        assert_eq!(
+            service(api)
+                .upload_file("C123", None, None, None, fixture.source(), true)
+                .await
+                .unwrap(),
+            FileUploadReport::TransferUncertain {
+                file_id: "FUPLOAD".into()
+            }
+        );
+        assert_eq!(calls.lock().unwrap().as_slice(), ["allocate", "transfer"]);
+
+        let mut api = fake_api();
+        api.upload_transfer_invalid_ack = true;
         let calls = api.upload_calls.clone();
         assert_eq!(
             service(api)

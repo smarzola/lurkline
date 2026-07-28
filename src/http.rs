@@ -449,7 +449,7 @@ impl SlackApi for SlackHttpClient {
                 limit: MAX_UPLOAD_ACK_BYTES,
             });
         }
-        let mut bytes_read = 0_usize;
+        let mut acknowledgement = Vec::new();
         let mut response_stream = response.bytes_stream();
         while let Some(chunk) = response_stream.next().await {
             let chunk = chunk.map_err(|error| {
@@ -463,19 +463,23 @@ impl SlackApi for SlackHttpClient {
                     }
                 }
             })?;
-            bytes_read = bytes_read
-                .checked_add(chunk.len())
-                .ok_or(Error::ResponseTooLarge {
-                    method: "files.uploadEdge",
-                    limit: MAX_UPLOAD_ACK_BYTES,
-                })?;
+            let bytes_read =
+                acknowledgement
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or(Error::ResponseTooLarge {
+                        method: "files.uploadEdge",
+                        limit: MAX_UPLOAD_ACK_BYTES,
+                    })?;
             if bytes_read > MAX_UPLOAD_ACK_BYTES {
                 return Err(Error::ResponseTooLarge {
                     method: "files.uploadEdge",
                     limit: MAX_UPLOAD_ACK_BYTES,
                 });
             }
+            acknowledgement.extend_from_slice(&chunk);
         }
+        validate_edge_upload_ack(&acknowledgement, content_length)?;
         receipt.await.map_err(|_| Error::InvalidResponse {
             method: "files.uploadEdge",
         })
@@ -822,6 +826,17 @@ fn validate_edge_upload_url(url: &url::Url, allow_test_loopback: bool) -> Result
         });
     }
     Ok(())
+}
+
+fn validate_edge_upload_ack(acknowledgement: &[u8], expected_bytes: u64) -> Result<()> {
+    let expected = format!("OK - {expected_bytes}");
+    if acknowledgement == expected.as_bytes() {
+        Ok(())
+    } else {
+        Err(Error::InvalidResponse {
+            method: "files.uploadEdge",
+        })
+    }
 }
 
 fn encode_json(value: &(impl serde::Serialize + ?Sized)) -> Result<String> {
@@ -1257,6 +1272,33 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[tokio::test]
+    async fn edge_upload_rejects_empty_malformed_and_wrong_count_acknowledgements() {
+        for acknowledgement in [
+            b"".as_slice(),
+            b"<html>not an acknowledgement</html>".as_slice(),
+            b"OK - 8".as_slice(),
+            b"OK - 9\n".as_slice(),
+        ] {
+            let (client, _, base_url) =
+                upload_server(StatusCode::OK, acknowledgement.to_vec()).await;
+            let (directory, mut source) = upload_source(b"synthetic");
+            assert!(matches!(
+                client
+                    .upload_edge_file(
+                        base_url.join("upload/v1/F123").unwrap().as_str(),
+                        &mut source
+                    )
+                    .await,
+                Err(Error::InvalidResponse {
+                    method: "files.uploadEdge"
+                })
+            ));
+            drop(source);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     #[test]
     fn private_download_rejects_non_slack_origins_and_embedded_credentials() {
         for value in [
@@ -1479,7 +1521,11 @@ mod tests {
             .files_get_upload_url("report.txt", 42, Some("accessible report"))
             .await
             .unwrap();
-        assert_eq!(allocation.file_id, "F123");
+        assert_eq!(allocation.file_id.as_deref(), Some("F123"));
+        assert_eq!(
+            allocation.upload_url.as_deref(),
+            Some("https://files.slack.com/upload/v1/F123?sig=secret")
+        );
         let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
         let body = String::from_utf8_lossy(&raw_body);
         assert_eq!(uri.path(), "/api/files.getUploadURL");
@@ -1519,6 +1565,40 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(multipart_text_field(&body, "files").unwrap()).unwrap(),
             serde_json::json!([{"id": "F123", "title": "Quarterly report"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_allocation_preserves_independently_valid_recovery_fields() {
+        for body in [
+            br#"{"ok":true,"file":"F123"}"#.as_slice(),
+            br#"{"ok":true,"file":"F123","upload_url":null}"#.as_slice(),
+            br#"{"ok":true,"file":"F123","upload_url":{"unexpected":true}}"#.as_slice(),
+        ] {
+            let (client, _) = server(StatusCode::OK, body.to_vec(), 64 * 1024).await;
+            let allocation = client
+                .files_get_upload_url("report.txt", 42, None)
+                .await
+                .unwrap();
+            assert_eq!(allocation.file_id.as_deref(), Some("F123"));
+            assert_eq!(allocation.upload_url, None);
+        }
+
+        let (client, _) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"file":{"unexpected":true},"upload_url":"https://files.slack.com/upload/v1/F123"}"#
+                .to_vec(),
+            64 * 1024,
+        )
+        .await;
+        let allocation = client
+            .files_get_upload_url("report.txt", 42, None)
+            .await
+            .unwrap();
+        assert_eq!(allocation.file_id, None);
+        assert_eq!(
+            allocation.upload_url.as_deref(),
+            Some("https://files.slack.com/upload/v1/F123")
         );
     }
 
