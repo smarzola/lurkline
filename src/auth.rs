@@ -3,14 +3,13 @@ use std::{
     env,
     ffi::OsString,
     fmt, fs,
-    fs::{File, OpenOptions},
+    fs::{File, Metadata, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use fs4::FileExt;
-use keyring::v1::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -25,10 +24,10 @@ use crate::{
 #[cfg(test)]
 use crate::config::credential_bundle_from_getter;
 
-const KEYRING_SERVICE: &str = "me.smarzola.lurkline.slack-session";
 const REGISTRY_VERSION: u8 = 1;
 const CREDENTIAL_VERSION: u8 = 1;
 const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
+const MAX_CREDENTIAL_BYTES: u64 = 256 * 1024;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -169,10 +168,10 @@ pub(crate) struct ProfileRegistry {
 impl ProfileRegistry {
     pub(crate) fn discover() -> Result<Self> {
         #[cfg(target_os = "macos")]
-        let directory = macos_registry_directory(env::var_os("HOME"))?;
+        let directory = macos_config_directory(env::var_os("HOME"))?;
         #[cfg(target_os = "linux")]
         let directory =
-            linux_registry_directory(env::var_os("HOME"), env::var_os("XDG_CONFIG_HOME"))?;
+            linux_config_directory(env::var_os("HOME"), env::var_os("XDG_CONFIG_HOME"))?;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let directory = {
             return Err(Error::ProfileRegistryRead);
@@ -201,19 +200,19 @@ impl ProfileRegistry {
 
     fn open_lock_file(&self) -> Result<File> {
         let directory = self.path.parent().ok_or(Error::ProfileRegistryLock)?;
-        fs::create_dir_all(directory).map_err(|_| Error::ProfileRegistryLock)?;
-        set_lock_directory_permissions(directory)?;
+        ensure_secure_directory(directory, "configuration directory")
+            .map_err(|_| Error::ProfileRegistryLock)?;
         let path = directory.join("profiles.lock");
-        open_lock_file(&path).map_err(|_| Error::ProfileRegistryLock)
+        open_secure_lock_file(&path).map_err(|_| Error::ProfileRegistryLock)
     }
 
     pub(crate) fn load(&self) -> Result<ProfileRegistryState> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let file = match open_secure_existing_file(&self.path, "profile registry") {
+            Ok(Some(file)) => file,
+            Ok(None) => {
                 return Ok(ProfileRegistryState::default());
             }
-            Err(_) => return Err(Error::ProfileRegistryRead),
+            Err(error) => return Err(error),
         };
         if file
             .metadata()
@@ -224,7 +223,8 @@ impl ProfileRegistry {
             return Err(Error::InvalidProfileRegistry);
         }
         let mut encoded = Vec::new();
-        file.read_to_end(&mut encoded)
+        file.take(MAX_REGISTRY_BYTES + 1)
+            .read_to_end(&mut encoded)
             .map_err(|_| Error::ProfileRegistryRead)?;
         if encoded.len() as u64 > MAX_REGISTRY_BYTES {
             return Err(Error::InvalidProfileRegistry);
@@ -247,9 +247,14 @@ impl ProfileRegistry {
         registry.validate()?;
         let encoded =
             serde_json::to_vec_pretty(registry).map_err(|_| Error::ProfileRegistryWrite)?;
+        if encoded.len() as u64 > MAX_REGISTRY_BYTES {
+            return Err(Error::ProfileRegistryWrite);
+        }
         let directory = self.path.parent().ok_or(Error::ProfileRegistryWrite)?;
-        fs::create_dir_all(directory).map_err(|_| Error::ProfileRegistryWrite)?;
-        set_directory_permissions(directory)?;
+        ensure_secure_directory(directory, "configuration directory")
+            .map_err(|_| Error::ProfileRegistryWrite)?;
+        validate_optional_secure_file(&self.path, "profile registry")
+            .map_err(|_| Error::ProfileRegistryWrite)?;
 
         let mut temporary_path = None;
         let mut temporary_file = None;
@@ -276,9 +281,8 @@ impl ProfileRegistry {
                 .map_err(|_| Error::ProfileRegistryWrite)?;
             file.sync_all().map_err(|_| Error::ProfileRegistryWrite)?;
             fs::rename(&path, &self.path).map_err(|_| Error::ProfileRegistryWrite)?;
-            // Rename is the commit point. A directory-sync failure cannot safely
-            // be reported as an uncommitted write because callers would roll back
-            // the keyring after the new registry became visible.
+            // Rename is the commit point. Do not trigger stale rollback after
+            // the new registry is already visible.
             let _ = sync(directory);
             Ok(())
         })();
@@ -294,29 +298,32 @@ fn nonempty(value: Option<OsString>) -> Option<OsString> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_registry_directory(home: Option<OsString>) -> Result<PathBuf> {
-    nonempty(home)
+fn macos_config_directory(home: Option<OsString>) -> Result<PathBuf> {
+    let home = nonempty(home)
         .map(PathBuf::from)
-        .map(|home| {
-            home.join("Library")
-                .join("Application Support")
-                .join("lurkline")
-        })
-        .ok_or(Error::ProfileRegistryRead)
+        .filter(|home| home.is_absolute())
+        .ok_or(Error::ProfileRegistryRead)?;
+    Ok(home
+        .join("Library")
+        .join("Application Support")
+        .join("lurkline"))
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn linux_registry_directory(
+fn linux_config_directory(
     home: Option<OsString>,
     xdg_config_home: Option<OsString>,
 ) -> Result<PathBuf> {
     match nonempty(xdg_config_home) {
         Some(value) if Path::new(&value).is_absolute() => Ok(PathBuf::from(value).join("lurkline")),
         Some(_) => Err(Error::ProfileRegistryRead),
-        None => nonempty(home)
-            .map(PathBuf::from)
-            .map(|home| home.join(".config").join("lurkline"))
-            .ok_or(Error::ProfileRegistryRead),
+        None => {
+            let home = nonempty(home)
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .ok_or(Error::ProfileRegistryRead)?;
+            Ok(home.join(".config").join("lurkline"))
+        }
     }
 }
 
@@ -328,6 +335,7 @@ fn open_temporary(path: &Path) -> std::io::Result<File> {
         .write(true)
         .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
 }
 
@@ -336,61 +344,136 @@ fn open_temporary(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
-#[cfg(unix)]
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+fn ensure_secure_directory(path: &Path, resource: &'static str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_directory_metadata(&metadata, resource),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder.create(path).map_err(|_| Error::CredentialStorage)?;
+            }
+            #[cfg(not(unix))]
+            fs::create_dir_all(path).map_err(|_| Error::CredentialStorage)?;
+            let metadata = fs::symlink_metadata(path).map_err(|_| Error::CredentialStorage)?;
+            validate_directory_metadata(&metadata, resource)
+        }
+        Err(_) => Err(Error::CredentialStorage),
+    }
+}
+
+fn validate_directory_metadata(metadata: &Metadata, resource: &'static str) -> Result<()> {
+    validate_metadata(metadata, resource, true)
+}
+
+fn validate_file_metadata(metadata: &Metadata, resource: &'static str) -> Result<()> {
+    validate_metadata(metadata, resource, false)
+}
+
+#[cfg(unix)]
+fn validate_metadata(metadata: &Metadata, resource: &'static str, directory: bool) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let expected_type = if directory {
+        metadata.file_type().is_dir()
+    } else {
+        metadata.file_type().is_file()
+    };
+    let expected_mode = if directory { 0o700 } else { 0o600 };
+    validate_owner_mode(
+        expected_type,
+        metadata.uid(),
+        metadata.permissions().mode() & 0o777,
+        expected_mode,
+        resource,
+    )
+}
+
+#[cfg(unix)]
+fn validate_owner_mode(
+    expected_type: bool,
+    uid: u32,
+    mode: u32,
+    expected_mode: u32,
+    resource: &'static str,
+) -> Result<()> {
+    // SAFETY: geteuid has no preconditions and does not retain pointers.
+    let current_uid = unsafe { libc::geteuid() };
+    if !expected_type || uid != current_uid || mode != expected_mode {
+        return Err(Error::UnsafeCredentialStorage { resource });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_metadata(metadata: &Metadata, resource: &'static str, directory: bool) -> Result<()> {
+    let expected_type = if directory {
+        metadata.file_type().is_dir()
+    } else {
+        metadata.file_type().is_file()
+    };
+    if !expected_type {
+        return Err(Error::UnsafeCredentialStorage { resource });
+    }
+    Ok(())
+}
+
+fn validate_optional_secure_file(path: &Path, resource: &'static str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            validate_file_metadata(&metadata, resource)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(Error::CredentialStorage),
+    }
+}
+
+fn open_secure_existing_file(path: &Path, resource: &'static str) -> Result<Option<File>> {
+    if !validate_optional_secure_file(path, resource)? {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|_| Error::CredentialStorage)?;
+    validate_file_metadata(
+        &file.metadata().map_err(|_| Error::CredentialStorage)?,
+        resource,
+    )?;
+    Ok(Some(file))
+}
+
+fn open_secure_lock_file(path: &Path) -> Result<File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    validate_optional_secure_file(path, "profile lock")?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|_| Error::ProfileRegistryLock)?;
+    validate_file_metadata(
+        &file.metadata().map_err(|_| Error::ProfileRegistryLock)?,
+        "profile lock",
+    )?;
     Ok(file)
-}
-
-#[cfg(not(unix))]
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-}
-
-#[cfg(unix)]
-fn set_directory_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|_| Error::ProfileRegistryWrite)
-}
-
-#[cfg(unix)]
-fn set_lock_directory_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|_| Error::ProfileRegistryLock)
-}
-
-#[cfg(not(unix))]
-fn set_lock_directory_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_directory_permissions(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
-        .map_err(|_| Error::ProfileRegistryWrite)
+        .map_err(|_| Error::CredentialStorage)
 }
 
 pub(crate) trait CredentialStore {
@@ -399,58 +482,152 @@ pub(crate) trait CredentialStore {
     fn delete(&self, profile: &ProfileName) -> Result<bool>;
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct NativeCredentialStore;
+#[derive(Clone, Debug)]
+pub(crate) struct FileCredentialStore {
+    directory: PathBuf,
+}
 
-impl NativeCredentialStore {
-    fn entry(profile: &ProfileName) -> Result<Entry> {
-        Entry::new(KEYRING_SERVICE, profile.as_str())
-            .map_err(|error| map_keyring_error(profile, error))
+impl FileCredentialStore {
+    fn for_registry(registry: &ProfileRegistry) -> Result<Self> {
+        let root = registry.path.parent().ok_or(Error::CredentialStorage)?;
+        Ok(Self {
+            directory: root.join("credentials"),
+        })
+    }
+
+    #[cfg(test)]
+    fn at(directory: PathBuf) -> Self {
+        Self { directory }
+    }
+
+    fn path(&self, profile: &ProfileName) -> PathBuf {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut file_name = String::with_capacity(profile.as_str().len() * 2 + 5);
+        for byte in profile.as_str().bytes() {
+            file_name.push(HEX[(byte >> 4) as usize] as char);
+            file_name.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        file_name.push_str(".json");
+        self.directory.join(file_name)
+    }
+
+    fn ensure_directory(&self) -> Result<()> {
+        let root = self.directory.parent().ok_or(Error::CredentialStorage)?;
+        ensure_secure_directory(root, "configuration directory")?;
+        ensure_secure_directory(&self.directory, "credentials directory")
+    }
+
+    fn directory_exists(&self) -> Result<bool> {
+        let root = self.directory.parent().ok_or(Error::CredentialStorage)?;
+        match fs::symlink_metadata(root) {
+            Ok(metadata) => validate_directory_metadata(&metadata, "configuration directory")?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(Error::CredentialStorage),
+        }
+        match fs::symlink_metadata(&self.directory) {
+            Ok(metadata) => {
+                validate_directory_metadata(&metadata, "credentials directory")?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(Error::CredentialStorage),
+        }
+    }
+
+    fn write_with_directory_sync(
+        &self,
+        profile: &ProfileName,
+        secret: &[u8],
+        sync: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        if secret.len() as u64 > MAX_CREDENTIAL_BYTES {
+            return Err(Error::CredentialTooLarge {
+                profile: profile.to_string(),
+            });
+        }
+        self.ensure_directory()?;
+        let destination = self.path(profile);
+        validate_optional_secure_file(&destination, "credential file")?;
+
+        let mut temporary_path = None;
+        let mut temporary_file = None;
+        for _ in 0..16 {
+            let suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = self.directory.join(format!(
+                ".{profile}.json.tmp-{}-{suffix}",
+                std::process::id()
+            ));
+            match open_temporary(&path) {
+                Ok(file) => {
+                    temporary_path = Some(path);
+                    temporary_file = Some(file);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(Error::CredentialStorage),
+            }
+        }
+        let temporary_path = temporary_path.ok_or(Error::CredentialStorage)?;
+        let mut file = temporary_file.ok_or(Error::CredentialStorage)?;
+        let result = (|| {
+            file.write_all(secret)
+                .map_err(|_| Error::CredentialStorage)?;
+            file.sync_all().map_err(|_| Error::CredentialStorage)?;
+            fs::rename(&temporary_path, &destination).map_err(|_| Error::CredentialStorage)?;
+            // Rename is the commit point. A sync failure cannot safely be
+            // reported as an uncommitted write after the new file is visible.
+            let _ = sync(&self.directory);
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temporary_path);
+        }
+        result
     }
 }
 
-impl CredentialStore for NativeCredentialStore {
+impl CredentialStore for FileCredentialStore {
     fn get(&self, profile: &ProfileName) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        match Self::entry(profile)?.get_secret() {
-            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
-            Err(KeyringError::NoEntry) => Ok(None),
-            Err(error) => Err(map_keyring_error(profile, error)),
+        if !self.directory_exists()? {
+            return Ok(None);
         }
+        let path = self.path(profile);
+        let Some(file) = open_secure_existing_file(&path, "credential file")? else {
+            return Ok(None);
+        };
+        if file.metadata().map_err(|_| Error::CredentialStorage)?.len() > MAX_CREDENTIAL_BYTES {
+            return Err(Error::CredentialTooLarge {
+                profile: profile.to_string(),
+            });
+        }
+        let mut encoded = Zeroizing::new(Vec::new());
+        file.take(MAX_CREDENTIAL_BYTES + 1)
+            .read_to_end(&mut encoded)
+            .map_err(|_| Error::CredentialStorage)?;
+        if encoded.len() as u64 > MAX_CREDENTIAL_BYTES {
+            return Err(Error::CredentialTooLarge {
+                profile: profile.to_string(),
+            });
+        }
+        Ok(Some(encoded))
     }
 
     fn set(&self, profile: &ProfileName, secret: &[u8]) -> Result<()> {
-        Self::entry(profile)?
-            .set_secret(secret)
-            .map_err(|error| map_keyring_error(profile, error))
+        self.write_with_directory_sync(profile, secret, sync_directory)
     }
 
     fn delete(&self, profile: &ProfileName) -> Result<bool> {
-        match Self::entry(profile)?.delete_credential() {
-            Ok(()) => Ok(true),
-            Err(KeyringError::NoEntry) => Ok(false),
-            Err(error) => Err(map_keyring_error(profile, error)),
+        if !self.directory_exists()? {
+            return Ok(false);
         }
-    }
-}
-
-fn map_keyring_error(profile: &ProfileName, error: KeyringError) -> Error {
-    match error {
-        KeyringError::NoDefaultStore
-        | KeyringError::NoStorageAccess(_)
-        | KeyringError::NotSupportedByStore(_) => Error::CredentialStoreUnavailable,
-        KeyringError::BadEncoding(mut bytes) => {
-            bytes.zeroize();
-            Error::InvalidStoredCredential {
-                profile: profile.to_string(),
-            }
+        let path = self.path(profile);
+        if !validate_optional_secure_file(&path, "credential file")? {
+            return Ok(false);
         }
-        KeyringError::BadDataFormat(mut bytes, _) => {
-            bytes.zeroize();
-            Error::InvalidStoredCredential {
-                profile: profile.to_string(),
-            }
-        }
-        _ => Error::CredentialStore,
+        fs::remove_file(path).map_err(|_| Error::CredentialStorage)?;
+        let _ = sync_directory(&self.directory);
+        Ok(true)
     }
 }
 
@@ -483,7 +660,7 @@ pub(crate) fn encode_bundle(bundle: &CredentialBundle) -> Result<Zeroizing<Vec<u
     };
     serde_json::to_vec(&stored)
         .map(Zeroizing::new)
-        .map_err(|_| Error::CredentialStore)
+        .map_err(|_| Error::CredentialStorage)
 }
 
 pub(crate) fn decode_bundle(profile: &ProfileName, encoded: &[u8]) -> Result<CredentialBundle> {
@@ -591,13 +768,14 @@ fn list_profiles_with(registry: &impl RegistryStore) -> Result<AuthListReport> {
 
 pub(crate) fn profile_status(explicit_profile: Option<&str>) -> Result<AuthStatusReport> {
     let registry = ProfileRegistry::discover()?;
+    let store = FileCredentialStore::for_registry(&registry)?;
     let _lock = registry.lock_shared()?;
     let environment_profile = environment_profile_for_selection(explicit_profile)?;
     profile_status_with(
         explicit_profile,
         environment_profile.as_deref(),
         &registry,
-        &NativeCredentialStore,
+        &store,
     )
 }
 
@@ -642,13 +820,8 @@ pub(crate) fn store_profile(
     replace_workspace: bool,
 ) -> Result<AuthImportReport> {
     let registry = ProfileRegistry::discover()?;
-    store_profile_locked(
-        profile,
-        bundle,
-        replace_workspace,
-        &registry,
-        &NativeCredentialStore,
-    )
+    let store = FileCredentialStore::for_registry(&registry)?;
+    store_profile_locked(profile, bundle, replace_workspace, &registry, &store)
 }
 
 fn store_profile_locked(
@@ -691,11 +864,7 @@ fn store_profile_with(
         });
     }
 
-    let previous = if current.is_some() {
-        store.get(profile)?
-    } else {
-        None
-    };
+    let previous = store.get(profile)?;
     store.set(profile, &encoded)?;
     state.register(profile, metadata.clone());
     if let Err(error) = registry.save_state(&state) {
@@ -722,12 +891,13 @@ fn store_profile_with(
 
 pub(crate) fn remove_profile(explicit_profile: Option<&str>) -> Result<AuthRemoveReport> {
     let registry = ProfileRegistry::discover()?;
+    let store = FileCredentialStore::for_registry(&registry)?;
     let environment_profile = environment_profile_for_selection(explicit_profile)?;
     remove_profile_locked(
         explicit_profile,
         environment_profile.as_deref(),
         &registry,
-        &NativeCredentialStore,
+        &store,
     )
 }
 
@@ -754,9 +924,19 @@ fn remove_profile_with(
             profile: profile.to_string(),
         });
     }
+    let previous = store.get(&profile)?;
     store.delete(&profile)?;
     state.remove(&profile);
-    registry.save_state(&state)?;
+    if let Err(error) = registry.save_state(&state) {
+        if let Some(previous) = previous
+            && store.set(&profile, &previous).is_err()
+        {
+            return Err(Error::CredentialReconciliation {
+                profile: profile.to_string(),
+            });
+        }
+        return Err(error);
+    }
     Ok(AuthRemoveReport {
         profile: profile.to_string(),
         removed: true,
@@ -771,6 +951,7 @@ pub(crate) fn resolve_config(explicit_profile: Option<&str>) -> Result<Config> {
     }
     let environment_profile = environment_profile_for_selection(explicit_profile)?;
     let registry = ProfileRegistry::discover()?;
+    let store = FileCredentialStore::for_registry(&registry)?;
     resolve_stored_config(
         explicit_profile,
         move |name| {
@@ -781,7 +962,7 @@ pub(crate) fn resolve_config(explicit_profile: Option<&str>) -> Result<Config> {
             }
         },
         &registry,
-        &NativeCredentialStore,
+        &store,
     )
 }
 
@@ -861,9 +1042,11 @@ fn resolve_stored_config(
         .ok_or_else(|| Error::ProfileNotFound {
             profile: profile.to_string(),
         })?;
-    let encoded = store.get(&profile)?.ok_or_else(|| Error::ProfileNotFound {
-        profile: profile.to_string(),
-    })?;
+    let encoded = store
+        .get(&profile)?
+        .ok_or_else(|| Error::MissingProfileCredential {
+            profile: profile.to_string(),
+        })?;
     let bundle = decode_bundle(&profile, &encoded)?;
     if !metadata.matches(&bundle) {
         return Err(Error::CredentialProfileMismatch {
@@ -970,7 +1153,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or(false)
             {
-                return Err(Error::CredentialStore);
+                return Err(Error::CredentialStorage);
             }
             self.values
                 .lock()
@@ -988,7 +1171,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or(false)
             {
-                return Err(Error::CredentialStore);
+                return Err(Error::CredentialStorage);
             }
             Ok(self
                 .values
@@ -1053,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_names_are_bounded_and_safe_for_keyring_accounts() {
+    fn profile_names_are_bounded_and_safe_for_file_names() {
         for valid in ["default", "sferait-ws", "work_2", "team.eu"] {
             assert_eq!(ProfileName::parse(valid).unwrap().as_str(), valid);
         }
@@ -1065,15 +1248,27 @@ mod tests {
     #[test]
     fn linux_config_path_prefers_absolute_xdg_without_requiring_home() {
         assert_eq!(
-            linux_registry_directory(None, Some(OsString::from("/tmp/xdg"))).unwrap(),
+            linux_config_directory(None, Some(OsString::from("/tmp/xdg"))).unwrap(),
             PathBuf::from("/tmp/xdg/lurkline")
         );
         assert_eq!(
-            linux_registry_directory(Some(OsString::from("/home/test")), None).unwrap(),
+            linux_config_directory(Some(OsString::from("/home/test")), None).unwrap(),
             PathBuf::from("/home/test/.config/lurkline")
         );
-        assert!(linux_registry_directory(None, Some(OsString::from("relative"))).is_err());
-        assert!(linux_registry_directory(None, None).is_err());
+        assert!(linux_config_directory(None, Some(OsString::from("relative"))).is_err());
+        assert!(linux_config_directory(Some(OsString::from("relative")), None).is_err());
+        assert!(linux_config_directory(None, None).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_config_path_requires_absolute_home() {
+        assert_eq!(
+            macos_config_directory(Some(OsString::from("/Users/test"))).unwrap(),
+            PathBuf::from("/Users/test/Library/Application Support/lurkline")
+        );
+        assert!(macos_config_directory(Some(OsString::from("relative"))).is_err());
+        assert!(macos_config_directory(None).is_err());
     }
 
     #[test]
@@ -1112,8 +1307,8 @@ mod tests {
     #[test]
     fn registry_rejects_corruption_without_overwriting_it() {
         let directory = TestDirectory::new("registry-corruption");
-        fs::create_dir_all(directory.0.clone()).unwrap();
         let registry = directory.registry();
+        registry.save(&ProfileRegistryState::default()).unwrap();
         fs::write(&registry.path, b"{not-json").unwrap();
         assert!(matches!(
             registry.load(),
@@ -1167,6 +1362,12 @@ mod tests {
             registry.load(),
             Err(Error::InvalidProfileRegistry)
         ));
+
+        fs::write(&registry.path, vec![b'x'; MAX_REGISTRY_BYTES as usize + 1]).unwrap();
+        assert!(matches!(
+            registry.load(),
+            Err(Error::InvalidProfileRegistry)
+        ));
     }
 
     #[test]
@@ -1198,6 +1399,24 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_registry_file_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("registry-unsafe");
+        let registry = directory.registry();
+        registry.save(&ProfileRegistryState::default()).unwrap();
+        fs::set_permissions(&registry.path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(matches!(
+            registry.load(),
+            Err(Error::UnsafeCredentialStorage {
+                resource: "profile registry"
+            })
+        ));
     }
 
     #[test]
@@ -1360,7 +1579,7 @@ mod tests {
         registry.save(&state).unwrap();
 
         let missing = resolve_config_with(None, |_| None, &registry, &store).unwrap_err();
-        assert!(matches!(missing, Error::ProfileNotFound { .. }));
+        assert!(matches!(missing, Error::MissingProfileCredential { .. }));
 
         store.insert(&profile, &bundle("other", "TOTHER", "stored-token"));
         let mismatch = resolve_config_with(None, |_| None, &registry, &store).unwrap_err();
@@ -1461,7 +1680,7 @@ mod tests {
         assert_eq!(
             registry.saves.load(Ordering::SeqCst),
             saves_before_refresh,
-            "same-workspace refresh must update only keyring"
+            "same-workspace refresh must update only the credential file"
         );
         assert_eq!(store.decoded(&beta).unwrap().token(), "xoxc-refreshed");
 
@@ -1490,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_profile_imports_preserve_both_registry_and_keyring_entries() {
+    fn concurrent_profile_imports_preserve_registry_and_credential_entries() {
         let directory = TestDirectory::new("concurrent-imports");
         let registry = directory.registry();
         let store = Arc::new(MemoryStore::default());
@@ -1628,7 +1847,7 @@ mod tests {
             &store,
         )
         .unwrap_err();
-        assert!(matches!(error, Error::CredentialStore));
+        assert!(matches!(error, Error::CredentialStorage));
         assert!(registry.load_state().unwrap().profiles.is_empty());
         assert!(store.decoded(&profile).is_none());
 
@@ -1649,7 +1868,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Error::ProfileRegistryWrite));
         assert!(registry.load_state().unwrap().profiles.is_empty());
-        assert!(store.decoded(&profile).is_none());
+        let restored_orphan = store.decoded(&profile).unwrap();
+        assert_eq!(restored_orphan.team_id, "TORPHAN");
+        assert_eq!(restored_orphan.token(), "xoxc-original");
 
         let registry = MemoryRegistry::default();
         let store = MemoryStore::default();
@@ -1744,7 +1965,7 @@ mod tests {
 
         store.fail_next_delete();
         let error = remove_profile_with(Some("beta"), None, &registry, &store).unwrap_err();
-        assert!(matches!(error, Error::CredentialStore));
+        assert!(matches!(error, Error::CredentialStorage));
         assert_eq!(
             registry.load_state().unwrap().default_profile.as_deref(),
             Some("beta")
@@ -1754,7 +1975,7 @@ mod tests {
         registry.fail_next_save();
         let error = remove_profile_with(Some("beta"), None, &registry, &store).unwrap_err();
         assert!(matches!(error, Error::ProfileRegistryWrite));
-        assert!(store.decoded(&beta).is_none());
+        assert!(store.decoded(&beta).is_some());
         assert!(registry.load_state().unwrap().profiles.contains_key("beta"));
 
         let retry = remove_profile_with(Some("beta"), None, &registry, &store).unwrap();
@@ -1774,6 +1995,32 @@ mod tests {
     }
 
     #[test]
+    fn profile_removal_reports_failed_restoration_and_retry_recovers() {
+        let registry = MemoryRegistry::default();
+        let store = MemoryStore::default();
+        let profile = ProfileName::parse("work").unwrap();
+        store_profile_with(
+            &profile,
+            bundle("example", "TTEST", "xoxc-original"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap();
+
+        registry.fail_next_save();
+        store.fail_next_set();
+        let error = remove_profile_with(Some("work"), None, &registry, &store).unwrap_err();
+        assert!(matches!(error, Error::CredentialReconciliation { .. }));
+        assert!(registry.load_state().unwrap().profiles.contains_key("work"));
+        assert!(store.decoded(&profile).is_none());
+
+        let recovered = remove_profile_with(Some("work"), None, &registry, &store).unwrap();
+        assert!(recovered.removed);
+        assert!(registry.load_state().unwrap().profiles.is_empty());
+    }
+
+    #[test]
     fn stored_bundle_round_trip_redacts_and_accepts_legacy_token_shapes() {
         let profile = ProfileName::parse("work").unwrap();
         let original = bundle("example", "T123", "legacy-browser-token");
@@ -1789,95 +2036,250 @@ mod tests {
     }
 
     #[test]
-    fn keyring_errors_are_secret_safe_and_actionable() {
-        let profile = ProfileName::parse("work").unwrap();
-        let invalid = map_keyring_error(
-            &profile,
-            KeyringError::BadEncoding(b"xoxc-should-never-render".to_vec()),
-        );
-        assert!(matches!(invalid, Error::InvalidStoredCredential { .. }));
-        assert!(!invalid.to_string().contains("xoxc-should-never-render"));
+    fn profile_file_names_are_case_distinct_and_cannot_traverse() {
+        let store = FileCredentialStore::at(PathBuf::from("/tmp/lurkline/credentials"));
+        let lower = store.path(&ProfileName::parse("work").unwrap());
+        let upper = store.path(&ProfileName::parse("WORK").unwrap());
+        let dot = store.path(&ProfileName::parse(".").unwrap());
+        let dot_dot = store.path(&ProfileName::parse("..").unwrap());
 
-        let malformed = map_keyring_error(
-            &profile,
-            KeyringError::BadDataFormat(
-                b"d=xoxd-should-never-render".to_vec(),
-                Box::new(std::io::Error::other("synthetic format error")),
-            ),
+        assert_eq!(lower.file_name().unwrap(), "776f726b.json");
+        assert_eq!(upper.file_name().unwrap(), "574f524b.json");
+        assert_eq!(dot.file_name().unwrap(), "2e.json");
+        assert_eq!(dot_dot.file_name().unwrap(), "2e2e.json");
+        let paths = [&lower, &upper, &dot, &dot_dot];
+        assert_eq!(
+            paths
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            paths.len()
         );
-        assert!(matches!(malformed, Error::InvalidStoredCredential { .. }));
-        assert!(!malformed.to_string().contains("xoxd-should-never-render"));
-
-        let unavailable = map_keyring_error(&profile, KeyringError::NoDefaultStore);
-        assert!(matches!(unavailable, Error::CredentialStoreUnavailable));
-        assert!(unavailable.to_string().contains("SLACK_*"));
-
-        let generic = map_keyring_error(
-            &profile,
-            KeyringError::Invalid("field".into(), "xoxc-hidden-detail".into()),
-        );
-        assert!(matches!(generic, Error::CredentialStore));
-        assert!(generic.to_string().contains("unlock or configure"));
-        assert!(!generic.to_string().contains("hidden-detail"));
+        for path in paths {
+            assert_eq!(path.parent(), Some(store.directory.as_path()));
+        }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
-    #[ignore = "writes one synthetic temporary macOS Keychain entry and removes it immediately"]
-    fn native_keyring_round_trip() {
-        use security_framework::os::macos::{
-            keychain::{CreateOptions, SecKeychain},
-            passwords::find_generic_password,
-        };
+    fn credential_files_and_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
 
-        struct Cleanup<'a> {
-            keychain: &'a SecKeychain,
-            account: &'a str,
-        }
+        let directory = TestDirectory::new("credential-mode");
+        let store = FileCredentialStore::at(directory.0.join("credentials"));
+        let profile = ProfileName::parse("work").unwrap();
+        let encoded = encode_bundle(&bundle("example", "TTEST", "xoxc-test")).unwrap();
 
-        impl Drop for Cleanup<'_> {
-            fn drop(&mut self) {
-                if let Ok((_, item)) = find_generic_password(
-                    Some(std::slice::from_ref(self.keychain)),
-                    KEYRING_SERVICE,
-                    self.account,
-                ) {
-                    item.delete();
-                }
-            }
-        }
+        store.set(&profile, &encoded).unwrap();
 
-        let directory = TestDirectory::new("native-keychain");
-        fs::create_dir_all(&directory.0).unwrap();
-        let keychain = CreateOptions::new()
-            .password("synthetic-keychain-password")
-            .create(directory.0.join("lurkline-smoke.keychain"))
-            .unwrap();
-        let profile = ProfileName::parse(&format!("native-smoke-{}", std::process::id())).unwrap();
-        let _cleanup = Cleanup {
-            keychain: &keychain,
-            account: profile.as_str(),
-        };
-        let encoded = encode_bundle(&bundle("example", "TTEST", "xoxc-test-token")).unwrap();
-        keychain
-            .set_generic_password(KEYRING_SERVICE, profile.as_str(), &encoded)
-            .unwrap();
-        let (loaded, item) = find_generic_password(
-            Some(std::slice::from_ref(&keychain)),
-            KEYRING_SERVICE,
-            profile.as_str(),
+        assert_eq!(
+            fs::metadata(&directory.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&store.directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(store.path(&profile))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let loaded = store.get(&profile).unwrap().unwrap();
+        assert_eq!(decode_bundle(&profile, &loaded).unwrap().team_id, "TTEST");
+    }
+
+    #[test]
+    fn file_backend_supports_profile_lifecycle_and_registry_only_recovery() {
+        let directory = TestDirectory::new("credential-lifecycle");
+        let registry = directory.registry();
+        let store = FileCredentialStore::at(directory.0.join("credentials"));
+        let profile = ProfileName::parse("work").unwrap();
+
+        store_profile_locked(
+            &profile,
+            bundle("example", "TTEST", "synthetic-first"),
+            false,
+            &registry,
+            &store,
         )
         .unwrap();
-        let decoded = decode_bundle(&profile, &loaded).unwrap();
-        assert_eq!(decoded.team_id, "TTEST");
-        item.delete();
         assert!(
-            find_generic_password(
-                Some(std::slice::from_ref(&keychain)),
-                KEYRING_SERVICE,
-                profile.as_str(),
-            )
-            .is_err()
+            profile_status_with(Some("work"), None, &registry, &store)
+                .unwrap()
+                .credential_present
         );
+        let config = resolve_stored_config(Some("work"), |_| None, &registry, &store).unwrap();
+        assert_eq!(config.team_id, "TTEST");
+        assert_eq!(config.token.expose(), "synthetic-first");
+
+        remove_profile_locked(Some("work"), None, &registry, &store).unwrap();
+        assert!(registry.load().unwrap().profiles.is_empty());
+        assert!(store.get(&profile).unwrap().is_none());
+
+        let registered = bundle("example", "TTEST", "synthetic-retired");
+        let mut state = ProfileRegistryState::default();
+        state.register(&profile, ProfileMetadata::from_bundle(&registered));
+        registry.save(&state).unwrap();
+        assert!(
+            !profile_status_with(Some("work"), None, &registry, &store)
+                .unwrap()
+                .credential_present
+        );
+        assert!(matches!(
+            resolve_stored_config(Some("work"), |_| None, &registry, &store),
+            Err(Error::MissingProfileCredential { .. })
+        ));
+
+        store_profile_locked(
+            &profile,
+            bundle("example", "TTEST", "synthetic-reimported"),
+            false,
+            &registry,
+            &store,
+        )
+        .unwrap();
+        let recovered = resolve_stored_config(Some("work"), |_| None, &registry, &store).unwrap();
+        assert_eq!(recovered.token.expose(), "synthetic-reimported");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_storage_objects_are_rejected() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = TestDirectory::new("credential-unsafe");
+        ensure_secure_directory(&directory.0, "configuration directory").unwrap();
+        let store = FileCredentialStore::at(directory.0.join("credentials"));
+        fs::create_dir(&store.directory).unwrap();
+        fs::set_permissions(&store.directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let profile = ProfileName::parse("work").unwrap();
+        assert!(matches!(
+            store.get(&profile),
+            Err(Error::UnsafeCredentialStorage {
+                resource: "credentials directory"
+            })
+        ));
+
+        fs::set_permissions(&store.directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = directory.0.join("target");
+        fs::write(&target, b"synthetic").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, store.path(&profile)).unwrap();
+        assert!(matches!(
+            store.get(&profile),
+            Err(Error::UnsafeCredentialStorage {
+                resource: "credential file"
+            })
+        ));
+
+        let unsafe_root = TestDirectory::new("credential-unsafe-root");
+        fs::create_dir(&unsafe_root.0).unwrap();
+        fs::set_permissions(&unsafe_root.0, fs::Permissions::from_mode(0o755)).unwrap();
+        let unsafe_store = FileCredentialStore::at(unsafe_root.0.join("credentials"));
+        assert!(matches!(
+            unsafe_store.get(&profile),
+            Err(Error::UnsafeCredentialStorage {
+                resource: "configuration directory"
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_mode_validation_rejects_wrong_owner_type_and_permissions() {
+        // SAFETY: geteuid has no preconditions and does not retain pointers.
+        let uid = unsafe { libc::geteuid() };
+        for resource in [
+            "configuration directory",
+            "credentials directory",
+            "profile registry",
+            "profile lock",
+            "credential file",
+        ] {
+            assert!(matches!(
+                validate_owner_mode(true, uid.wrapping_add(1), 0o600, 0o600, resource),
+                Err(Error::UnsafeCredentialStorage { .. })
+            ));
+            assert!(matches!(
+                validate_owner_mode(false, uid, 0o600, 0o600, resource),
+                Err(Error::UnsafeCredentialStorage { .. })
+            ));
+            assert!(matches!(
+                validate_owner_mode(true, uid, 0o640, 0o600, resource),
+                Err(Error::UnsafeCredentialStorage { .. })
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_lock_file_is_rejected() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = TestDirectory::new("lock-unsafe");
+        ensure_secure_directory(&directory.0, "configuration directory").unwrap();
+        let registry = directory.registry();
+        let target = directory.0.join("target");
+        fs::write(&target, b"").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, directory.0.join("profiles.lock")).unwrap();
+
+        assert!(matches!(
+            registry.lock_shared(),
+            Err(Error::ProfileRegistryLock)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_reads_and_writes_are_bounded_and_secret_safe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("credential-bounds");
+        let store = FileCredentialStore::at(directory.0.join("credentials"));
+        let profile = ProfileName::parse("work").unwrap();
+        let secret = vec![b'x'; MAX_CREDENTIAL_BYTES as usize + 1];
+        let error = store.set(&profile, &secret).unwrap_err();
+        assert!(matches!(error, Error::CredentialTooLarge { .. }));
+        assert!(!error.to_string().contains(&"x".repeat(32)));
+
+        store.ensure_directory().unwrap();
+        fs::write(store.path(&profile), &secret).unwrap();
+        fs::set_permissions(store.path(&profile), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            store.get(&profile),
+            Err(Error::CredentialTooLarge { .. })
+        ));
+
+        fs::write(store.path(&profile), b"{not-json").unwrap();
+        let encoded = store.get(&profile).unwrap().unwrap();
+        assert!(matches!(
+            decode_bundle(&profile, &encoded),
+            Err(Error::InvalidStoredCredential { .. })
+        ));
+    }
+
+    #[test]
+    fn credential_rename_is_the_commit_point_if_directory_sync_fails() {
+        let directory = TestDirectory::new("credential-commit-point");
+        let store = FileCredentialStore::at(directory.0.join("credentials"));
+        let profile = ProfileName::parse("work").unwrap();
+        let encoded = encode_bundle(&bundle("example", "TTEST", "xoxc-test")).unwrap();
+        let sync_calls = AtomicUsize::new(0);
+
+        store
+            .write_with_directory_sync(&profile, &encoded, |_| {
+                sync_calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::CredentialStorage)
+            })
+            .unwrap();
+
+        assert_eq!(sync_calls.load(Ordering::SeqCst), 1);
+        let loaded = store.get(&profile).unwrap().unwrap();
+        assert_eq!(decode_bundle(&profile, &loaded).unwrap().team_id, "TTEST");
     }
 }

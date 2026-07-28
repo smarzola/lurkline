@@ -40,7 +40,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Import and manage secure browser-session credential profiles.
+    /// Import and manage browser-session credential profiles.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -135,7 +135,7 @@ pub enum AuthCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove one profile from the OS credential store and local registry.
+    /// Remove one profile's credential file and registry entry.
     Remove {
         /// Emit stable JSON.
         #[arg(long)]
