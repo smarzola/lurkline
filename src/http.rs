@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{
     Client, StatusCode,
-    header::{ACCEPT, COOKIE, HeaderMap, HeaderValue, ORIGIN, REFERER},
+    header::{ACCEPT, AUTHORIZATION, COOKIE, HeaderMap, HeaderValue, LOCATION, ORIGIN, REFERER},
     multipart::Form,
     redirect::Policy,
 };
@@ -14,10 +14,12 @@ use serde_json::Value;
 use crate::{
     config::Config,
     error::{Error, Result},
+    local_file::BoundedDownload,
     model::{
-        ClientCountsPayload, DraftDestination, RawConversationsPage, RawDraftResponse,
-        RawDraftsPage, RawMessagePage, RawMessageSearchResponse, RawMessagesList,
-        RawMutationResponse, RawPostMessageResponse, RawUsersPage,
+        ClientCountsPayload, DraftDestination, RawAuthTestResponse, RawConversationsPage,
+        RawDraftResponse, RawDraftsPage, RawEmojiResponse, RawFileResponse, RawMessagePage,
+        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
+        RawReactionItemResponse, RawUsersPage,
     },
     service::SlackApi,
 };
@@ -26,6 +28,7 @@ use crate::{
 pub(crate) struct SlackHttpClient {
     config: Arc<Config>,
     client: Client,
+    download_client: Client,
 }
 
 impl SlackHttpClient {
@@ -39,9 +42,17 @@ impl SlackHttpClient {
             .map_err(|_| Error::Transport {
                 method: "client.build",
             })?;
+        let download_client = Client::builder()
+            .redirect(Policy::none())
+            .timeout(config.timeout)
+            .build()
+            .map_err(|_| Error::Transport {
+                method: "client.build",
+            })?;
         Ok(Self {
             config: Arc::new(config),
             client,
+            download_client,
         })
     }
 
@@ -69,6 +80,18 @@ impl SlackHttpClient {
     }
 
     async fn post_publication_form<T>(
+        &self,
+        method: &'static str,
+        reason: &'static str,
+        fields: &[(&'static str, String)],
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.post_form_inner(method, reason, fields, true).await
+    }
+
+    async fn post_mutation_form<T>(
         &self,
         method: &'static str,
         reason: &'static str,
@@ -316,6 +339,81 @@ impl SlackApi for SlackHttpClient {
         self.post_form("users.list", "users-list", &fields).await
     }
 
+    async fn auth_test(&self) -> Result<RawAuthTestResponse> {
+        self.post_form("auth.test", "lurkline-auth-test", &[]).await
+    }
+
+    async fn emoji_list(&self) -> Result<RawEmojiResponse> {
+        self.post_form(
+            "emoji.list",
+            "lurkline-emoji-list",
+            &[("include_categories", "true".into())],
+        )
+        .await
+    }
+
+    async fn files_info(&self, file_id: &str) -> Result<RawFileResponse> {
+        self.post_form(
+            "files.info",
+            "lurkline-files-info",
+            &[("file", file_id.into())],
+        )
+        .await
+    }
+
+    async fn reactions_get(
+        &self,
+        channel: &str,
+        message_ts: &str,
+    ) -> Result<RawReactionItemResponse> {
+        self.post_form(
+            "reactions.get",
+            "lurkline-reactions-get",
+            &[
+                ("channel", channel.into()),
+                ("timestamp", message_ts.into()),
+                ("full", "true".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn reactions_add(
+        &self,
+        channel: &str,
+        message_ts: &str,
+        name: &str,
+    ) -> Result<RawMutationResponse> {
+        self.post_mutation_form(
+            "reactions.add",
+            "lurkline-reactions-add",
+            &[
+                ("channel", channel.into()),
+                ("timestamp", message_ts.into()),
+                ("name", name.into()),
+            ],
+        )
+        .await
+    }
+
+    async fn reactions_remove(
+        &self,
+        channel: &str,
+        message_ts: &str,
+        name: &str,
+    ) -> Result<RawMutationResponse> {
+        self.post_mutation_form(
+            "reactions.remove",
+            "lurkline-reactions-remove",
+            &[
+                ("channel", channel.into()),
+                ("timestamp", message_ts.into()),
+                ("name", name.into()),
+            ],
+        )
+        .await
+    }
+
     async fn drafts_list(&self, next_ts: Option<&str>, limit: usize) -> Result<RawDraftsPage> {
         let mut fields = vec![("is_active", "true".into()), ("limit", limit.to_string())];
         if let Some(next_ts) = next_ts {
@@ -421,6 +519,126 @@ impl SlackApi for SlackHttpClient {
         self.post_publication_form("chat.postMessage", "lurkline-message-send", &fields)
             .await
     }
+
+    async fn download_private_file(
+        &self,
+        download_url: &str,
+        target: &mut BoundedDownload,
+    ) -> Result<()> {
+        const MAX_REDIRECTS: usize = 3;
+        let mut url = url::Url::parse(download_url).map_err(|_| Error::InvalidResponse {
+            method: "files.download",
+        })?;
+        let allow_test_loopback = cfg!(test)
+            && self.config.base_url.host_str() == Some("127.0.0.1")
+            && self.config.base_url.scheme() == "http";
+        validate_credentialed_download_url(&url, allow_test_loopback)?;
+
+        for hop in 0..=MAX_REDIRECTS {
+            let mut request = self.download_client.get(url.clone());
+            if hop == 0 {
+                request = request.header(
+                    AUTHORIZATION,
+                    format!("Bearer {}", self.config.token.expose()),
+                );
+            }
+            let response = request.send().await.map_err(|error| {
+                if error.is_timeout() {
+                    Error::Timeout {
+                        method: "files.download",
+                    }
+                } else {
+                    Error::Transport {
+                        method: "files.download",
+                    }
+                }
+            })?;
+
+            if response.status().is_redirection() {
+                if hop == MAX_REDIRECTS {
+                    return Err(Error::InvalidResponse {
+                        method: "files.download",
+                    });
+                }
+                let location = response
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or(Error::InvalidResponse {
+                        method: "files.download",
+                    })?;
+                url = url.join(location).map_err(|_| Error::InvalidResponse {
+                    method: "files.download",
+                })?;
+                validate_redirect_download_url(&url, allow_test_loopback)?;
+                continue;
+            }
+            if matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ) {
+                return Err(Error::Authentication);
+            }
+            if !response.status().is_success() {
+                return Err(Error::HttpStatus {
+                    method: "files.download",
+                    status: response.status().as_u16(),
+                });
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > crate::service::MAX_FILE_DOWNLOAD_BYTES)
+            {
+                return Err(Error::ResponseTooLarge {
+                    method: "files.download",
+                    limit: crate::service::MAX_FILE_DOWNLOAD_BYTES as usize,
+                });
+            }
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|error| {
+                    if error.is_timeout() {
+                        Error::Timeout {
+                            method: "files.download",
+                        }
+                    } else {
+                        Error::Transport {
+                            method: "files.download",
+                        }
+                    }
+                })?;
+                target.write_chunk(&chunk)?;
+            }
+            return Ok(());
+        }
+        unreachable!("bounded redirect loop always returns")
+    }
+}
+
+fn validate_credentialed_download_url(url: &url::Url, allow_test_loopback: bool) -> Result<()> {
+    validate_file_download_origin(url, allow_test_loopback)
+}
+
+fn validate_redirect_download_url(url: &url::Url, allow_test_loopback: bool) -> Result<()> {
+    validate_file_download_origin(url, allow_test_loopback)
+}
+
+fn validate_file_download_origin(url: &url::Url, allow_test_loopback: bool) -> Result<()> {
+    let host = url.host_str().unwrap_or_default();
+    let valid_origin = (url.scheme() == "https"
+        && host == "files.slack.com"
+        && url.port_or_known_default() == Some(443))
+        || (allow_test_loopback && url.scheme() == "http" && host == "127.0.0.1");
+    if !valid_origin
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Error::InvalidResponse {
+            method: "files.download",
+        });
+    }
+    Ok(())
 }
 
 fn encode_json(value: &(impl serde::Serialize + ?Sized)) -> Result<String> {
@@ -503,7 +721,7 @@ mod tests {
         extract::{OriginalUri, State},
         http::{HeaderMap, StatusCode, Uri},
         response::{IntoResponse, Response},
-        routing::post,
+        routing::{get, post},
     };
     use futures_util::stream;
     use tokio::net::TcpListener;
@@ -569,6 +787,51 @@ mod tests {
         SlackHttpClient::new(config).unwrap()
     }
 
+    #[derive(Clone)]
+    struct DownloadCapture {
+        requests: Arc<Mutex<Vec<(Uri, HeaderMap)>>>,
+        redirect: bool,
+    }
+
+    async fn download_handler(
+        State(capture): State<DownloadCapture>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        capture
+            .requests
+            .lock()
+            .unwrap()
+            .push((uri.clone(), headers));
+        if capture.redirect && uri.path() == "/download" {
+            return Response::builder()
+                .status(StatusCode::FOUND)
+                .header(LOCATION, "/bytes")
+                .body(Body::empty())
+                .unwrap();
+        }
+        Response::new(Body::from("safe"))
+    }
+
+    async fn download_server(redirect: bool) -> (SlackHttpClient, DownloadCapture, Url) {
+        let capture = DownloadCapture {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            redirect,
+        };
+        let app = Router::new()
+            .route("/download", get(download_handler))
+            .route("/bytes", get(download_handler))
+            .with_state(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = Url::parse(&format!("http://{address}/")).unwrap();
+        let config = Config::for_test(base_url.clone(), 64 * 1024);
+        (SlackHttpClient::new(config).unwrap(), capture, base_url)
+    }
+
     #[tokio::test]
     async fn sends_browser_session_request_shape() {
         let (client, capture) = server(
@@ -613,6 +876,66 @@ mod tests {
                 "missing multipart field {expected}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn private_download_uses_a_credential_isolated_client_and_strips_auth_on_redirect() {
+        for redirect in [false, true] {
+            let (client, capture, base_url) = download_server(redirect).await;
+            let directory = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "lurkline-http-download-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+            std::fs::create_dir(&directory).unwrap();
+            let root = crate::local_file::McpFileRoot::open(&directory).unwrap();
+            let mut target = root
+                .prepare_download(std::path::Path::new("output"), 10)
+                .unwrap();
+            client
+                .download_private_file(base_url.join("download").unwrap().as_str(), &mut target)
+                .await
+                .unwrap();
+            target.commit().unwrap();
+            assert_eq!(std::fs::read(directory.join("output")).unwrap(), b"safe");
+
+            let requests = capture.requests.lock().unwrap();
+            assert_eq!(requests.len(), if redirect { 2 } else { 1 });
+            assert_eq!(
+                requests[0].1.get(AUTHORIZATION).unwrap(),
+                "Bearer xoxc-test-secret"
+            );
+            assert!(requests[0].1.get(COOKIE).is_none());
+            if redirect {
+                assert!(requests[1].1.get(AUTHORIZATION).is_none());
+                assert!(requests[1].1.get(COOKIE).is_none());
+            }
+            drop(requests);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn private_download_rejects_non_slack_origins_and_embedded_credentials() {
+        for value in [
+            "http://files.slack.com/file",
+            "https://example.com/file",
+            "https://slack.com/file",
+            "https://workspace.slack.com/file",
+            "https://other.files.slack.com/file",
+            "https://user@files.slack.com/file",
+            "https://files.slack.com:444/file",
+            "https://files.slack.com/file#fragment",
+        ] {
+            let url = Url::parse(value).unwrap();
+            assert!(validate_credentialed_download_url(&url, false).is_err());
+            assert!(validate_redirect_download_url(&url, false).is_err());
+        }
+        let valid = Url::parse("https://files.slack.com/files-pri/T-F/download/name").unwrap();
+        assert!(validate_credentialed_download_url(&valid, false).is_ok());
+        assert!(validate_redirect_download_url(&valid, false).is_ok());
     }
 
     #[tokio::test]
@@ -689,6 +1012,30 @@ mod tests {
                     "false",
                 ],
             ),
+            (
+                "auth",
+                br#"{"ok":true,"user_id":"U123"}"#.as_slice(),
+                "/api/auth.test",
+                vec!["lurkline-auth-test"],
+            ),
+            (
+                "emoji",
+                br#"{"ok":true,"emoji":{}}"#.as_slice(),
+                "/api/emoji.list",
+                vec!["include_categories", "true"],
+            ),
+            (
+                "file",
+                br#"{"ok":true,"file":{"id":"F123"}}"#.as_slice(),
+                "/api/files.info",
+                vec!["file", "F123"],
+            ),
+            (
+                "reaction",
+                br#"{"ok":true,"message":{"ts":"100.000001"}}"#.as_slice(),
+                "/api/reactions.get",
+                vec!["C123", "100.000001", "full", "true"],
+            ),
         ];
 
         for (case, response, expected_path, expected_fields) in cases {
@@ -721,6 +1068,18 @@ mod tests {
                 "search" => {
                     client.search_messages("deploy", None, 25).await.unwrap();
                 }
+                "auth" => {
+                    client.auth_test().await.unwrap();
+                }
+                "emoji" => {
+                    client.emoji_list().await.unwrap();
+                }
+                "file" => {
+                    client.files_info("F123").await.unwrap();
+                }
+                "reaction" => {
+                    client.reactions_get("C123", "100.000001").await.unwrap();
+                }
                 _ => unreachable!(),
             }
             let guard = capture.request.lock().unwrap();
@@ -743,6 +1102,50 @@ mod tests {
                     }])
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_reaction_mutation_shapes() {
+        for (method, expected_path) in [
+            ("add", "/api/reactions.add"),
+            ("remove", "/api/reactions.remove"),
+        ] {
+            let (client, capture) =
+                server(StatusCode::OK, br#"{"ok":true}"#.to_vec(), 64 * 1024).await;
+            if method == "add" {
+                client
+                    .reactions_add("C123", "100.000001", "eyes")
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .reactions_remove("C123", "100.000001", "eyes")
+                    .await
+                    .unwrap();
+            }
+            let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+            let body = String::from_utf8_lossy(&raw_body);
+            assert_eq!(uri.path(), expected_path);
+            assert_eq!(multipart_text_field(&body, "channel"), Some("C123"));
+            assert_eq!(multipart_text_field(&body, "timestamp"), Some("100.000001"));
+            assert_eq!(multipart_text_field(&body, "name"), Some("eyes"));
+        }
+
+        let (client, _) = server(StatusCode::OK, b"not-json".to_vec(), 64 * 1024).await;
+        assert!(matches!(
+            client.reactions_add("C123", "100.000001", "eyes").await,
+            Err(Error::InvalidResponse {
+                method: "reactions.add"
+            })
+        ));
+
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let (client, _) = server(status, Vec::new(), 64 * 1024).await;
+            assert!(matches!(
+                client.reactions_remove("C123", "100.000001", "eyes").await,
+                Err(Error::Authentication)
+            ));
         }
     }
 
