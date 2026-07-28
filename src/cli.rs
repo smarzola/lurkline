@@ -1745,7 +1745,8 @@ mod tests {
             private_url: Some("https://files.slack.com/private".into()),
             download_url: Some("https://files.slack.com/file\nname".into()),
             permalink: Some("https://workspace.slack.com/files/F123".into()),
-            shares: vec![],
+            shares: Some(vec![]),
+            shares_complete: true,
         }
     }
 
@@ -1810,6 +1811,7 @@ mod tests {
         assert_eq!(file["id"], "F123");
         assert_eq!(file["size"], 42);
         assert_eq!(file["shares"], serde_json::json!([]));
+        assert_eq!(file["shares_complete"], true);
 
         let reaction = serde_json::to_value(ReactionMutationReport {
             channel_id: "C123".into(),

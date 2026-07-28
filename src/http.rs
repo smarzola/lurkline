@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{
     Client, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, COOKIE, HeaderMap, HeaderValue, LOCATION, ORIGIN, REFERER},
+    header::{
+        ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, LOCATION, ORIGIN,
+        REFERER,
+    },
     multipart::Form,
     redirect::Policy,
 };
@@ -537,10 +540,12 @@ impl SlackApi for SlackHttpClient {
         for hop in 0..=MAX_REDIRECTS {
             let mut request = self.download_client.get(url.clone());
             if hop == 0 {
-                request = request.header(
-                    AUTHORIZATION,
-                    format!("Bearer {}", self.config.token.expose()),
-                );
+                request = request
+                    .header(
+                        AUTHORIZATION,
+                        format!("Bearer {}", self.config.token.expose()),
+                    )
+                    .header(COOKIE, self.config.cookie.expose());
             }
             let response = request.send().await.map_err(|error| {
                 if error.is_timeout() {
@@ -583,6 +588,19 @@ impl SlackApi for SlackHttpClient {
                 return Err(Error::HttpStatus {
                     method: "files.download",
                     status: response.status().as_u16(),
+                });
+            }
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim);
+            if !content_type
+                .is_some_and(|value| value.eq_ignore_ascii_case("application/force-download"))
+            {
+                return Err(Error::InvalidResponse {
+                    method: "files.download",
                 });
             }
             if response
@@ -791,6 +809,8 @@ mod tests {
     struct DownloadCapture {
         requests: Arc<Mutex<Vec<(Uri, HeaderMap)>>>,
         redirect: bool,
+        content_type: Option<&'static str>,
+        body: &'static [u8],
     }
 
     async fn download_handler(
@@ -810,13 +830,29 @@ mod tests {
                 .body(Body::empty())
                 .unwrap();
         }
-        Response::new(Body::from("safe"))
+        let mut response = Response::new(Body::from(capture.body));
+        if let Some(content_type) = capture.content_type {
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        }
+        response
     }
 
     async fn download_server(redirect: bool) -> (SlackHttpClient, DownloadCapture, Url) {
+        download_server_with_response(redirect, Some("application/force-download"), b"safe").await
+    }
+
+    async fn download_server_with_response(
+        redirect: bool,
+        content_type: Option<&'static str>,
+        body: &'static [u8],
+    ) -> (SlackHttpClient, DownloadCapture, Url) {
         let capture = DownloadCapture {
             requests: Arc::new(Mutex::new(Vec::new())),
             redirect,
+            content_type,
+            body,
         };
         let app = Router::new()
             .route("/download", get(download_handler))
@@ -879,7 +915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_download_uses_a_credential_isolated_client_and_strips_auth_on_redirect() {
+    async fn private_download_uses_required_first_hop_credentials_and_strips_redirects() {
         for redirect in [false, true] {
             let (client, capture, base_url) = download_server(redirect).await;
             let directory = std::fs::canonicalize(std::env::temp_dir())
@@ -907,13 +943,49 @@ mod tests {
                 requests[0].1.get(AUTHORIZATION).unwrap(),
                 "Bearer xoxc-test-secret"
             );
-            assert!(requests[0].1.get(COOKIE).is_none());
+            assert_eq!(
+                requests[0].1.get(COOKIE).unwrap(),
+                "d=xoxd-test-secret; b=test"
+            );
             if redirect {
                 assert!(requests[1].1.get(AUTHORIZATION).is_none());
                 assert!(requests[1].1.get(COOKIE).is_none());
             }
             drop(requests);
             std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn private_download_rejects_unexpected_content_type_without_residue() {
+        for content_type in [None, Some("text/html; charset=utf-8")] {
+            let (client, _capture, base_url) =
+                download_server_with_response(false, content_type, b"safe").await;
+            let directory = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "lurkline-http-download-content-type-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+            std::fs::create_dir(&directory).unwrap();
+            let root = crate::local_file::McpFileRoot::open(&directory).unwrap();
+            let mut target = root
+                .prepare_download(std::path::Path::new("output"), 4)
+                .unwrap();
+
+            let result = client
+                .download_private_file(base_url.join("download").unwrap().as_str(), &mut target)
+                .await;
+            assert!(matches!(
+                result,
+                Err(Error::InvalidResponse {
+                    method: "files.download"
+                })
+            ));
+            drop(target);
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+            std::fs::remove_dir(&directory).unwrap();
         }
     }
 

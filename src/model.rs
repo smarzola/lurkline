@@ -139,7 +139,11 @@ pub(crate) struct RawFile {
     #[serde(default)]
     pub permalink: Option<String>,
     #[serde(default)]
-    pub shares: RawFileShares,
+    pub shares: Option<RawFileShares>,
+    #[serde(default)]
+    pub has_more_shares: Option<bool>,
+    #[serde(default)]
+    pub skipped_shares: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -640,7 +644,10 @@ pub struct FileReference {
     pub private_url: Option<String>,
     pub download_url: Option<String>,
     pub permalink: Option<String>,
-    pub shares: Vec<FileShare>,
+    /// `None` means Slack omitted share metadata; `Some([])` is explicitly empty.
+    pub shares: Option<Vec<FileShare>>,
+    /// Whether `shares` is present and Slack did not report omitted entries.
+    pub shares_complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]

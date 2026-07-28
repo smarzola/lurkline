@@ -1074,14 +1074,23 @@ impl SlackService {
                 method: "messages.list",
             });
         }
-        candidates
+        let mut matches = candidates
             .into_iter()
-            .find(|message| message.ts == message_ts)
-            .map(|message| normalize_message(&channel, message, "messages.list"))
-            .transpose()?
-            .ok_or(Error::NotFound {
+            .filter(|message| message.ts == message_ts);
+        let Some(first) = matches.next() else {
+            return Err(Error::NotFound {
                 resource: "Slack message",
-            })
+            });
+        };
+        let first = normalize_message(&channel, first, "messages.list")?;
+        for duplicate in matches {
+            if normalize_message(&channel, duplicate, "messages.list")? != first {
+                return Err(Error::InvalidResponse {
+                    method: "messages.list",
+                });
+            }
+        }
+        Ok(first)
     }
 
     pub(crate) async fn find_users(&self, query: &str, limit: usize) -> Result<UserSearchReport> {
@@ -1971,40 +1980,45 @@ fn normalize_file(raw: RawFile, method: &'static str) -> Result<FileReference> {
         }
     }
 
-    let share_channels = raw
-        .shares
-        .public
-        .len()
-        .saturating_add(raw.shares.private.len());
-    let share_count = raw
-        .shares
-        .public
-        .values()
-        .chain(raw.shares.private.values())
-        .map(Vec::len)
-        .sum::<usize>();
-    if share_channels > MAX_FILE_SHARES || share_count > MAX_FILE_SHARES {
-        return Err(Error::InvalidResponse { method });
-    }
-    let mut shares = Vec::with_capacity(share_count);
-    append_file_shares(
-        &mut shares,
-        raw.shares.public,
-        FileShareVisibility::Public,
-        method,
-    )?;
-    append_file_shares(
-        &mut shares,
-        raw.shares.private,
-        FileShareVisibility::Private,
-        method,
-    )?;
-    shares.sort_by(|left, right| {
-        left.channel_id
-            .cmp(&right.channel_id)
-            .then_with(|| left.ts.cmp(&right.ts))
-            .then_with(|| left.thread_ts.cmp(&right.thread_ts))
-    });
+    let shares = if let Some(raw_shares) = raw.shares {
+        let share_channels = raw_shares
+            .public
+            .len()
+            .saturating_add(raw_shares.private.len());
+        let share_count = raw_shares
+            .public
+            .values()
+            .chain(raw_shares.private.values())
+            .map(Vec::len)
+            .sum::<usize>();
+        if share_channels > MAX_FILE_SHARES || share_count > MAX_FILE_SHARES {
+            return Err(Error::InvalidResponse { method });
+        }
+        let mut shares = Vec::with_capacity(share_count);
+        append_file_shares(
+            &mut shares,
+            raw_shares.public,
+            FileShareVisibility::Public,
+            method,
+        )?;
+        append_file_shares(
+            &mut shares,
+            raw_shares.private,
+            FileShareVisibility::Private,
+            method,
+        )?;
+        shares.sort_by(|left, right| {
+            left.channel_id
+                .cmp(&right.channel_id)
+                .then_with(|| left.ts.cmp(&right.ts))
+                .then_with(|| left.thread_ts.cmp(&right.thread_ts))
+        });
+        Some(shares)
+    } else {
+        None
+    };
+    let shares_complete =
+        shares.is_some() && raw.has_more_shares != Some(true) && raw.skipped_shares != Some(true);
 
     Ok(FileReference {
         id: raw.id,
@@ -2027,6 +2041,7 @@ fn normalize_file(raw: RawFile, method: &'static str) -> Result<FileReference> {
         download_url: raw.url_private_download,
         permalink: raw.permalink,
         shares,
+        shares_complete,
     })
 }
 
@@ -5196,7 +5211,7 @@ mod tests {
                 url_private: Some("https://files.slack.com/private".into()),
                 url_private_download: Some("https://files.slack.com/download".into()),
                 permalink: Some("https://sferait.slack.com/files/U123/F123".into()),
-                shares: crate::model::RawFileShares {
+                shares: Some(crate::model::RawFileShares {
                     private: BTreeMap::from([(
                         "C123".into(),
                         vec![crate::model::RawFileShare {
@@ -5205,7 +5220,7 @@ mod tests {
                         }],
                     )]),
                     ..crate::model::RawFileShares::default()
-                },
+                }),
                 ..RawFile::default()
             },
         };
@@ -5221,11 +5236,63 @@ mod tests {
         let service = service(api);
         let file = service.get_file("F123").await.unwrap();
         assert_eq!(file.title.as_deref(), Some("Note"));
-        assert_eq!(file.shares.len(), 1);
+        assert_eq!(file.shares.as_ref().unwrap().len(), 1);
+        assert!(file.shares_complete);
         let emoji = service.list_custom_emoji().await.unwrap();
         assert_eq!(emoji.emoji.len(), 2);
         assert_eq!(emoji.emoji[0].kind, CustomEmojiKind::Image);
         assert_eq!(emoji.emoji[1].alias_for.as_deref(), Some("party"));
+    }
+
+    #[test]
+    fn file_share_metadata_distinguishes_omitted_complete_and_truncated_data() {
+        let omitted = normalize_file(
+            RawFile {
+                id: "F123".into(),
+                ..RawFile::default()
+            },
+            "files.info",
+        )
+        .unwrap();
+        assert_eq!(omitted.shares, None);
+        assert!(!omitted.shares_complete);
+
+        let complete = normalize_file(
+            RawFile {
+                id: "F123".into(),
+                shares: Some(crate::model::RawFileShares::default()),
+                ..RawFile::default()
+            },
+            "files.info",
+        )
+        .unwrap();
+        assert_eq!(complete.shares, Some(vec![]));
+        assert!(complete.shares_complete);
+
+        for (has_more_shares, skipped_shares) in [(Some(true), None), (None, Some(true))] {
+            let truncated = normalize_file(
+                RawFile {
+                    id: "F123".into(),
+                    shares: Some(crate::model::RawFileShares {
+                        private: BTreeMap::from([(
+                            "C123".into(),
+                            vec![crate::model::RawFileShare {
+                                ts: "100.000001".into(),
+                                thread_ts: None,
+                            }],
+                        )]),
+                        ..crate::model::RawFileShares::default()
+                    }),
+                    has_more_shares,
+                    skipped_shares,
+                    ..RawFile::default()
+                },
+                "files.info",
+            )
+            .unwrap();
+            assert_eq!(truncated.shares.as_ref().unwrap().len(), 1);
+            assert!(!truncated.shares_complete);
+        }
     }
 
     #[tokio::test]
@@ -5260,7 +5327,8 @@ mod tests {
             private_url: None,
             download_url: Some("https://files.slack.com/download".into()),
             permalink: None,
-            shares: vec![],
+            shares: Some(vec![]),
+            shares_complete: true,
         };
         let target = root
             .prepare_download(std::path::Path::new("output"), 10)
@@ -5640,10 +5708,55 @@ mod tests {
                     "private_url": null,
                     "download_url": "https://files.slack.com/note.txt",
                     "permalink": null,
-                    "shares": []
+                    "shares": null,
+                    "shares_complete": false
                 }]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn exact_message_accepts_identical_duplicate_representations() {
+        let mut api = fake_api();
+        let message = raw_message("100.000002", "target");
+        api.message_list.messages = BTreeMap::from([("target".into(), message.clone())]);
+        api.message_list.messages_data = BTreeMap::from([(
+            "C123".into(),
+            RawChannelMessages {
+                messages: vec![message],
+            },
+        )]);
+
+        let message = service(api)
+            .get_message("C123", "100.000002")
+            .await
+            .unwrap();
+        assert_eq!(message.text, "target");
+        assert_eq!(message.files.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_message_rejects_conflicting_duplicate_representations() {
+        let mut api = fake_api();
+        let sparse = raw_message("100.000002", "target");
+        let mut hydrated = sparse.clone();
+        hydrated.attachments = Some(vec![serde_json::json!({
+            "fallback": "synthetic attachment"
+        })]);
+        api.message_list.messages = BTreeMap::from([("target".into(), sparse)]);
+        api.message_list.messages_data = BTreeMap::from([(
+            "C123".into(),
+            RawChannelMessages {
+                messages: vec![hydrated],
+            },
+        )]);
+
+        assert!(matches!(
+            service(api).get_message("C123", "100.000002").await,
+            Err(Error::InvalidResponse {
+                method: "messages.list"
+            })
+        ));
     }
 
     #[tokio::test]

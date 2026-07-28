@@ -383,7 +383,10 @@ before treating that list as exhaustive. Slack guarantees that the
 authenticated user remains present when that user reacted. Nullable or omitted
 file metadata remains `null`; sparse Slack Connect placeholders expose
 `mode: "file_access"` and `file_access: "check_file_info"` without inventing
-names, sizes, timestamps, or uploader IDs.
+names, sizes, timestamps, or uploader IDs. File `shares` is `null` when Slack
+omits it and `[]` only when Slack returns an explicit empty object. Treat
+shares as exhaustive only when `shares_complete` is `true`; Slack's
+`has_more_shares` and `skipped_shares` indicators make it `false`.
 
 Add `--json` to a data-returning command for structured JSON.
 
@@ -414,10 +417,13 @@ components, and 255 bytes per component.
 
 Lurkline obtains the download URL from `files.info`; callers can't supply one.
 The response must include both an exact byte size and a private download URL.
-It uses a separate client without the browser cookie. The first validated
-`https://files.slack.com` request carries the browser token, and any validated
-redirect is followed without credentials. Redirects away from that exact
-origin, non-HTTPS URLs, embedded URL credentials, and more than three hops fail.
+It uses a separate file client. The first validated
+`https://files.slack.com` request carries the browser token and cookie because
+Slack requires both for private file bytes. A successful response must have the
+observed `application/force-download` media type before any bytes are written.
+Any validated redirect is followed without either credential. Redirects away
+from that exact origin, non-HTTPS URLs, embedded URL credentials, and more than
+three hops fail.
 
 List custom emoji and aliases:
 
@@ -696,11 +702,11 @@ The browser token and `d=` cookie carry your Slack user authority. Lurkline:
   process-environment override.
 - Stores only normalized credential fields, never the copied cURL request.
 - Zeroizes owned secret buffers where practical and redacts diagnostics.
-- Sends browser API credentials only to the configured single-label
+- Sends browser Web API method credentials only to the configured single-label
   `*.slack.com` workspace origin.
-- Uses a separate cookie-free file client, sends the token only on the first
-  exact `https://files.slack.com` download request, and strips it from
-  redirects.
+- Uses a separate file client, sends the token and cookie only on the first
+  exact `https://files.slack.com` download request after live validation, and
+  strips both from redirects.
 - Rejects API redirects, validates file redirects, and bounds request input,
   response output, and streamed file bytes.
 - Keeps MCP writes disabled unless the operator passes `--allow-write`.
