@@ -106,8 +106,7 @@ Download an archive and its matching `.sha256` file from
 [GitHub Releases](https://github.com/smarzola/lurkline/releases). Releases
 provide binaries for Linux x86-64, Linux ARM64, and macOS ARM64.
 
-For example, run the following commands to verify and install the macOS ARM64
-archive:
+Verify and install the macOS ARM64 archive:
 
 ```sh
 shasum -a 256 -c lurkline-v0.8.0-macos-aarch64.tar.gz.sha256
@@ -118,7 +117,7 @@ lurkline --version
 
 ### Build from source
 
-Run the following commands:
+Build and install Lurkline from source:
 
 ```sh
 git clone https://github.com/smarzola/lurkline.git
@@ -192,7 +191,7 @@ rollback where possible.
 
 ### Remove a profile
 
-Run the following command:
+Remove the profile:
 
 ```sh
 lurkline auth remove --profile work
@@ -948,7 +947,7 @@ data.
 
 ## Develop Lurkline
 
-Run the complete verification suite:
+Verify a development checkout:
 
 ```sh
 cargo fmt --all -- --check
