@@ -1,4 +1,7 @@
-use std::{process::Stdio, time::Duration};
+use std::{
+    process::Stdio,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::{Value, json};
 use tokio::{
@@ -124,7 +127,6 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_doctor",
             "slack_create_draft",
             "slack_delete_draft",
-            "slack_download_file",
             "slack_find_conversations",
             "slack_find_users",
             "slack_get_draft",
@@ -323,66 +325,6 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         );
     }
 
-    let download_disabled = call_tool(
-        &mut stdin,
-        &mut stdout,
-        27,
-        "slack_download_file",
-        json!({
-            "file_id": "F123",
-            "path": "synthetic.txt",
-            "max_bytes": 1024
-        }),
-    )
-    .await;
-    assert_eq!(download_disabled["result"]["isError"], true);
-    assert_eq!(
-        download_disabled["result"]["structuredContent"]["error"]["code"],
-        "file_root_required"
-    );
-
-    let invalid_download_path = call_tool(
-        &mut stdin,
-        &mut stdout,
-        30,
-        "slack_download_file",
-        json!({
-            "file_id": "F123",
-            "path": "../synthetic.txt",
-            "max_bytes": 1024
-        }),
-    )
-    .await;
-    assert_eq!(invalid_download_path["result"]["isError"], true);
-    assert_eq!(
-        invalid_download_path["result"]["structuredContent"]["error"]["code"],
-        "local_file"
-    );
-
-    let oversized_download_path = call_tool(
-        &mut stdin,
-        &mut stdout,
-        31,
-        "slack_download_file",
-        json!({
-            "file_id": "F123",
-            "path": "x".repeat(4097),
-            "max_bytes": 1024
-        }),
-    )
-    .await;
-    assert_eq!(oversized_download_path["result"]["isError"], true);
-    assert_eq!(
-        oversized_download_path["result"]["structuredContent"]["error"]["code"],
-        "local_file"
-    );
-    assert!(
-        oversized_download_path["result"]["structuredContent"]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("4096-byte limit")
-    );
-
     let invalid_file = call_tool(
         &mut stdin,
         &mut stdout,
@@ -561,4 +503,149 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     let mut diagnostics = String::new();
     stderr.read_to_string(&mut diagnostics).await.unwrap();
     assert!(diagnostics.is_empty(), "unexpected stderr: {diagnostics}");
+}
+
+#[tokio::test]
+async fn raw_json_rpc_exposes_and_guards_enabled_file_uploads() {
+    let file_root = std::env::temp_dir().join(format!(
+        "lurkline-mcp-raw-upload-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&file_root).unwrap();
+    let file_root = std::fs::canonicalize(file_root).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lurkline"))
+        .args(["mcp", "--allow-write", "--file-root"])
+        .arg(&file_root)
+        .env("SLACK_BASE_URL", "https://example.slack.com")
+        .env("SLACK_TEAM_ID", "T000TEST")
+        .env("SLACK_TOKEN", "xoxc-mcp-test-secret")
+        .env("SLACK_COOKIE", "d=xoxd-mcp-test-secret; b=test")
+        .env("LURKLINE_TIMEOUT_MS", "500")
+        .env_remove("LURKLINE_MAX_RESPONSE_BYTES")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = child.stderr.take().unwrap();
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "raw-upload-test", "version": "1.0"}
+            }
+        }),
+    )
+    .await;
+    let initialized = response_with_id(&mut stdout, 100).await;
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "lurkline");
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }),
+    )
+    .await;
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 101, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    let tools = response_with_id(&mut stdout, 101).await;
+    let upload = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "slack_upload_file")
+        .expect("enabled upload tool");
+    for property in [
+        "conversation",
+        "path",
+        "thread_ts",
+        "title",
+        "alt_text",
+        "max_bytes",
+        "confirm",
+    ] {
+        assert!(
+            upload["inputSchema"]["properties"][property].is_object(),
+            "missing upload input property {property}"
+        );
+    }
+    assert!(
+        upload["inputSchema"]["properties"]["path"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Relative regular file")
+    );
+    let output_schema = serde_json::to_string(&upload["outputSchema"]).unwrap();
+    assert!(output_schema.contains("allocation_uncertain"));
+    assert!(output_schema.contains("transfer_uncertain"));
+    assert!(output_schema.contains("completion_uncertain"));
+    assert!(output_schema.contains("shared"));
+    assert_eq!(upload["annotations"]["readOnlyHint"], false);
+    assert_eq!(upload["annotations"]["destructiveHint"], false);
+    assert_eq!(upload["annotations"]["idempotentHint"], false);
+    assert_eq!(upload["annotations"]["openWorldHint"], true);
+
+    let unconfirmed = call_tool(
+        &mut stdin,
+        &mut stdout,
+        102,
+        "slack_upload_file",
+        json!({
+            "conversation": "C123",
+            "path": "missing.txt",
+            "confirm": false
+        }),
+    )
+    .await;
+    assert_eq!(unconfirmed["result"]["isError"], true);
+    assert_eq!(
+        unconfirmed["result"]["structuredContent"]["error"]["code"],
+        "confirmation_required"
+    );
+
+    let unsafe_path = call_tool(
+        &mut stdin,
+        &mut stdout,
+        103,
+        "slack_upload_file",
+        json!({
+            "conversation": "C123",
+            "path": "../outside.txt",
+            "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(unsafe_path["result"]["isError"], true);
+    assert_eq!(
+        unsafe_path["result"]["structuredContent"]["error"]["code"],
+        "local_file"
+    );
+
+    drop(stdin);
+    let status = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("MCP server did not stop on EOF")
+        .unwrap();
+    assert!(status.success());
+    let mut diagnostics = String::new();
+    stderr.read_to_string(&mut diagnostics).await.unwrap();
+    assert!(diagnostics.is_empty(), "unexpected stderr: {diagnostics}");
+    std::fs::remove_dir(&file_root).unwrap();
 }

@@ -107,6 +107,8 @@ pub(crate) struct RawFile {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
+    pub alt_txt: Option<String>,
+    #[serde(default)]
     pub mimetype: Option<String>,
     #[serde(default)]
     pub filetype: Option<String>,
@@ -139,6 +141,12 @@ pub(crate) struct RawFile {
     #[serde(default)]
     pub permalink: Option<String>,
     #[serde(default)]
+    pub channels: Option<Vec<String>>,
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
+    #[serde(default)]
+    pub ims: Option<Vec<String>>,
+    #[serde(default)]
     pub shares: Option<RawFileShares>,
     #[serde(default)]
     pub has_more_shares: Option<bool>,
@@ -165,6 +173,33 @@ pub(crate) struct RawFileShare {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawFileResponse {
     pub file: RawFile,
+}
+
+#[derive(Clone, Deserialize)]
+pub(crate) struct RawFileUploadAllocation {
+    #[serde(default, deserialize_with = "deserialize_optional_string_lossy")]
+    pub upload_url: Option<String>,
+    #[serde(
+        default,
+        rename = "file",
+        deserialize_with = "deserialize_optional_string_lossy"
+    )]
+    pub file_id: Option<String>,
+}
+
+fn deserialize_optional_string_lossy<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
+}
+
+#[derive(Clone, Deserialize)]
+pub(crate) struct RawFileUploadCompletion {
+    pub files: Vec<RawFile>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -628,6 +663,8 @@ pub struct FileReference {
     pub id: String,
     pub name: Option<String>,
     pub title: Option<String>,
+    /// Slack-provided alternative text. `None` means Slack omitted the field.
+    pub alt_text: Option<String>,
     pub mimetype: Option<String>,
     pub filetype: Option<String>,
     pub pretty_type: Option<String>,
@@ -644,6 +681,12 @@ pub struct FileReference {
     pub private_url: Option<String>,
     pub download_url: Option<String>,
     pub permalink: Option<String>,
+    /// Public-channel IDs. `None` means Slack omitted the field.
+    pub channel_ids: Option<Vec<String>>,
+    /// Private-channel IDs. `None` means Slack omitted the field.
+    pub group_ids: Option<Vec<String>>,
+    /// Direct-message IDs. `None` means Slack omitted the field.
+    pub im_ids: Option<Vec<String>>,
     /// `None` means Slack omitted share metadata; `Some([])` is explicitly empty.
     pub shares: Option<Vec<FileShare>>,
     /// Whether `shares` is present and Slack did not report omitted entries.
@@ -658,6 +701,8 @@ pub enum FileShareVisibility {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// A normalized share proof. Direct-message upload verification may synthesize
+/// this record from exact file membership and message-route state.
 pub struct FileShare {
     pub visibility: FileShareVisibility,
     pub channel_id: String,
@@ -703,6 +748,27 @@ pub struct FileDownloadReport {
     pub bytes_written: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durability_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum FileUploadReport {
+    /// Slack may have allocated an upload, but returned no safe recovery key.
+    AllocationUncertain,
+    /// Slack allocated a file ID, but no file bytes were sent.
+    Allocated { file_id: String },
+    /// Slack allocated a file ID, but the local source changed before completion.
+    SourceChanged { file_id: String },
+    /// Slack allocated a file ID, but byte acceptance cannot be proven.
+    TransferUncertain { file_id: String },
+    /// Slack received the bytes, but target sharing cannot be proven.
+    CompletionUncertain { file_id: String },
+    /// Exact Slack file membership and message-route state prove the requested target.
+    Shared {
+        file: Box<FileReference>,
+        share: FileShare,
+        reconciled: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

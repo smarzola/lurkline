@@ -13,20 +13,23 @@ use crate::{
     curl_import::{MAX_CURL_BYTES, parse_copy_as_curl},
     error::{Error, Result},
     http::SlackHttpClient,
-    local_file::{prepare_cli_download, validate_cli_download_path},
+    local_file::{
+        prepare_cli_download, prepare_cli_upload, validate_cli_download_path,
+        validate_cli_upload_path,
+    },
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     mcp,
     model::{
         Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
         ConversationSearchTruncationReason, CustomEmojiKind, CustomEmojiList, DoctorReport, Draft,
         DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport, FileReference,
-        InboxReport, Message, MessagePage, MessageSearchPage, ReactionMutationReport,
-        RenderedMessage, SentMessage, ThreadPage, UnreadReport, UserSearchReport,
-        UserSearchTruncationReason,
+        FileUploadReport, InboxReport, Message, MessagePage, MessageSearchPage,
+        ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage, UnreadReport,
+        UserSearchReport, UserSearchTruncationReason,
     },
     service::{
-        DEFAULT_FILE_DOWNLOAD_BYTES, MAX_CONVERSATIONS, MAX_FILE_DOWNLOAD_BYTES, MAX_USERS,
-        SlackService,
+        DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES, MAX_CONVERSATIONS,
+        MAX_FILE_DOWNLOAD_BYTES, MAX_FILE_UPLOAD_BYTES, MAX_USERS, SlackService,
     },
 };
 
@@ -156,6 +159,32 @@ pub enum FilesCommand {
         /// Maximum bytes to write, up to 1 GiB.
         #[arg(long, default_value_t = DEFAULT_FILE_DOWNLOAD_BYTES, value_parser = clap::value_parser!(u64).range(1..=MAX_FILE_DOWNLOAD_BYTES))]
         max_bytes: u64,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Upload one regular file to a root message or thread reply.
+    Upload {
+        /// Slack conversation ID or exact name.
+        conversation: String,
+        /// Local regular file with a UTF-8 basename of at most 255 bytes.
+        #[arg(long)]
+        path: std::path::PathBuf,
+        /// Existing thread root timestamp. Omit to share at the conversation root.
+        #[arg(long)]
+        thread_ts: Option<String>,
+        /// Optional Slack title: 1 to 255 UTF-8 bytes without control characters.
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional image alt text: 1 to 1,000 UTF-8 bytes without control characters.
+        #[arg(long)]
+        alt_text: Option<String>,
+        /// Maximum source bytes to read, up to 1 GiB.
+        #[arg(long, default_value_t = DEFAULT_FILE_UPLOAD_BYTES, value_parser = clap::value_parser!(u64).range(1..=MAX_FILE_UPLOAD_BYTES))]
+        max_bytes: u64,
+        /// Confirm the Slack mutation.
+        #[arg(long)]
+        confirm: bool,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -730,6 +759,47 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                 json,
             )
         }
+        Command::Files {
+            command:
+                FilesCommand::Upload {
+                    conversation,
+                    path,
+                    thread_ts,
+                    title,
+                    alt_text,
+                    max_bytes,
+                    confirm,
+                    json,
+                },
+        } => {
+            if !confirm {
+                return Err(Error::ConfirmationRequired {
+                    action: "file upload",
+                });
+            }
+            let file_name = validate_cli_upload_path(&path)?;
+            SlackService::validate_upload_request(
+                &conversation,
+                thread_ts.as_deref(),
+                title.as_deref(),
+                alt_text.as_deref(),
+                &file_name,
+            )?;
+            let source = prepare_cli_upload(&path, max_bytes)?;
+            print_file_upload(
+                service
+                    .upload_file(
+                        &conversation,
+                        thread_ts.as_deref(),
+                        title.as_deref(),
+                        alt_text.as_deref(),
+                        source,
+                        confirm,
+                    )
+                    .await?,
+                json,
+            )
+        }
         Command::Emoji {
             command: EmojiCommand::List { json },
         } => print_custom_emoji(service.list_custom_emoji().await?, json),
@@ -814,6 +884,45 @@ fn format_file_download(report: &FileDownloadReport) -> String {
         report.bytes_written,
         escape_human(&report.output_path)
     )
+}
+
+fn print_file_upload(report: FileUploadReport, json: bool) -> Result<()> {
+    if json {
+        print_json(&report)
+    } else {
+        println!("{}", format_file_upload(&report));
+        Ok(())
+    }
+}
+
+fn format_file_upload(report: &FileUploadReport) -> String {
+    match report {
+        FileUploadReport::AllocationUncertain => "allocation_uncertain".into(),
+        FileUploadReport::Allocated { file_id } => {
+            format!("allocated\t{}", escape_human(file_id))
+        }
+        FileUploadReport::SourceChanged { file_id } => {
+            format!("source_changed\t{}", escape_human(file_id))
+        }
+        FileUploadReport::TransferUncertain { file_id } => {
+            format!("transfer_uncertain\t{}", escape_human(file_id))
+        }
+        FileUploadReport::CompletionUncertain { file_id } => {
+            format!("completion_uncertain\t{}", escape_human(file_id))
+        }
+        FileUploadReport::Shared {
+            file,
+            share,
+            reconciled,
+        } => format!(
+            "shared\t{}\t{}\t{}\t{}\treconciled={}",
+            escape_human(&file.id),
+            escape_human(&share.channel_id),
+            escape_human(&share.ts),
+            escape_human(share.thread_ts.as_deref().unwrap_or("-")),
+            reconciled
+        ),
+    }
 }
 
 fn print_custom_emoji(list: CustomEmojiList, json: bool) -> Result<()> {
@@ -1640,6 +1749,37 @@ mod tests {
                 command: DraftsCommand::Send { confirm: true, .. }
             }
         ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "files",
+                "upload",
+                "@smarzola",
+                "--path",
+                "synthetic.txt",
+                "--thread-ts",
+                "100.000001",
+                "--title",
+                "Synthetic",
+                "--alt-text",
+                "Synthetic test file",
+                "--max-bytes",
+                "1024",
+                "--confirm",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Files {
+                command: FilesCommand::Upload {
+                    max_bytes: 1024,
+                    confirm: true,
+                    json: true,
+                    thread_ts: Some(_),
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
@@ -1729,6 +1869,7 @@ mod tests {
             id: "F123".into(),
             name: Some("report\tfinal.pdf".into()),
             title: Some("Report".into()),
+            alt_text: None,
             mimetype: Some("application/pdf".into()),
             filetype: Some("pdf".into()),
             pretty_type: Some("PDF".into()),
@@ -1745,6 +1886,9 @@ mod tests {
             private_url: Some("https://files.slack.com/private".into()),
             download_url: Some("https://files.slack.com/file\nname".into()),
             permalink: Some("https://workspace.slack.com/files/F123".into()),
+            channel_ids: None,
+            group_ids: None,
+            im_ids: None,
             shares: Some(vec![]),
             shares_complete: true,
         }
@@ -1767,6 +1911,27 @@ mod tests {
         assert_eq!(
             format_file_download(&download),
             "downloaded\tF123\t42\tdownloads/report\\nfinal.pdf"
+        );
+
+        let upload = FileUploadReport::Shared {
+            file: Box::new(file.clone()),
+            share: crate::model::FileShare {
+                visibility: crate::model::FileShareVisibility::Private,
+                channel_id: "D123".into(),
+                ts: "100.000001".into(),
+                thread_ts: Some("90.000001".into()),
+            },
+            reconciled: true,
+        };
+        assert_eq!(
+            format_file_upload(&upload),
+            "shared\tF123\tD123\t100.000001\t90.000001\treconciled=true"
+        );
+        assert_eq!(
+            format_file_upload(&FileUploadReport::TransferUncertain {
+                file_id: "F123".into()
+            }),
+            "transfer_uncertain\tF123"
         );
 
         let emoji = CustomEmojiList {
@@ -1810,8 +1975,28 @@ mod tests {
         let file = serde_json::to_value(synthetic_file()).unwrap();
         assert_eq!(file["id"], "F123");
         assert_eq!(file["size"], 42);
+        assert_eq!(file["channel_ids"], serde_json::Value::Null);
+        assert_eq!(file["group_ids"], serde_json::Value::Null);
+        assert_eq!(file["im_ids"], serde_json::Value::Null);
         assert_eq!(file["shares"], serde_json::json!([]));
         assert_eq!(file["shares_complete"], true);
+
+        assert_eq!(
+            serde_json::to_value(FileUploadReport::Allocated {
+                file_id: "F123".into()
+            })
+            .unwrap(),
+            serde_json::json!({
+                "stage": "allocated",
+                "file_id": "F123"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(FileUploadReport::AllocationUncertain).unwrap(),
+            serde_json::json!({
+                "stage": "allocation_uncertain"
+            })
+        );
 
         let reaction = serde_json::to_value(ReactionMutationReport {
             channel_id: "C123".into(),
