@@ -401,11 +401,19 @@ impl McpServer {
         allow_write: bool,
         file_root: Option<McpFileRoot>,
     ) -> Self {
+        let has_file_root = file_root.is_some();
+        let mut tool_router = Self::tool_router();
+        if !has_file_root {
+            tool_router.remove_route("slack_download_file");
+        }
+        if !allow_write || !has_file_root {
+            tool_router.remove_route("slack_upload_file");
+        }
         Self {
             service,
             allow_write,
             file_root: file_root.map(Arc::new),
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -1206,7 +1214,6 @@ mod tests {
                 "slack_doctor",
                 "slack_create_draft",
                 "slack_delete_draft",
-                "slack_download_file",
                 "slack_find_conversations",
                 "slack_find_users",
                 "slack_get_draft",
@@ -1225,7 +1232,6 @@ mod tests {
                 "slack_send_draft",
                 "slack_send_message",
                 "slack_update_draft",
-                "slack_upload_file",
             ])
         );
         assert!(tools.tools.iter().all(|tool| tool.output_schema.is_some()));
@@ -1308,59 +1314,6 @@ mod tests {
                 "error": {
                     "code": "write_not_allowed",
                     "message": "Slack writes are disabled; start the MCP server with --allow-write"
-                }
-            }))
-        );
-
-        let upload_disabled = client
-            .peer()
-            .call_tool(
-                CallToolRequestParams::new("slack_upload_file").with_arguments(
-                    json!({
-                        "conversation": "C123",
-                        "path": "missing",
-                        "confirm": true
-                    })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-                ),
-            )
-            .await
-            .expect("upload write gate returns a tool result");
-        assert_eq!(upload_disabled.is_error, Some(true));
-        assert_eq!(
-            upload_disabled.structured_content,
-            Some(json!({
-                "error": {
-                    "code": "write_not_allowed",
-                    "message": "Slack writes are disabled; start the MCP server with --allow-write"
-                }
-            }))
-        );
-
-        let file_root_disabled = client
-            .peer()
-            .call_tool(
-                CallToolRequestParams::new("slack_download_file").with_arguments(
-                    json!({
-                        "file_id": "F123",
-                        "path": "output"
-                    })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-                ),
-            )
-            .await
-            .expect("file root gate returns a tool result");
-        assert_eq!(file_root_disabled.is_error, Some(true));
-        assert_eq!(
-            file_root_disabled.structured_content,
-            Some(json!({
-                "error": {
-                    "code": "file_root_required",
-                    "message": "local file tools are disabled; start the MCP server with --file-root ABSOLUTE_PATH"
                 }
             }))
         );
@@ -1471,6 +1424,35 @@ mod tests {
 
         client.cancel().await.expect("client closes");
         server_task.await.expect("server task");
+    }
+
+    #[test]
+    fn file_tools_are_advertised_only_with_their_required_capabilities() {
+        let config = Config::for_test(Url::parse("http://127.0.0.1:1234").unwrap(), 1024);
+        for (allow_write, has_file_root, download_visible, upload_visible) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, true, false),
+            (true, true, true, true),
+        ] {
+            let root = has_file_root.then(|| {
+                McpFileRoot::open(
+                    &std::fs::canonicalize(std::env::temp_dir())
+                        .expect("temporary directory is available"),
+                )
+                .expect("temporary directory is a valid file root")
+            });
+            let server =
+                McpServer::with_file_root(SlackService::new(FakeApi, &config), allow_write, root);
+            assert_eq!(
+                server.tool_router.has_route("slack_download_file"),
+                download_visible
+            );
+            assert_eq!(
+                server.tool_router.has_route("slack_upload_file"),
+                upload_visible
+            );
+        }
     }
 
     #[tokio::test]

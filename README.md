@@ -486,6 +486,8 @@ character, contain no control characters, and be at most 255 bytes. Optional
 values can contain 1 to 1,000 UTF-8 bytes and use the same non-whitespace and
 non-control rules. Lurkline validates the conversation, thread timestamp,
 basename, title, and alt text before it opens or hashes the source.
+For a thread upload, it also reads the exact timestamp and requires an existing
+root message before Slack allocates upload storage.
 
 The Slack lifecycle has three mutations—allocation, transfer, and
 completion—followed by exact verification:
@@ -669,7 +671,7 @@ The following MCP client configuration keeps writes disabled:
 }
 ```
 
-To expose write tools, explicitly add `--allow-write`:
+To enable write tools, explicitly add `--allow-write`:
 
 ```json
 {
@@ -701,12 +703,13 @@ To expose local file transfers, configure one absolute file root:
 }
 ```
 
-MCP download and upload paths must be relative to that root. Lurkline opens the
-root once at server startup and rejects path escapes, replacements, and
-symbolic links. Downloads don't require `--allow-write` because they don't
-mutate Slack.
+MCP lists the download tool only when a file root is configured. Download and
+upload paths must be relative to that root. Lurkline opens the root once at
+server startup and rejects path escapes, replacements, and symbolic links.
+Downloads don't require `--allow-write` because they don't mutate Slack.
 
-To enable uploads, configure both the file root and the write gate:
+Lurkline lists the upload tool only when both capabilities are configured. To
+enable uploads, configure the file root and the write gate:
 
 ```json
 {

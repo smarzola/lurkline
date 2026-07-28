@@ -124,7 +124,6 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_doctor",
             "slack_create_draft",
             "slack_delete_draft",
-            "slack_download_file",
             "slack_find_conversations",
             "slack_find_users",
             "slack_get_draft",
@@ -143,7 +142,6 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_send_draft",
             "slack_send_message",
             "slack_update_draft",
-            "slack_upload_file",
         ])
     );
     for tool_name in [
@@ -323,66 +321,6 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "{name}"
         );
     }
-
-    let download_disabled = call_tool(
-        &mut stdin,
-        &mut stdout,
-        27,
-        "slack_download_file",
-        json!({
-            "file_id": "F123",
-            "path": "synthetic.txt",
-            "max_bytes": 1024
-        }),
-    )
-    .await;
-    assert_eq!(download_disabled["result"]["isError"], true);
-    assert_eq!(
-        download_disabled["result"]["structuredContent"]["error"]["code"],
-        "file_root_required"
-    );
-
-    let invalid_download_path = call_tool(
-        &mut stdin,
-        &mut stdout,
-        30,
-        "slack_download_file",
-        json!({
-            "file_id": "F123",
-            "path": "../synthetic.txt",
-            "max_bytes": 1024
-        }),
-    )
-    .await;
-    assert_eq!(invalid_download_path["result"]["isError"], true);
-    assert_eq!(
-        invalid_download_path["result"]["structuredContent"]["error"]["code"],
-        "local_file"
-    );
-
-    let oversized_download_path = call_tool(
-        &mut stdin,
-        &mut stdout,
-        31,
-        "slack_download_file",
-        json!({
-            "file_id": "F123",
-            "path": "x".repeat(4097),
-            "max_bytes": 1024
-        }),
-    )
-    .await;
-    assert_eq!(oversized_download_path["result"]["isError"], true);
-    assert_eq!(
-        oversized_download_path["result"]["structuredContent"]["error"]["code"],
-        "local_file"
-    );
-    assert!(
-        oversized_download_path["result"]["structuredContent"]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("4096-byte limit")
-    );
 
     let invalid_file = call_tool(
         &mut stdin,

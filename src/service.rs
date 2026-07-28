@@ -355,6 +355,15 @@ impl SlackService {
             source.file_name(),
         )?;
         let channel_id = self.resolve_conversation_id(conversation).await?;
+        if let Some(thread_ts) = thread_ts {
+            let root = self.get_message_by_id(&channel_id, thread_ts).await?;
+            if !is_exact_file_route(&root.ts, root.thread_ts.as_deref(), None) {
+                return Err(Error::invalid_input(
+                    "thread_ts",
+                    "must identify a root message in the target conversation",
+                ));
+            }
+        }
         if source.size() > MAX_FILE_UPLOAD_BYTES {
             return Err(Error::invalid_input(
                 "max_bytes",
@@ -1303,9 +1312,13 @@ impl SlackService {
     pub(crate) async fn get_message(&self, channel: &str, message_ts: &str) -> Result<Message> {
         validate_timestamp("message_ts", message_ts)?;
         let channel = self.resolve_conversation_id(channel).await?;
-        let raw = self.api.messages_list(&channel, message_ts).await?;
+        self.get_message_by_id(&channel, message_ts).await
+    }
+
+    async fn get_message_by_id(&self, channel: &str, message_ts: &str) -> Result<Message> {
+        let raw = self.api.messages_list(channel, message_ts).await?;
         let mut candidates = raw.messages.into_values().collect::<Vec<_>>();
-        if let Some(channel_messages) = raw.messages_data.get(&channel) {
+        if let Some(channel_messages) = raw.messages_data.get(channel) {
             candidates.extend(channel_messages.messages.iter().cloned());
         }
         if candidates
@@ -1324,9 +1337,9 @@ impl SlackService {
                 resource: "Slack message",
             });
         };
-        let first = normalize_message(&channel, first, "messages.list")?;
+        let first = normalize_message(channel, first, "messages.list")?;
         for duplicate in matches {
-            if normalize_message(&channel, duplicate, "messages.list")? != first {
+            if normalize_message(channel, duplicate, "messages.list")? != first {
                 return Err(Error::InvalidResponse {
                     method: "messages.list",
                 });
@@ -2885,6 +2898,7 @@ mod tests {
         replies: RawMessagePage,
         reply_pages: Mutex<VecDeque<RawMessagePage>>,
         message_list: RawMessagesList,
+        message_list_calls: Arc<Mutex<Vec<(String, String)>>>,
         search: RawMessageSearchResponse,
         search_calls: Arc<Mutex<Vec<SearchCall>>>,
         history_calls: Arc<Mutex<Vec<HistoryCall>>>,
@@ -3033,11 +3047,11 @@ mod tests {
                 .unwrap_or_else(|| self.replies.clone()))
         }
 
-        async fn messages_list(
-            &self,
-            _channel: &str,
-            _message_ts: &str,
-        ) -> Result<RawMessagesList> {
+        async fn messages_list(&self, channel: &str, message_ts: &str) -> Result<RawMessagesList> {
+            self.message_list_calls
+                .lock()
+                .unwrap()
+                .push((channel.into(), message_ts.into()));
             Ok(self.message_list.clone())
         }
 
@@ -3468,6 +3482,7 @@ mod tests {
             replies: RawMessagePage::default(),
             reply_pages: Mutex::new(VecDeque::new()),
             message_list: RawMessagesList::default(),
+            message_list_calls: Arc::new(Mutex::new(Vec::new())),
             search: RawMessageSearchResponse {
                 messages: RawMessageSearchMatches {
                     matches: vec![],
@@ -3600,6 +3615,18 @@ mod tests {
             }],
             ..RawMessage::default()
         }
+    }
+
+    fn allow_upload_thread(api: &mut FakeApi) {
+        api.message_list.messages.insert(
+            "upload-thread-root".into(),
+            RawMessage {
+                ts: "100.000001".into(),
+                user: Some("U123".into()),
+                text: "synthetic upload thread root".into(),
+                ..RawMessage::default()
+            },
+        );
     }
 
     fn entry(id: &str, has_unreads: bool, mentions: u64) -> RawUnread {
@@ -5939,7 +5966,11 @@ mod tests {
             api.file_response = RawFileResponse {
                 file: uploaded_file(thread_ts),
             };
+            if thread_ts.is_some() {
+                allow_upload_thread(&mut api);
+            }
             let calls = api.upload_calls.clone();
+            let message_list_calls = api.message_list_calls.clone();
             let report = service(api)
                 .upload_file(
                     "C123",
@@ -5968,6 +5999,15 @@ mod tests {
                 calls.lock().unwrap().as_slice(),
                 ["allocate", "transfer", "complete"]
             );
+            let message_list_calls = message_list_calls.lock().unwrap();
+            if thread_ts.is_some() {
+                assert_eq!(
+                    message_list_calls.as_slice(),
+                    [("C123".into(), "100.000001".into())]
+                );
+            } else {
+                assert!(message_list_calls.is_empty());
+            }
         }
     }
 
@@ -5981,6 +6021,7 @@ mod tests {
             };
             let message = upload_message("200.000001", thread_ts);
             if thread_ts.is_some() {
+                allow_upload_thread(&mut api);
                 api.replies.messages = vec![message];
             } else {
                 api.history.messages = vec![message];
@@ -6047,6 +6088,7 @@ mod tests {
         api.file_response = RawFileResponse {
             file: dm_uploaded_file(Some(vec!["D123".into()])),
         };
+        allow_upload_thread(&mut api);
         api.replies.messages = vec![upload_message("100.000001", Some("100.000001"))];
         assert_eq!(
             service(api)
@@ -6122,12 +6164,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_rejects_unresolved_thread_targets_before_allocation() {
+        let cases = [
+            RawMessagesList::default(),
+            RawMessagesList {
+                messages: BTreeMap::from([(
+                    "reply".into(),
+                    RawMessage {
+                        ts: "100.000001".into(),
+                        thread_ts: Some("99.000001".into()),
+                        ..RawMessage::default()
+                    },
+                )]),
+                ..RawMessagesList::default()
+            },
+            RawMessagesList {
+                messages: BTreeMap::from([(
+                    "malformed".into(),
+                    RawMessage {
+                        ts: "malformed".into(),
+                        ..RawMessage::default()
+                    },
+                )]),
+                ..RawMessagesList::default()
+            },
+        ];
+
+        for (index, message_list) in cases.into_iter().enumerate() {
+            let fixture = UploadFixture::new(b"synthetic");
+            let mut api = fake_api();
+            api.message_list = message_list;
+            let upload_calls = api.upload_calls.clone();
+            let message_list_calls = api.message_list_calls.clone();
+            let result = service(api)
+                .upload_file(
+                    "C123",
+                    Some("100.000001"),
+                    None,
+                    None,
+                    fixture.source(),
+                    true,
+                )
+                .await;
+            match index {
+                0 => assert!(matches!(result, Err(Error::NotFound { .. }))),
+                1 => assert!(matches!(
+                    result,
+                    Err(Error::InvalidInput {
+                        field: "thread_ts",
+                        ..
+                    })
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(Error::InvalidResponse {
+                        method: "messages.list"
+                    })
+                )),
+            }
+            assert!(upload_calls.lock().unwrap().is_empty());
+            assert_eq!(
+                message_list_calls.lock().unwrap().as_slice(),
+                [("C123".into(), "100.000001".into())]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn upload_dm_thread_verification_is_bounded_and_cursor_safe() {
         let fixture = UploadFixture::new(b"synthetic");
         let mut api = fake_api();
         api.file_response = RawFileResponse {
             file: dm_uploaded_file(Some(vec!["D123".into()])),
         };
+        allow_upload_thread(&mut api);
         api.reply_pages.get_mut().unwrap().extend([
             RawMessagePage {
                 messages: vec![],
@@ -6179,6 +6289,7 @@ mod tests {
         api.file_response = RawFileResponse {
             file: dm_uploaded_file(Some(vec!["D123".into()])),
         };
+        allow_upload_thread(&mut api);
         api.replies = RawMessagePage {
             messages: vec![upload_message("200.000001", Some("100.000001"))],
             has_more: true,
