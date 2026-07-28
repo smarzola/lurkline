@@ -19,6 +19,8 @@ pub enum Error {
     MissingProfile,
     #[error("credential profile {profile} was not found")]
     ProfileNotFound { profile: String },
+    #[error("credentials for profile {profile} are missing; re-import the profile")]
+    MissingProfileCredential { profile: String },
     #[error(
         "credential profile {profile} belongs to another workspace; pass --replace-workspace to replace it"
     )]
@@ -32,13 +34,15 @@ pub enum Error {
     #[error("credential profile registry could not be locked")]
     ProfileRegistryLock,
     #[error(
-        "the operating system credential store is unavailable; configure all four SLACK_* environment variables instead"
+        "credential storage operation failed; re-import the profile or use all four SLACK_* environment variables"
     )]
-    CredentialStoreUnavailable,
+    CredentialStorage,
+    #[error("unsafe {resource}; it must be owned by the current user with owner-only permissions")]
+    UnsafeCredentialStorage { resource: &'static str },
     #[error(
-        "the operating system credential store operation failed; unlock or configure it, or use all four SLACK_* environment variables"
+        "stored credentials for profile {profile} exceed the size limit; re-import the profile"
     )]
-    CredentialStore,
+    CredentialTooLarge { profile: String },
     #[error("stored credentials for profile {profile} are invalid; re-import the profile")]
     InvalidStoredCredential { profile: String },
     #[error(

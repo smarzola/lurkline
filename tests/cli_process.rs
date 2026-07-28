@@ -53,7 +53,7 @@ fn stdout(args: &[&str]) -> String {
 }
 
 #[test]
-fn version_and_help_expose_the_complete_v041_cli_without_configuration() {
+fn version_and_help_expose_the_complete_v050_cli_without_configuration() {
     assert_eq!(
         stdout(&["--version"]).trim(),
         format!("lurkline {}", env!("CARGO_PKG_VERSION"))
