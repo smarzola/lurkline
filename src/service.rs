@@ -1552,17 +1552,29 @@ impl SlackService {
             let Ok(file) = normalize_file(raw.file, "files.info") else {
                 continue;
             };
-            let matching_shares = file
-                .shares
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .filter(|share| {
-                    share.channel_id == request.channel
-                        && share.thread_ts.as_deref() == request.thread_ts
-                })
-                .collect::<Vec<_>>();
-            let [share] = matching_shares.as_slice() else {
+            let share = if request.channel.starts_with('D') {
+                match exact_file_share(&file, request.channel, request.thread_ts) {
+                    Some(share) => Some(share),
+                    None if file.shares_complete
+                        && file.shares.as_ref().is_some_and(Vec::is_empty)
+                        && file
+                            .im_ids
+                            .as_ref()
+                            .is_some_and(|ids| ids.len() == 1 && ids[0] == request.channel) =>
+                    {
+                        self.find_direct_message_file_share(
+                            request.channel,
+                            request.thread_ts,
+                            request.file_id,
+                        )
+                        .await
+                    }
+                    None => None,
+                }
+            } else {
+                exact_file_share(&file, request.channel, request.thread_ts)
+            };
+            let Some(share) = share else {
                 continue;
             };
             if !is_valid_timestamp(&share.ts) {
@@ -2714,7 +2726,11 @@ fn is_exact_published_file(
                     || (shares.len() == 1
                         && shares[0].channel_id == channel_id
                         && shares[0].ts == message_ts
-                        && shares[0].thread_ts.as_deref() == thread_ts)
+                        && is_exact_file_route(
+                            &shares[0].ts,
+                            shares[0].thread_ts.as_deref(),
+                            thread_ts,
+                        ))
             });
     }
     let has_exact_membership = (channel_ids.is_some_and(|ids| ids == [channel_id])
@@ -2726,7 +2742,7 @@ fn is_exact_published_file(
             shares.len() == 1
                 && shares[0].channel_id == channel_id
                 && shares[0].ts == message_ts
-                && shares[0].thread_ts.as_deref() == thread_ts
+                && is_exact_file_route(&shares[0].ts, shares[0].thread_ts.as_deref(), thread_ts)
         })
 }
 
@@ -4784,6 +4800,53 @@ mod tests {
         }
     }
 
+    fn published_dm_file_without_share(file_id: &str) -> RawFile {
+        RawFile {
+            id: file_id.into(),
+            name: Some("source.txt".into()),
+            alt_txt: Some("Synthetic test file".into()),
+            size: Some(9),
+            is_external: Some(false),
+            is_public: Some(false),
+            public_url_shared: Some(false),
+            channels: Some(vec![]),
+            groups: Some(vec![]),
+            ims: Some(vec!["D123".into()]),
+            shares: Some(crate::model::RawFileShares::default()),
+            ..RawFile::default()
+        }
+    }
+
+    fn published_channel_file(
+        file_id: &str,
+        message_ts: &str,
+        actual_thread_ts: Option<&str>,
+    ) -> RawFile {
+        RawFile {
+            id: file_id.into(),
+            name: Some("source.txt".into()),
+            alt_txt: Some("Synthetic test file".into()),
+            size: Some(9),
+            is_external: Some(false),
+            is_public: Some(false),
+            public_url_shared: Some(false),
+            channels: Some(vec!["C123".into()]),
+            groups: Some(vec![]),
+            ims: Some(vec![]),
+            shares: Some(crate::model::RawFileShares {
+                private: BTreeMap::from([(
+                    "C123".into(),
+                    vec![crate::model::RawFileShare {
+                        ts: message_ts.into(),
+                        thread_ts: actual_thread_ts.map(str::to_owned),
+                    }],
+                )]),
+                ..crate::model::RawFileShares::default()
+            }),
+            ..RawFile::default()
+        }
+    }
+
     fn active_drafts(drafts: Vec<RawDraft>) -> RawDraftsPage {
         RawDraftsPage {
             drafts,
@@ -6125,13 +6188,76 @@ mod tests {
                 file: private_draft_file("FPRIVATE"),
             }),
             Ok(RawFileResponse {
-                file: published_dm_file("FPRIVATE", "7000.000001"),
+                file: published_dm_file_without_share("FPRIVATE"),
+            }),
+        ]));
+        let published = RawMessage {
+            ts: "7000.000001".into(),
+            text: "publish".into(),
+            blocks,
+            files: vec![RawFile {
+                id: "FPRIVATE".into(),
+                ..RawFile::default()
+            }],
+            ..RawMessage::default()
+        };
+        api.history.messages = vec![published.clone()];
+        api.message_list
+            .messages
+            .insert("published".into(), published);
+        api.file_share_error = Some("internal_error".into());
+        let file_share_calls = api.file_share_calls.clone();
+        let post_calls = api.post_calls.clone();
+        let draft_calls = api.draft_calls.clone();
+        let history_calls = api.history_calls.clone();
+
+        let report = service(api).send_draft("DR-file", true).await.unwrap();
+        assert!(report.draft_deleted);
+        assert!(report.cleanup_warning.is_none());
+        assert_eq!(file_share_calls.lock().unwrap().len(), 1);
+        assert!(post_calls.lock().unwrap().is_empty());
+        assert_eq!(history_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            draft_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn file_draft_publication_accepts_a_self_threaded_channel_root() {
+        let draft = raw_file_draft("DR-file", "1021", "C123", "publish", "FPRIVATE");
+        let blocks = draft.blocks.clone();
+        let mut api = fake_api();
+        api.draft_infos = Mutex::new(VecDeque::from([
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+            RawDraftResponse {
+                draft: draft.clone(),
+            },
+        ]));
+        api.draft_pages = Mutex::new(VecDeque::from([
+            active_drafts(vec![draft]),
+            active_drafts(vec![]),
+        ]));
+        api.file_info_results = Mutex::new(VecDeque::from([
+            Ok(RawFileResponse {
+                file: private_draft_file("FPRIVATE"),
+            }),
+            Ok(RawFileResponse {
+                file: published_channel_file("FPRIVATE", "7001.000001", Some("7001.000001")),
             }),
         ]));
         api.message_list.messages.insert(
             "published".into(),
             RawMessage {
-                ts: "7000.000001".into(),
+                ts: "7001.000001".into(),
+                thread_ts: Some("7001.000001".into()),
                 text: "publish".into(),
                 blocks,
                 files: vec![RawFile {
@@ -6141,16 +6267,17 @@ mod tests {
                 ..RawMessage::default()
             },
         );
-        api.file_share_error = Some("internal_error".into());
         let file_share_calls = api.file_share_calls.clone();
-        let post_calls = api.post_calls.clone();
         let draft_calls = api.draft_calls.clone();
 
         let report = service(api).send_draft("DR-file", true).await.unwrap();
         assert!(report.draft_deleted);
         assert!(report.cleanup_warning.is_none());
+        assert_eq!(
+            report.sent.message.thread_ts.as_deref(),
+            Some("7001.000001")
+        );
         assert_eq!(file_share_calls.lock().unwrap().len(), 1);
-        assert!(post_calls.lock().unwrap().is_empty());
         assert_eq!(
             draft_calls
                 .lock()
