@@ -1885,6 +1885,9 @@ mod tests {
             private_url: Some("https://files.slack.com/private".into()),
             download_url: Some("https://files.slack.com/file\nname".into()),
             permalink: Some("https://workspace.slack.com/files/F123".into()),
+            channel_ids: None,
+            group_ids: None,
+            im_ids: None,
             shares: Some(vec![]),
             shares_complete: true,
         }
@@ -1971,6 +1974,9 @@ mod tests {
         let file = serde_json::to_value(synthetic_file()).unwrap();
         assert_eq!(file["id"], "F123");
         assert_eq!(file["size"], 42);
+        assert_eq!(file["channel_ids"], serde_json::Value::Null);
+        assert_eq!(file["group_ids"], serde_json::Value::Null);
+        assert_eq!(file["im_ids"], serde_json::Value::Null);
         assert_eq!(file["shares"], serde_json::json!([]));
         assert_eq!(file["shares_complete"], true);
 

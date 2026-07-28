@@ -50,7 +50,9 @@ const MAX_FILE_UPLOAD_ALT_TEXT_BYTES: usize = 1_000;
 const MAX_DRAFT_DESTINATION_USERS: usize = 100;
 const MAX_ATTACHMENTS_PER_MESSAGE: usize = 100;
 const MAX_FILES_PER_MESSAGE: usize = 100;
+const MAX_FILE_CONVERSATIONS: usize = 1_000;
 const MAX_FILE_SHARES: usize = 1_000;
+const MAX_FILE_SHARE_SCAN_PAGES: usize = 10;
 const MAX_REACTIONS_PER_MESSAGE: usize = 100;
 const MAX_REACTION_USERS: usize = 1_000;
 const MAX_CUSTOM_EMOJI: usize = 10_000;
@@ -411,19 +413,20 @@ impl SlackService {
             },
             _ => return Ok(FileUploadReport::CompletionUncertain { file_id }),
         };
-        let share = file
-            .shares
-            .as_ref()
-            .and_then(|shares| {
-                shares.iter().find(|share| {
-                    share.channel_id == channel_id
-                        && match thread_ts {
-                            Some(thread_ts) => share.thread_ts.as_deref() == Some(thread_ts),
-                            None => share.thread_ts.is_none(),
-                        }
-                })
-            })
-            .cloned();
+        let share = if channel_id.starts_with('D') {
+            if !file
+                .im_ids
+                .as_ref()
+                .is_some_and(|im_ids| im_ids.iter().any(|im_id| im_id == &channel_id))
+            {
+                None
+            } else {
+                self.find_direct_message_file_share(&channel_id, thread_ts, &file_id)
+                    .await
+            }
+        } else {
+            exact_file_share(&file, &channel_id, thread_ts)
+        };
         match share {
             Some(share) => Ok(FileUploadReport::Shared {
                 file: Box::new(file),
@@ -432,6 +435,82 @@ impl SlackService {
             }),
             None => Ok(FileUploadReport::CompletionUncertain { file_id }),
         }
+    }
+
+    async fn find_direct_message_file_share(
+        &self,
+        channel_id: &str,
+        thread_ts: Option<&str>,
+        file_id: &str,
+    ) -> Option<FileShare> {
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut match_ts = None;
+
+        for _ in 0..MAX_FILE_SHARE_SCAN_PAGES {
+            let raw = match thread_ts {
+                Some(thread_ts) => {
+                    self.api
+                        .conversation_replies(
+                            channel_id,
+                            thread_ts,
+                            cursor.as_deref(),
+                            MAX_MESSAGES,
+                        )
+                        .await
+                }
+                None => {
+                    self.api
+                        .conversation_history(channel_id, cursor.as_deref(), MAX_MESSAGES)
+                        .await
+                }
+            }
+            .ok()?;
+            if raw.messages.len() > MAX_MESSAGES {
+                return None;
+            }
+            let method = if thread_ts.is_some() {
+                "conversations.replies"
+            } else {
+                "conversations.history"
+            };
+            let messages =
+                normalize_messages(channel_id, raw.messages, MAX_MESSAGES, method).ok()?;
+            for message in messages {
+                let exact_route =
+                    is_exact_file_route(&message.ts, message.thread_ts.as_deref(), thread_ts);
+                let occurrences = message
+                    .files
+                    .iter()
+                    .filter(|file| file.id == file_id)
+                    .count();
+                if occurrences > 1 || (occurrences == 1 && !exact_route) {
+                    return None;
+                }
+                if occurrences == 1 && match_ts.replace(message.ts).is_some() {
+                    return None;
+                }
+            }
+
+            let next_cursor = response_cursor(method, raw.response_metadata.next_cursor).ok()?;
+            let has_more = raw.has_more || next_cursor.is_some();
+            if !has_more {
+                return match_ts.map(|ts| FileShare {
+                    visibility: FileShareVisibility::Private,
+                    channel_id: channel_id.to_owned(),
+                    ts,
+                    thread_ts: thread_ts.map(str::to_owned),
+                });
+            }
+            let next_cursor = next_cursor?;
+            if cursor.as_deref() == Some(next_cursor.as_str())
+                || !seen_cursors.insert(next_cursor.clone())
+            {
+                return None;
+            }
+            cursor = Some(next_cursor);
+        }
+        None
     }
 
     pub(crate) fn validate_upload_request(
@@ -2143,6 +2222,9 @@ fn normalize_file(raw: RawFile, method: &'static str) -> Result<FileReference> {
         }
     }
 
+    let channel_ids = normalize_file_conversation_ids(raw.channels, b"C", method)?;
+    let group_ids = normalize_file_conversation_ids(raw.groups, b"CG", method)?;
+    let im_ids = normalize_file_conversation_ids(raw.ims, b"D", method)?;
     let shares = if let Some(raw_shares) = raw.shares {
         let share_channels = raw_shares
             .public
@@ -2203,9 +2285,64 @@ fn normalize_file(raw: RawFile, method: &'static str) -> Result<FileReference> {
         private_url: raw.url_private,
         download_url: raw.url_private_download,
         permalink: raw.permalink,
+        channel_ids,
+        group_ids,
+        im_ids,
         shares,
         shares_complete,
     })
+}
+
+fn normalize_file_conversation_ids(
+    ids: Option<Vec<String>>,
+    prefixes: &[u8],
+    method: &'static str,
+) -> Result<Option<Vec<String>>> {
+    let Some(ids) = ids else {
+        return Ok(None);
+    };
+    if ids.len() > MAX_FILE_CONVERSATIONS {
+        return Err(Error::InvalidResponse { method });
+    }
+    let mut seen = HashSet::with_capacity(ids.len());
+    for id in &ids {
+        if !id
+            .as_bytes()
+            .first()
+            .is_some_and(|prefix| prefixes.contains(prefix))
+            || !is_valid_any_conversation_id(id)
+            || !seen.insert(id.clone())
+        {
+            return Err(Error::InvalidResponse { method });
+        }
+    }
+    Ok(Some(ids))
+}
+
+fn exact_file_share(
+    file: &FileReference,
+    channel_id: &str,
+    thread_ts: Option<&str>,
+) -> Option<FileShare> {
+    let mut matches = file.shares.as_ref()?.iter().filter(|share| {
+        share.channel_id == channel_id
+            && is_exact_file_route(&share.ts, share.thread_ts.as_deref(), thread_ts)
+    });
+    let first = matches.next()?.clone();
+    matches.next().is_none().then_some(first)
+}
+
+fn is_exact_file_route(
+    message_ts: &str,
+    actual_thread_ts: Option<&str>,
+    requested_thread_ts: Option<&str>,
+) -> bool {
+    match requested_thread_ts {
+        Some(requested_thread_ts) => {
+            actual_thread_ts == Some(requested_thread_ts) && message_ts != requested_thread_ts
+        }
+        None => actual_thread_ts.is_none() || actual_thread_ts == Some(message_ts),
+    }
 }
 
 fn append_file_shares(
@@ -2744,7 +2881,9 @@ mod tests {
     struct FakeApi {
         counts: ClientCountsPayload,
         history: RawMessagePage,
+        history_pages: Mutex<VecDeque<RawMessagePage>>,
         replies: RawMessagePage,
+        reply_pages: Mutex<VecDeque<RawMessagePage>>,
         message_list: RawMessagesList,
         search: RawMessageSearchResponse,
         search_calls: Arc<Mutex<Vec<SearchCall>>>,
@@ -2865,7 +3004,12 @@ mod tests {
                 cursor: cursor.map(str::to_owned),
                 limit,
             });
-            Ok(self.history.clone())
+            Ok(self
+                .history_pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.history.clone()))
         }
 
         async fn conversation_replies(
@@ -2881,7 +3025,12 @@ mod tests {
                 cursor: cursor.map(str::to_owned),
                 limit,
             });
-            Ok(self.replies.clone())
+            Ok(self
+                .reply_pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.replies.clone()))
         }
 
         async fn messages_list(
@@ -3315,7 +3464,9 @@ mod tests {
         FakeApi {
             counts: empty_counts(),
             history: RawMessagePage::default(),
+            history_pages: Mutex::new(VecDeque::new()),
             replies: RawMessagePage::default(),
+            reply_pages: Mutex::new(VecDeque::new()),
             message_list: RawMessagesList::default(),
             search: RawMessageSearchResponse {
                 messages: RawMessageSearchMatches {
@@ -3423,6 +3574,31 @@ mod tests {
                 ..crate::model::RawFileShares::default()
             }),
             ..RawFile::default()
+        }
+    }
+
+    fn dm_uploaded_file(im_ids: Option<Vec<String>>) -> RawFile {
+        RawFile {
+            id: "FUPLOAD".into(),
+            name: Some("source.txt".into()),
+            size: Some(9),
+            ims: im_ids,
+            shares: Some(crate::model::RawFileShares::default()),
+            ..RawFile::default()
+        }
+    }
+
+    fn upload_message(ts: &str, thread_ts: Option<&str>) -> RawMessage {
+        RawMessage {
+            ts: ts.into(),
+            thread_ts: thread_ts.map(str::to_owned),
+            user: Some("U123".into()),
+            text: "synthetic file upload".into(),
+            files: vec![RawFile {
+                id: "FUPLOAD".into(),
+                ..RawFile::default()
+            }],
+            ..RawMessage::default()
         }
     }
 
@@ -5602,10 +5778,16 @@ mod tests {
         .unwrap();
         assert_eq!(omitted.shares, None);
         assert!(!omitted.shares_complete);
+        assert_eq!(omitted.channel_ids, None);
+        assert_eq!(omitted.group_ids, None);
+        assert_eq!(omitted.im_ids, None);
 
         let complete = normalize_file(
             RawFile {
                 id: "F123".into(),
+                channels: Some(vec![]),
+                groups: Some(vec!["G123".into()]),
+                ims: Some(vec!["D123".into()]),
                 shares: Some(crate::model::RawFileShares::default()),
                 ..RawFile::default()
             },
@@ -5614,6 +5796,34 @@ mod tests {
         .unwrap();
         assert_eq!(complete.shares, Some(vec![]));
         assert!(complete.shares_complete);
+        assert_eq!(complete.channel_ids, Some(vec![]));
+        assert_eq!(complete.group_ids, Some(vec!["G123".into()]));
+        assert_eq!(complete.im_ids, Some(vec!["D123".into()]));
+
+        for raw in [
+            RawFile {
+                id: "F123".into(),
+                channels: Some(vec!["D123".into()]),
+                ..RawFile::default()
+            },
+            RawFile {
+                id: "F123".into(),
+                groups: Some(vec!["G123".into(), "G123".into()]),
+                ..RawFile::default()
+            },
+            RawFile {
+                id: "F123".into(),
+                ims: Some(vec!["D123".into(); MAX_FILE_CONVERSATIONS + 1]),
+                ..RawFile::default()
+            },
+        ] {
+            assert!(matches!(
+                normalize_file(raw, "files.info"),
+                Err(Error::InvalidResponse {
+                    method: "files.info"
+                })
+            ));
+        }
 
         for (has_more_shares, skipped_shares) in [(Some(true), None), (None, Some(true))] {
             let truncated = normalize_file(
@@ -5673,6 +5883,9 @@ mod tests {
             private_url: None,
             download_url: Some("https://files.slack.com/download".into()),
             permalink: None,
+            channel_ids: None,
+            group_ids: None,
+            im_ids: None,
             shares: Some(vec![]),
             shares_complete: true,
         };
@@ -5756,6 +5969,239 @@ mod tests {
                 ["allocate", "transfer", "complete"]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn upload_verifies_dm_root_and_thread_with_membership_and_exact_messages() {
+        for thread_ts in [None, Some("100.000001")] {
+            let fixture = UploadFixture::new(b"synthetic");
+            let mut api = fake_api();
+            api.file_response = RawFileResponse {
+                file: dm_uploaded_file(Some(vec!["D123".into()])),
+            };
+            let message = upload_message("200.000001", thread_ts);
+            if thread_ts.is_some() {
+                api.replies.messages = vec![message];
+            } else {
+                api.history.messages = vec![message];
+            }
+            let history_calls = api.history_calls.clone();
+            let reply_calls = api.reply_calls.clone();
+            let report = service(api)
+                .upload_file(
+                    "D123",
+                    thread_ts,
+                    Some("Synthetic"),
+                    Some("Synthetic test file"),
+                    fixture.source(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let FileUploadReport::Shared {
+                file,
+                share,
+                reconciled,
+            } = report
+            else {
+                panic!("exact DM membership and message state must prove success");
+            };
+            assert_eq!(file.im_ids, Some(vec!["D123".into()]));
+            assert_eq!(share.visibility, FileShareVisibility::Private);
+            assert_eq!(share.channel_id, "D123");
+            assert_eq!(share.ts, "200.000001");
+            assert_eq!(share.thread_ts.as_deref(), thread_ts);
+            assert!(!reconciled);
+            assert_eq!(
+                history_calls.lock().unwrap().len(),
+                usize::from(thread_ts.is_none())
+            );
+            assert_eq!(
+                reply_calls.lock().unwrap().len(),
+                usize::from(thread_ts.is_some())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_classifies_dm_thread_parents_as_roots_not_replies() {
+        let fixture = UploadFixture::new(b"synthetic");
+        let mut api = fake_api();
+        api.file_response = RawFileResponse {
+            file: dm_uploaded_file(Some(vec!["D123".into()])),
+        };
+        api.history.messages = vec![upload_message("200.000001", Some("200.000001"))];
+        let report = service(api)
+            .upload_file("D123", None, None, None, fixture.source(), true)
+            .await
+            .unwrap();
+        let FileUploadReport::Shared { share, .. } = report else {
+            panic!("a self-threaded parent must prove a root upload");
+        };
+        assert_eq!(share.ts, "200.000001");
+        assert_eq!(share.thread_ts, None);
+
+        let fixture = UploadFixture::new(b"synthetic");
+        let mut api = fake_api();
+        api.file_response = RawFileResponse {
+            file: dm_uploaded_file(Some(vec!["D123".into()])),
+        };
+        api.replies.messages = vec![upload_message("100.000001", Some("100.000001"))];
+        assert_eq!(
+            service(api)
+                .upload_file(
+                    "D123",
+                    Some("100.000001"),
+                    None,
+                    None,
+                    fixture.source(),
+                    true
+                )
+                .await
+                .unwrap(),
+            FileUploadReport::CompletionUncertain {
+                file_id: "FUPLOAD".into()
+            }
+        );
+    }
+
+    #[test]
+    fn file_route_proof_distinguishes_root_parents_from_replies() {
+        assert!(is_exact_file_route("200.000001", None, None));
+        assert!(is_exact_file_route("200.000001", Some("200.000001"), None));
+        assert!(!is_exact_file_route(
+            "100.000001",
+            Some("100.000001"),
+            Some("100.000001")
+        ));
+        assert!(is_exact_file_route(
+            "200.000001",
+            Some("100.000001"),
+            Some("100.000001")
+        ));
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_unproven_or_ambiguous_dm_shares() {
+        for (im_ids, messages) in [
+            (None, vec![upload_message("200.000001", None)]),
+            (
+                Some(vec!["DOTHER".into()]),
+                vec![upload_message("200.000001", None)],
+            ),
+            (Some(vec!["D123".into()]), vec![]),
+            (
+                Some(vec!["D123".into()]),
+                vec![
+                    upload_message("200.000001", None),
+                    upload_message("201.000001", None),
+                ],
+            ),
+            (
+                Some(vec!["D123".into()]),
+                vec![upload_message("200.000001", Some("100.000001"))],
+            ),
+        ] {
+            let fixture = UploadFixture::new(b"synthetic");
+            let mut api = fake_api();
+            api.file_response = RawFileResponse {
+                file: dm_uploaded_file(im_ids),
+            };
+            api.history.messages = messages;
+            assert_eq!(
+                service(api)
+                    .upload_file("D123", None, None, None, fixture.source(), true)
+                    .await
+                    .unwrap(),
+                FileUploadReport::CompletionUncertain {
+                    file_id: "FUPLOAD".into()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_dm_thread_verification_is_bounded_and_cursor_safe() {
+        let fixture = UploadFixture::new(b"synthetic");
+        let mut api = fake_api();
+        api.file_response = RawFileResponse {
+            file: dm_uploaded_file(Some(vec!["D123".into()])),
+        };
+        api.reply_pages.get_mut().unwrap().extend([
+            RawMessagePage {
+                messages: vec![],
+                has_more: true,
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "page-2".into(),
+                },
+            },
+            RawMessagePage {
+                messages: vec![upload_message("200.000001", Some("100.000001"))],
+                ..RawMessagePage::default()
+            },
+        ]);
+        let reply_calls = api.reply_calls.clone();
+        assert!(matches!(
+            service(api)
+                .upload_file(
+                    "D123",
+                    Some("100.000001"),
+                    None,
+                    None,
+                    fixture.source(),
+                    true
+                )
+                .await
+                .unwrap(),
+            FileUploadReport::Shared { .. }
+        ));
+        assert_eq!(
+            reply_calls.lock().unwrap().as_slice(),
+            [
+                ReplyCall {
+                    channel: "D123".into(),
+                    thread_ts: "100.000001".into(),
+                    cursor: None,
+                    limit: MAX_MESSAGES,
+                },
+                ReplyCall {
+                    channel: "D123".into(),
+                    thread_ts: "100.000001".into(),
+                    cursor: Some("page-2".into()),
+                    limit: MAX_MESSAGES,
+                },
+            ]
+        );
+
+        let fixture = UploadFixture::new(b"synthetic");
+        let mut api = fake_api();
+        api.file_response = RawFileResponse {
+            file: dm_uploaded_file(Some(vec!["D123".into()])),
+        };
+        api.replies = RawMessagePage {
+            messages: vec![upload_message("200.000001", Some("100.000001"))],
+            has_more: true,
+            response_metadata: RawResponseMetadata {
+                next_cursor: "loop".into(),
+            },
+        };
+        assert_eq!(
+            service(api)
+                .upload_file(
+                    "D123",
+                    Some("100.000001"),
+                    None,
+                    None,
+                    fixture.source(),
+                    true
+                )
+                .await
+                .unwrap(),
+            FileUploadReport::CompletionUncertain {
+                file_id: "FUPLOAD".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -6344,6 +6790,9 @@ mod tests {
                     "private_url": null,
                     "download_url": "https://files.slack.com/note.txt",
                     "permalink": null,
+                    "channel_ids": null,
+                    "group_ids": null,
+                    "im_ids": null,
                     "shares": null,
                     "shares_complete": false
                 }]

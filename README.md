@@ -389,7 +389,9 @@ file metadata remains `null`; sparse Slack Connect placeholders expose
 names, sizes, timestamps, or uploader IDs. File `shares` is `null` when Slack
 omits it and `[]` only when Slack returns an explicit empty object. Treat
 shares as exhaustive only when `shares_complete` is `true`; Slack's
-`has_more_shares` and `skipped_shares` indicators make it `false`.
+`has_more_shares` and `skipped_shares` indicators make it `false`. The
+`channel_ids`, `group_ids`, and `im_ids` fields also preserve omission as
+`null` and an explicit empty Slack array as `[]`.
 
 Add `--json` to a data-returning command for structured JSON.
 
@@ -485,13 +487,23 @@ values can contain 1 to 1,000 UTF-8 bytes and use the same non-whitespace and
 non-control rules. Lurkline validates the conversation, thread timestamp,
 basename, title, and alt text before it opens or hashes the source.
 
-The three-stage Slack lifecycle—allocation, transfer, and completion—uses four
-network calls because Lurkline adds an exact verification read:
+The Slack lifecycle has three mutations—allocation, transfer, and
+completion—followed by exact verification:
 
 1. Allocate a non-secret Slack file ID and a signed upload URL.
 2. Stream the exact bytes to the URL with a separate credential-free client.
 3. Complete the upload for the requested root or thread.
-4. Read `files.info` to prove the requested share.
+4. Read `files.info` to prove membership in the requested conversation.
+5. For a direct message, read bounded conversation history or thread replies
+   to prove that the unique file ID has the requested root or thread route.
+
+For a channel, the exact `files.info` share entry proves both the conversation
+and root or thread timestamp. For a direct message, Slack reports membership
+through `im_ids` without a message timestamp. Lurkline therefore requires both
+the exact DM ID in `im_ids` and one exact file-ID match in the requested
+history or thread. It scans at most 10 pages of 200 messages. Missing,
+ambiguous, malformed, or still-truncated evidence returns
+`completion_uncertain`.
 
 Lurkline never prints or returns the signed URL. The byte request contains no
 browser token, cookie, workspace origin, or referrer and doesn't follow
@@ -506,7 +518,7 @@ Use the returned `stage` to decide what to do next:
 | `source_changed` | The source changed after allocation. Lurkline didn't complete the upload. | Stabilize the source, then start a new upload deliberately. |
 | `transfer_uncertain` | Slack byte acceptance can't be proven. | Don't upload again automatically. Inspect Slack before deciding. |
 | `completion_uncertain` | The bytes were sent, but the requested share can't be proven. | Inspect the file ID and destination before deciding whether to retry. |
-| `shared` | `files.info` proves the exact root or thread share. | No recovery is required. |
+| `shared` | Slack state proves the exact conversation and root or thread route. | No recovery is required. |
 
 Uploads support one local file and one root or thread destination. Lurkline
 doesn't support batch uploads, snippets, remote files, public-link creation,

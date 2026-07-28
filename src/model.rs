@@ -139,6 +139,12 @@ pub(crate) struct RawFile {
     #[serde(default)]
     pub permalink: Option<String>,
     #[serde(default)]
+    pub channels: Option<Vec<String>>,
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
+    #[serde(default)]
+    pub ims: Option<Vec<String>>,
+    #[serde(default)]
     pub shares: Option<RawFileShares>,
     #[serde(default)]
     pub has_more_shares: Option<bool>,
@@ -655,6 +661,12 @@ pub struct FileReference {
     pub private_url: Option<String>,
     pub download_url: Option<String>,
     pub permalink: Option<String>,
+    /// Public-channel IDs. `None` means Slack omitted the field.
+    pub channel_ids: Option<Vec<String>>,
+    /// Private-channel IDs. `None` means Slack omitted the field.
+    pub group_ids: Option<Vec<String>>,
+    /// Direct-message IDs. `None` means Slack omitted the field.
+    pub im_ids: Option<Vec<String>>,
     /// `None` means Slack omitted share metadata; `Some([])` is explicitly empty.
     pub shares: Option<Vec<FileShare>>,
     /// Whether `shares` is present and Slack did not report omitted entries.
@@ -669,6 +681,8 @@ pub enum FileShareVisibility {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// A normalized share proof. Direct-message upload verification may synthesize
+/// this record from exact file membership and message-route state.
 pub struct FileShare {
     pub visibility: FileShareVisibility,
     pub channel_id: String,
@@ -729,7 +743,7 @@ pub enum FileUploadReport {
     TransferUncertain { file_id: String },
     /// Slack received the bytes, but target sharing cannot be proven.
     CompletionUncertain { file_id: String },
-    /// Exact `files.info` state proves the file is shared to the requested target.
+    /// Exact Slack file membership and message-route state prove the requested target.
     Shared {
         file: Box<FileReference>,
         share: FileShare,
