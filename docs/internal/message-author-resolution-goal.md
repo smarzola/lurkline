@@ -263,6 +263,21 @@ Inspect every failure and fix in-scope regressions rather than weakening tests.
 Document an unrelated pre-existing failure only with command output and
 evidence that this branch did not cause it.
 
+Status: Complete (2026-07-29). A fresh final audit found that an interrupted
+later `users.list` page discarded identities from earlier validated pages.
+The repair retains only fully validated pages, resolves their known users,
+marks only remaining misses `unavailable`, and preserves strict named-routing
+errors. The same auditor cleared the repair.
+
+Post-repair verification passed `cargo fmt --all -- --check`,
+`cargo clippy --locked --all-targets -- -D warnings`,
+`cargo test --locked --all-targets` (226 library, 12 CLI process, 2 raw MCP,
+and 1 package metadata tests), `cargo build --release --locked`,
+`rustup run 1.88.0 cargo check --locked --all-targets`,
+`target/release/lurkline --version` (`lurkline 0.8.2`),
+`python3 scripts/check-no-secrets.py`, `git diff --check`, and a deterministic
+macOS ARM64 package checksum and archive-layout check.
+
 ## Resume Protocol
 
 On resume, first read this prompt, `AGENTS.md`, `git status`, milestone status

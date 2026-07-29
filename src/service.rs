@@ -402,7 +402,15 @@ struct ResolvedNamedConversation {
 
 enum AuthorDirectory {
     Loaded(UserDirectory),
-    Unavailable,
+    Interrupted(UserDirectory),
+}
+
+enum UserDirectoryScan {
+    Finished(UserDirectory),
+    Interrupted {
+        directory: UserDirectory,
+        error: Error,
+    },
 }
 
 impl SlackService {
@@ -2483,51 +2491,68 @@ impl SlackService {
         if let Some(user_directory) = user_directory {
             return AuthorDirectory::Loaded(user_directory);
         }
-        match self.load_user_directory().await {
-            Ok(user_directory) => AuthorDirectory::Loaded(user_directory),
-            Err(_) => AuthorDirectory::Unavailable,
+        match self.scan_user_directory().await {
+            UserDirectoryScan::Finished(user_directory) => AuthorDirectory::Loaded(user_directory),
+            UserDirectoryScan::Interrupted { directory, .. } => {
+                AuthorDirectory::Interrupted(directory)
+            }
         }
     }
 
     async fn load_user_directory(&self) -> Result<UserDirectory> {
+        match self.scan_user_directory().await {
+            UserDirectoryScan::Finished(directory) => Ok(directory),
+            UserDirectoryScan::Interrupted { error, .. } => Err(error),
+        }
+    }
+
+    async fn scan_user_directory(&self) -> UserDirectoryScan {
         let mut users = HashMap::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
 
         for page_index in 0..MAX_USER_PAGES {
-            let page = self
+            let page = match self
                 .api
                 .users_list(cursor.as_deref(), USERS_PAGE_SIZE)
-                .await?;
-            if page.members.len() > USERS_PAGE_SIZE {
-                return Err(Error::InvalidResponse {
-                    method: "users.list",
-                });
-            }
-            for raw_user in page.members {
-                if !is_valid_user_id(&raw_user.id) {
-                    return Err(Error::InvalidResponse {
-                        method: "users.list",
-                    });
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    return UserDirectoryScan::Interrupted {
+                        directory: UserDirectory {
+                            users,
+                            complete: false,
+                        },
+                        error,
+                    };
                 }
-                let user = normalize_user(raw_user);
+            };
+            let (page_users, next) = match normalize_user_directory_page(page, &seen_cursors) {
+                Ok(page) => page,
+                Err(error) => {
+                    return UserDirectoryScan::Interrupted {
+                        directory: UserDirectory {
+                            users,
+                            complete: false,
+                        },
+                        error,
+                    };
+                }
+            };
+            for user in page_users {
                 users.insert(user.id.clone(), user);
             }
-            let next = response_cursor("users.list", page.response_metadata.next_cursor)?;
             let Some(next) = next else {
-                return Ok(UserDirectory {
+                return UserDirectoryScan::Finished(UserDirectory {
                     users,
                     complete: true,
                 });
             };
-            if !seen_cursors.insert(next.clone()) {
-                return Err(Error::InvalidResponse {
-                    method: "users.list",
-                });
-            }
+            seen_cursors.insert(next.clone());
             cursor = Some(next);
             if page_index + 1 == MAX_USER_PAGES {
-                return Ok(UserDirectory {
+                return UserDirectoryScan::Finished(UserDirectory {
                     users,
                     complete: false,
                 });
@@ -3490,9 +3515,16 @@ fn enrich_author(
         *author_resolution = AuthorResolution::Unknown;
         return;
     };
-    let AuthorDirectory::Loaded(directory) = directory else {
-        *author_resolution = AuthorResolution::Unavailable;
-        return;
+    let (directory, missing_resolution) = match directory {
+        AuthorDirectory::Loaded(directory) => (
+            directory,
+            if directory.complete {
+                AuthorResolution::Unresolved
+            } else {
+                AuthorResolution::Incomplete
+            },
+        ),
+        AuthorDirectory::Interrupted(directory) => (directory, AuthorResolution::Unavailable),
     };
     if let Some(user) = directory.users.get(author_id) {
         *author_name = directory_author_label(&user.name);
@@ -3503,11 +3535,7 @@ fn enrich_author(
             return;
         }
     }
-    *author_resolution = if directory.complete {
-        AuthorResolution::Unresolved
-    } else {
-        AuthorResolution::Incomplete
-    };
+    *author_resolution = missing_resolution;
 }
 
 fn directory_author_label(value: &str) -> Option<String> {
@@ -3686,6 +3714,32 @@ fn validate_upload_input(field: &'static str, value: &str, maximum: usize) -> Re
 
 fn completion_has_exact_file(completion: &RawFileUploadCompletion, file_id: &str) -> bool {
     completion.files.len() == 1 && completion.files[0].id == file_id
+}
+
+fn normalize_user_directory_page(
+    page: RawUsersPage,
+    seen_cursors: &HashSet<String>,
+) -> Result<(Vec<User>, Option<String>)> {
+    if page.members.len() > USERS_PAGE_SIZE
+        || page
+            .members
+            .iter()
+            .any(|raw_user| !is_valid_user_id(&raw_user.id))
+    {
+        return Err(Error::InvalidResponse {
+            method: "users.list",
+        });
+    }
+    let next = response_cursor("users.list", page.response_metadata.next_cursor)?;
+    if next
+        .as_ref()
+        .is_some_and(|next| seen_cursors.contains(next))
+    {
+        return Err(Error::InvalidResponse {
+            method: "users.list",
+        });
+    }
+    Ok((page.members.into_iter().map(normalize_user).collect(), next))
 }
 
 fn normalize_user(raw: RawUser) -> User {
@@ -4044,6 +4098,7 @@ mod tests {
         user_pages: Mutex<VecDeque<RawUsersPage>>,
         user_calls: Arc<Mutex<Vec<UserCall>>>,
         user_list_error: bool,
+        user_list_error_after: Option<usize>,
         drafts_page: RawDraftsPage,
         draft_pages: Mutex<VecDeque<RawDraftsPage>>,
         draft_info: RawDraftResponse,
@@ -4288,11 +4343,18 @@ mod tests {
         }
 
         async fn users_list(&self, cursor: Option<&str>, limit: usize) -> Result<RawUsersPage> {
-            self.user_calls.lock().unwrap().push(UserCall {
+            let mut calls = self.user_calls.lock().unwrap();
+            let call_index = calls.len();
+            calls.push(UserCall {
                 cursor: cursor.map(str::to_owned),
                 limit,
             });
-            if self.user_list_error {
+            drop(calls);
+            if self.user_list_error
+                || self
+                    .user_list_error_after
+                    .is_some_and(|after| call_index >= after)
+            {
                 return Err(Error::Authentication);
             }
             Ok(self
@@ -4808,6 +4870,7 @@ mod tests {
             user_pages: Mutex::new(VecDeque::new()),
             user_calls: Arc::new(Mutex::new(Vec::new())),
             user_list_error: false,
+            user_list_error_after: None,
             drafts_page: RawDraftsPage::default(),
             draft_pages: Mutex::new(VecDeque::new()),
             draft_info: RawDraftResponse::default(),
@@ -9905,6 +9968,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_directory_retains_validated_users_and_marks_only_misses_unavailable() {
+        let mut api = fake_api();
+        let first = raw_message("100.000001", "known before interruption");
+        let mut missing = raw_message("100.000002", "not reached");
+        missing.user = Some("U999".into());
+        api.history.messages = vec![first, missing];
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("U123", "alice", "Alice Example")],
+            response_metadata: RawResponseMetadata {
+                next_cursor: "users-2".into(),
+            },
+        }]));
+        api.user_list_error_after = Some(1);
+        let user_calls = api.user_calls.clone();
+
+        let page = service(api).read_channel("C123", None, 2).await.unwrap();
+
+        assert_eq!(
+            user_calls.lock().unwrap().as_slice(),
+            &[
+                UserCall {
+                    cursor: None,
+                    limit: USERS_PAGE_SIZE,
+                },
+                UserCall {
+                    cursor: Some("users-2".into()),
+                    limit: USERS_PAGE_SIZE,
+                },
+            ]
+        );
+        assert_eq!(page.messages[0].author_name.as_deref(), Some("alice"));
+        assert_eq!(
+            page.messages[0].author_resolution,
+            AuthorResolution::Directory
+        );
+        assert_eq!(page.messages[1].author_name, None);
+        assert_eq!(
+            page.messages[1].author_resolution,
+            AuthorResolution::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_later_directory_page_keeps_only_earlier_validated_users() {
+        let malformed_pages = [
+            RawUsersPage {
+                members: vec![
+                    raw_user("U999", "bob", "Bob Example"),
+                    raw_user("bad-id", "invalid", "Invalid"),
+                ],
+                ..RawUsersPage::default()
+            },
+            RawUsersPage {
+                members: vec![raw_user("U999", "bob", "Bob Example")],
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "users-2".into(),
+                },
+            },
+        ];
+        for malformed_page in malformed_pages {
+            let mut api = fake_api();
+            let first = raw_message("100.000001", "known before malformed page");
+            let mut missing = raw_message("100.000002", "malformed page user");
+            missing.user = Some("U999".into());
+            api.history.messages = vec![first, missing];
+            api.user_pages = Mutex::new(VecDeque::from([
+                RawUsersPage {
+                    members: vec![raw_user("U123", "alice", "Alice Example")],
+                    response_metadata: RawResponseMetadata {
+                        next_cursor: "users-2".into(),
+                    },
+                },
+                malformed_page,
+            ]));
+
+            let page = service(api).read_channel("C123", None, 2).await.unwrap();
+
+            assert_eq!(page.messages[0].author_name.as_deref(), Some("alice"));
+            assert_eq!(
+                page.messages[0].author_resolution,
+                AuthorResolution::Directory
+            );
+            assert_eq!(page.messages[1].author_name, None);
+            assert_eq!(
+                page.messages[1].author_resolution,
+                AuthorResolution::Unavailable
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn incomplete_directory_resolves_scanned_users_and_marks_misses() {
         let mut api = fake_api();
         let first = raw_message("100.000001", "found");
@@ -10067,6 +10221,21 @@ mod tests {
         api.user_list_error = true;
         assert!(matches!(
             service(api).read_channel("general", None, 1).await,
+            Err(Error::Authentication)
+        ));
+
+        let mut later_failure = fake_api();
+        later_failure.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("U123", "alice", "Alice Example")],
+            response_metadata: RawResponseMetadata {
+                next_cursor: "users-2".into(),
+            },
+        }]));
+        later_failure.user_list_error_after = Some(1);
+        assert!(matches!(
+            service(later_failure)
+                .read_channel("general", None, 1)
+                .await,
             Err(Error::Authentication)
         ));
     }
