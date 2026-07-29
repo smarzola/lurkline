@@ -1,6 +1,6 @@
 [package]
 name = "lurkline"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Slack reading and guarded rich-text authoring through an existing browser session"
@@ -29,3 +29,9 @@ zeroize = { version = "1.9", features = ["derive"] }
 [dev-dependencies]
 axum = "0.8"
 rmcp = { version = "2.2", features = ["client"] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
