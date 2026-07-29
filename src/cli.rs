@@ -20,12 +20,13 @@ use crate::{
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     mcp,
     model::{
-        Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
-        ConversationSearchTruncationReason, CustomEmojiKind, CustomEmojiList, DoctorReport, Draft,
-        DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
-        FileDraftCreateReport, FileReference, FileUploadReport, InboxReport, InboxTruncationReason,
-        Message, MessagePage, MessageSearchPage, ReactionMutationReport, RenderedMessage,
-        SentMessage, ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        AuthorResolution, Conversation, ConversationKind, ConversationPage,
+        ConversationSearchReport, ConversationSearchTruncationReason, CustomEmojiKind,
+        CustomEmojiList, DoctorReport, Draft, DraftDeleteReport, DraftPage, DraftSendReport,
+        FileDownloadReport, FileDraftAssociation, FileDraftCreateReport, FileReference,
+        FileUploadReport, InboxReport, InboxTruncationReason, Message, MessagePage,
+        MessageSearchPage, ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage,
+        UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
     service::{
         DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES, FileDraftCreateRequest,
@@ -1534,19 +1535,23 @@ fn print_messages(messages: &[Message]) {
         return;
     }
     for message in messages {
-        let author = escape_human(
-            message
-                .author_id
-                .as_deref()
-                .or(message.author_name.as_deref())
-                .unwrap_or("-"),
-        );
-        let text = escape_human(&message.text);
-        println!(
-            "{}\t{}\t{}\treplies={}",
-            message.ts, author, text, message.reply_count
-        );
+        println!("{}", format_message_line(message));
     }
+}
+
+fn format_message_line(message: &Message) -> String {
+    format!(
+        "{}\t{}\t{}\treplies={}",
+        escape_human(&message.ts),
+        format_author(
+            message.author_id.as_deref(),
+            message.author_name.as_deref(),
+            message.author_display_name.as_deref(),
+            message.author_resolution,
+        ),
+        escape_human(&message.text),
+        message.reply_count
+    )
 }
 
 fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
@@ -1573,19 +1578,46 @@ fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
 }
 
 fn format_search_match(message: &crate::model::MessageSearchMatch) -> String {
-    let author = message
-        .author_id
-        .as_deref()
-        .or(message.author_name.as_deref())
-        .unwrap_or("-");
     format!(
         "{}\t{}\t{}\t{}\t{}",
         escape_human(&message.ts),
         escape_human(&message.channel_id),
         escape_human(&message.channel_name),
-        escape_human(author),
+        format_author(
+            message.author_id.as_deref(),
+            message.author_name.as_deref(),
+            message.author_display_name.as_deref(),
+            message.author_resolution,
+        ),
         escape_human(&message.text)
     )
+}
+
+fn format_author(
+    author_id: Option<&str>,
+    author_name: Option<&str>,
+    author_display_name: Option<&str>,
+    resolution: AuthorResolution,
+) -> String {
+    if let Some(author_name) = author_name {
+        return escape_human(&format!("@{author_name}"));
+    }
+    if let Some(author_display_name) = author_display_name {
+        return escape_human(author_display_name);
+    }
+    let Some(author_id) = author_id else {
+        return "-".to_owned();
+    };
+    let status = match resolution {
+        AuthorResolution::Unresolved => "unresolved",
+        AuthorResolution::Incomplete => "resolution incomplete",
+        AuthorResolution::Unavailable => "resolution unavailable",
+        AuthorResolution::NotAttempted => "resolution not attempted",
+        AuthorResolution::Provided | AuthorResolution::Directory | AuthorResolution::Unknown => {
+            "identity unavailable"
+        }
+    };
+    escape_human(&format!("{author_id} [{status}]"))
 }
 
 fn escape_human(value: &str) -> String {
@@ -2028,6 +2060,70 @@ mod tests {
     }
 
     #[test]
+    fn formats_resolved_display_and_truthful_author_fallbacks() {
+        assert_eq!(
+            format_author(
+                Some("U123"),
+                Some("ali\tce"),
+                Some("Alice Example"),
+                AuthorResolution::Directory,
+            ),
+            "@ali\\tce"
+        );
+        assert_eq!(
+            format_author(
+                Some("U123"),
+                None,
+                Some("Alice\nExample"),
+                AuthorResolution::Directory,
+            ),
+            "Alice\\nExample"
+        );
+        for (resolution, expected) in [
+            (AuthorResolution::Unresolved, "U123 [unresolved]"),
+            (AuthorResolution::Incomplete, "U123 [resolution incomplete]"),
+            (
+                AuthorResolution::Unavailable,
+                "U123 [resolution unavailable]",
+            ),
+            (
+                AuthorResolution::NotAttempted,
+                "U123 [resolution not attempted]",
+            ),
+        ] {
+            assert_eq!(
+                format_author(Some("U123"), None, None, resolution),
+                expected
+            );
+        }
+        assert_eq!(
+            format_author(None, None, None, AuthorResolution::Unknown),
+            "-"
+        );
+
+        let message = Message {
+            channel_id: "C123".into(),
+            ts: "100.000001".into(),
+            thread_ts: None,
+            author_id: Some("U123".into()),
+            author_name: Some("alice".into()),
+            author_display_name: Some("Alice Example".into()),
+            author_resolution: AuthorResolution::Directory,
+            text: "hello\r\x1b".into(),
+            blocks: None,
+            attachments: None,
+            reply_count: 2,
+            latest_reply: None,
+            reactions: vec![],
+            files: vec![],
+        };
+        assert_eq!(
+            format_message_line(&message),
+            "100.000001\t@alice\thello\\r\\u{1b}\treplies=2"
+        );
+    }
+
+    #[test]
     fn search_locations_render_ids_and_names_without_assuming_channel_kind() {
         for (id, name) in [
             ("C123", "general"),
@@ -2052,7 +2148,7 @@ mod tests {
             };
             assert_eq!(
                 format_search_match(&message),
-                format!("100.000001\t{id}\t{name}\tU456\thello\\r\\u{{1b}}")
+                format!("100.000001\t{id}\t{name}\tU456 [unresolved]\thello\\r\\u{{1b}}")
             );
         }
     }

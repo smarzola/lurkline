@@ -133,7 +133,7 @@ The goal is complete only when:
 ## Milestones
 
 - [x] Milestone 1: Deliver bounded typed author resolution.
-- [ ] Milestone 2: Deliver ergonomic CLI/MCP behavior and operator guidance.
+- [x] Milestone 2: Deliver ergonomic CLI/MCP behavior and operator guidance.
 
 ### Checkpoint Protocol
 
@@ -224,7 +224,24 @@ python3 scripts/check-no-secrets.py
 git diff --check
 ```
 
-Status: Not started.
+Status: Complete (2026-07-29). Channel, thread, exact-message, inbox, and
+search rows share one terminal-safe author formatter. It prefers `@username`,
+then a display name, and otherwise appends a truthful resolution label to the
+stable Slack ID. Raw MCP schema coverage checks the additive fields and every
+resolution state across read, inbox, search, and sent-message results. README
+guidance documents the human-to-structured state mapping and bounded lookup
+contract.
+
+Verification passed `cargo fmt --all -- --check`,
+`cargo test --locked cli::tests` (12 passed),
+`cargo test --locked --test cli_process` (12 passed),
+`cargo test --locked --test mcp_raw_stdio` (2 passed),
+`cargo clippy --locked --all-targets -- -D warnings`,
+`python3 scripts/check-no-secrets.py`, and `git diff --check`. The retained
+reviewer found one documentation mismatch between human labels and serialized
+enum values plus an overstated scan count. The repair maps every value
+explicitly and documents the 20-page, up-to-4,000-user bound; re-review reported
+no blocking findings.
 
 ## Final Verification
 
