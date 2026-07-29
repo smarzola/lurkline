@@ -57,9 +57,18 @@ jobs:
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  quality:
+    name: Verify exact release source
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build ${{ matrix.platform }}
-    needs: validate
+    needs:
+      - validate
+      - quality
     strategy:
       fail-fast: false
       matrix:
@@ -124,6 +133,7 @@ jobs:
     name: Publish GitHub Release
     needs:
       - validate
+      - quality
       - build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
