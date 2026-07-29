@@ -166,6 +166,19 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "{tool_name} schema omits the ID/name precedence escape"
         );
     }
+    let inbox_tool = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "slack_read_inbox")
+        .unwrap();
+    let inbox_output_schema = serde_json::to_string(&inbox_tool["outputSchema"]).unwrap();
+    for expected in ["truncation_reason", "conversation_limit", "byte_limit"] {
+        assert!(
+            inbox_output_schema.contains(expected),
+            "inbox output schema omits {expected}"
+        );
+    }
     let search_tool = tools["result"]["tools"]
         .as_array()
         .unwrap()

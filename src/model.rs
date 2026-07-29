@@ -673,12 +673,22 @@ pub struct InboxConversation {
     pub messages: MessagePage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxTruncationReason {
+    ConversationLimit,
+    ByteLimit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct InboxReport {
     pub team_id: String,
     pub conversations: Vec<InboxConversation>,
     pub total_unread_conversations: usize,
     pub has_more_conversations: bool,
+    /// Why unread conversations were omitted; absent when this report is complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<InboxTruncationReason>,
     pub threads: UnreadThreads,
 }
 

@@ -23,9 +23,9 @@ use crate::{
         Conversation, ConversationKind, ConversationPage, ConversationSearchReport,
         ConversationSearchTruncationReason, CustomEmojiKind, CustomEmojiList, DoctorReport, Draft,
         DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
-        FileDraftCreateReport, FileReference, FileUploadReport, InboxReport, Message, MessagePage,
-        MessageSearchPage, ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage,
-        UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        FileDraftCreateReport, FileReference, FileUploadReport, InboxReport, InboxTruncationReason,
+        Message, MessagePage, MessageSearchPage, ReactionMutationReport, RenderedMessage,
+        SentMessage, ThreadPage, UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
     service::{
         DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES, FileDraftCreateRequest,
@@ -1337,11 +1337,11 @@ fn print_inbox(report: InboxReport, json: bool) -> Result<()> {
     if json {
         return print_json(&report);
     }
-    if report.conversations.is_empty() && !report.threads.has_unreads {
+    if inbox_is_clear(&report) {
         println!("Inbox is clear.");
         return Ok(());
     }
-    let shown_conversations = report.conversations.len();
+    let more_conversations = inbox_more_conversations_line(&report);
     for entry in report.conversations {
         println!(
             "{}\t{}\t{}\tmentions={}",
@@ -1359,11 +1359,8 @@ fn print_inbox(report: InboxReport, json: bool) -> Result<()> {
             );
         }
     }
-    if report.has_more_conversations {
-        println!(
-            "more-conversations\tshown={}\ttotal={}",
-            shown_conversations, report.total_unread_conversations
-        );
+    if let Some(line) = more_conversations {
+        println!("{line}");
     }
     if report.threads.has_unreads {
         println!(
@@ -1373,6 +1370,27 @@ fn print_inbox(report: InboxReport, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn inbox_is_clear(report: &InboxReport) -> bool {
+    report.conversations.is_empty() && !report.threads.has_unreads && !report.has_more_conversations
+}
+
+fn inbox_more_conversations_line(report: &InboxReport) -> Option<String> {
+    if !report.has_more_conversations {
+        return None;
+    }
+    let reason = match report.truncation_reason {
+        Some(InboxTruncationReason::ConversationLimit) => "conversation-limit",
+        Some(InboxTruncationReason::ByteLimit) => "byte-limit",
+        None => "unknown",
+    };
+    Some(format!(
+        "more-conversations\tshown={}\ttotal={}\treason={}",
+        report.conversations.len(),
+        report.total_unread_conversations,
+        reason
+    ))
 }
 
 fn print_conversation_page(page: ConversationPage, json: bool) -> Result<()> {
@@ -2228,5 +2246,27 @@ mod tests {
                 "reconciled": false
             })
         );
+    }
+
+    #[test]
+    fn empty_byte_truncated_inbox_is_not_rendered_as_clear() {
+        let report = InboxReport {
+            team_id: "T000TEST".into(),
+            conversations: Vec::new(),
+            total_unread_conversations: 1,
+            has_more_conversations: true,
+            truncation_reason: Some(InboxTruncationReason::ByteLimit),
+            threads: crate::model::UnreadThreads {
+                has_unreads: false,
+                mention_count: 0,
+                unread_count_by_channel: std::collections::BTreeMap::new(),
+            },
+        };
+
+        assert_eq!(
+            inbox_more_conversations_line(&report).as_deref(),
+            Some("more-conversations\tshown=0\ttotal=1\treason=byte-limit")
+        );
+        assert!(!inbox_is_clear(&report));
     }
 }
