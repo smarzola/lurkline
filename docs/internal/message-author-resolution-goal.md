@@ -5,9 +5,10 @@ Work in
 
 Make Lurkline's normal message-navigation output identify known Slack users by
 username while preserving stable author IDs and truthful resolution metadata
-for agents. Apply one bounded, best-effort user-directory lookup per returned
-message collection, never one lookup per message, and preserve message reads
-when auxiliary identity resolution is incomplete or unavailable.
+for agents. Apply at most one bounded user-directory lookup across conversation
+routing and author enrichment for each operation, never one lookup per message,
+and preserve already-addressable message reads when auxiliary identity
+resolution is incomplete or unavailable.
 
 Source of truth:
 [GitHub issue #12](https://github.com/smarzola/lurkline/issues/12) and the
@@ -19,6 +20,8 @@ When this goal is complete:
 
 - Channel, thread, exact-message, and message-search reads resolve known user
   IDs through Lurkline's existing bounded user directory.
+- Name-based conversation routing reuses its already-loaded user directory for
+  author enrichment instead of starting a second scan.
 - Human output renders `@username` when available and labels raw-ID fallbacks
   as unresolved, incomplete, or unavailable instead of presenting opaque IDs
   as if they were names.
@@ -44,6 +47,9 @@ Verified before implementation:
 - `src/service.rs::load_user_directory` already retrieves at most 20 pages of
   200 users, deduplicates cursors, validates user IDs, and reports whether the
   directory is complete.
+- `src/service.rs::resolve_named_conversation` currently loads that directory
+  before resolving any non-ID conversation reference, but discards it before
+  the message result is normalized.
 - `src/model.rs::Message` and `MessageSearchMatch` expose `author_id` and
   nullable `author_name`, but no display name or resolution status.
 - MCP read tools return the same typed service models as the CLI.
@@ -62,10 +68,14 @@ Follow `AGENTS.md`.
 - Preserve existing message text, Block Kit, attachments, thread, reaction,
   file, pagination, and stable-ID behavior.
 - Treat user-directory lookup as auxiliary enrichment: a lookup failure must
-  not make an otherwise valid message read fail.
-- Reuse the existing bounded `users.list` directory scan. Perform no
-  per-message network loop, add no cache or dependency, and skip the scan when
-  every returned author is already named or absent.
+  not make an otherwise valid, already-addressable message read fail. A
+  directory failure needed to resolve a caller-supplied conversation name or
+  DM participant remains a routing failure because no conversation ID is yet
+  available.
+- Reuse a directory already loaded while resolving the conversation reference.
+  Otherwise use the existing bounded `users.list` scan for author enrichment.
+  Perform no per-message network loop, add no cache or dependency, and start no
+  auxiliary scan when every returned author is already named or absent.
 - Accept only bounded non-control usernames and display names in enriched
   output. Keep terminal escaping for all human-readable fields.
 - Use synthetic identities and messages in tests and documentation. Never
@@ -94,21 +104,26 @@ evidence without claiming completion.
 
 The goal is complete only when:
 
-1. Known directory users are resolved once per channel, thread, exact-message,
-   or search operation, with username and display name in typed JSON/MCP output.
+1. Known directory users are resolved with at most one user-directory scan
+   across routing and enrichment for each channel, thread, exact-message, or
+   search operation, with username and display name in typed JSON/MCP output.
 2. Human message and search output prefers escaped `@username`; display-only
    identities remain readable; unresolved IDs explicitly distinguish complete,
    incomplete, and unavailable resolution.
-3. Direct Slack author names require no directory lookup, and an auxiliary
-   lookup failure preserves the primary message result.
+3. Direct Slack author names require no auxiliary directory lookup, and an
+   auxiliary lookup failure preserves the primary message result; directory
+   failures required to resolve a conversation reference remain routing
+   failures.
 4. Directory pagination remains bounded and cursor-safe, partial results can
    still resolve users already scanned, and no operation performs a
    per-message lookup.
 5. Existing message data and pagination behavior remain compatible, MCP output
    schemas expose the additive identity fields, and README behavior is
    task-focused and current.
-6. Synthetic unit, CLI, and raw MCP tests cover resolved, direct, unresolved,
-   partial, unavailable, display-only, and control-character-safe behavior.
+6. Synthetic unit, CLI, and raw MCP tests cover resolved, direct, authorless,
+   unresolved, partial, unavailable, display-only, and
+   control-character-safe behavior, including directory-call counts for named
+   channels, named DMs, and filtered search.
 7. Every milestone has passing verification, a clean retained-reviewer result,
    a checked status note, and a focused Conventional Commit.
 8. Final formatting, strict locked Clippy, all locked tests, release build,
@@ -142,13 +157,18 @@ Acceptance criteria:
 
 - Typed message and search results preserve `author_id` and expose bounded
   username, display name, and explicit resolution state.
-- Channel, thread, exact-message, and search services perform at most one
-  bounded user-directory scan when unresolved author IDs exist.
-- Directly named authors and authorless messages skip the directory.
+- Channel, thread, exact-message, and search services reuse any user directory
+  needed for reference routing and perform at most one bounded directory scan
+  across the whole operation.
+- Directly named authors and authorless messages skip an auxiliary directory
+  scan; Slack-shaped references therefore require no directory at all for
+  those results.
 - Complete misses, scan-limit misses, and lookup failures are distinguishable;
-  lookup failures do not discard otherwise valid messages.
-- Synthetic service tests cover batching, bounds, fallback states, and existing
-  message/pagination behavior.
+  auxiliary lookup failures do not discard otherwise valid messages, while
+  routing failures retain their existing errors.
+- Synthetic service tests cover batching, bounds, fallback states, existing
+  message/pagination behavior, and exact directory-call counts for named
+  channel, named DM, and search-with-conversation paths.
 
 Likely touchpoints: `src/model.rs`, `src/service.rs`, and synthetic unit tests.
 
