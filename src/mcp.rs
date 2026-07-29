@@ -318,7 +318,7 @@ enum ToolOutput<T> {
 struct ToolError {
     code: String,
     message: String,
-    /// Present when a publication may have succeeded and must not be retried automatically.
+    /// Present when a creation or publication may have succeeded and must not be retried automatically.
     #[serde(skip_serializing_if = "Option::is_none")]
     client_msg_id: Option<String>,
 }
@@ -331,7 +331,8 @@ fn tool_result<T: Serialize>(result: crate::error::Result<T>) -> CallToolResult 
         },
         Err(error) => {
             let client_msg_id = match &error {
-                Error::PublicationUncertain { client_msg_id } => Some(client_msg_id.clone()),
+                Error::PublicationUncertain { client_msg_id }
+                | Error::DraftCreationUncertain { client_msg_id } => Some(client_msg_id.clone()),
                 _ => None,
             };
             let output = ToolOutput::<T>::Error {
@@ -389,6 +390,7 @@ fn error_code(error: &Error) -> &'static str {
         Error::Timeout { .. } => "timeout",
         Error::Transport { .. } => "transport",
         Error::PublicationUncertain { .. } => "publication_uncertain",
+        Error::DraftCreationUncertain { .. } => "draft_creation_uncertain",
         Error::DraftMutationUncertain { .. } => "draft_mutation_uncertain",
         Error::ReactionUncertain { .. } => "reaction_uncertain",
         Error::ReactionNotApplied { .. } => "reaction_not_applied",
@@ -1802,20 +1804,36 @@ mod tests {
     }
 
     #[test]
-    fn publication_uncertain_errors_expose_the_client_id_structurally() {
-        let result = tool_result::<SentMessage>(Err(Error::PublicationUncertain {
-            client_msg_id: "00000000-0000-4000-8000-000000000001".into(),
-        }));
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.structured_content,
-            Some(json!({
-                "error": {
-                    "code": "publication_uncertain",
-                    "message": "Slack publication outcome is unknown for client message 00000000-0000-4000-8000-000000000001; do not retry automatically; verify the message in Slack before deciding whether to retry",
-                    "client_msg_id": "00000000-0000-4000-8000-000000000001"
-                }
-            }))
-        );
+    fn uncertain_creation_and_publication_errors_expose_the_client_id_structurally() {
+        let client_msg_id = "00000000-0000-4000-8000-000000000001";
+        for (error, code, message) in [
+            (
+                Error::PublicationUncertain {
+                    client_msg_id: client_msg_id.into(),
+                },
+                "publication_uncertain",
+                "Slack publication outcome is unknown for client message 00000000-0000-4000-8000-000000000001; do not retry automatically; verify the message in Slack before deciding whether to retry",
+            ),
+            (
+                Error::DraftCreationUncertain {
+                    client_msg_id: client_msg_id.into(),
+                },
+                "draft_creation_uncertain",
+                "Slack draft creation outcome is unknown for client message 00000000-0000-4000-8000-000000000001; do not retry automatically; reread active drafts before deciding whether to retry",
+            ),
+        ] {
+            let result = tool_result::<SentMessage>(Err(error));
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result.structured_content,
+                Some(json!({
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "client_msg_id": client_msg_id
+                    }
+                }))
+            );
+        }
     }
 }

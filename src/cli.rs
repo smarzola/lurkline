@@ -1174,8 +1174,20 @@ fn print_draft_delete(report: DraftDeleteReport, json: bool) -> Result<()> {
     if json {
         print_json(&report)
     } else {
-        println!("deleted\t{}", escape_human(&report.id));
+        println!("{}", format_draft_delete(&report));
         Ok(())
+    }
+}
+
+fn format_draft_delete(report: &DraftDeleteReport) -> String {
+    if let Some(file_id) = &report.file_id {
+        format!(
+            "deleted\t{}\tfile-preserved\t{}",
+            escape_human(&report.id),
+            escape_human(file_id)
+        )
+    } else {
+        format!("deleted\t{}", escape_human(&report.id))
     }
 }
 
@@ -2135,6 +2147,22 @@ mod tests {
         assert_eq!(
             format_reaction_mutation(&reaction),
             "present\tC123\t100.000001\teyes\\nwide\ttarget_present=true\tchanged=false\treconciled=true"
+        );
+        assert_eq!(
+            format_draft_delete(&DraftDeleteReport {
+                id: "DR123".into(),
+                deleted: true,
+                file_id: Some("F123".into()),
+                file_deleted: Some(false),
+            }),
+            "deleted\tDR123\tfile-preserved\tF123"
+        );
+        assert_eq!(
+            Error::DraftCreationUncertain {
+                client_msg_id: "00000000-0000-4000-8000-000000000001".into(),
+            }
+            .to_string(),
+            "Slack draft creation outcome is unknown for client message 00000000-0000-4000-8000-000000000001; do not retry automatically; reread active drafts before deciding whether to retry"
         );
     }
 

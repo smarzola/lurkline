@@ -630,11 +630,11 @@ pub struct DraftPage {
 pub struct DraftDeleteReport {
     pub id: String,
     pub deleted: bool,
-    /// File deleted with the draft. Absent for text-only drafts.
+    /// File associated with the deleted draft. Absent for text-only drafts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
-    /// Whether Slack proved the draft-owned file was deleted. Absent for
-    /// text-only drafts.
+    /// Always false for one-file drafts because deletion preserves the file to
+    /// avoid a cross-process ownership race. Absent for text-only drafts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_deleted: Option<bool>,
 }

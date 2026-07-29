@@ -449,7 +449,7 @@ impl SlackService {
             .await
         {
             Ok(allocation) => allocation,
-            Err(error) if upload_allocation_error_is_ambiguous(&error) => {
+            Err(error) if mutation_error_is_ambiguous(&error) => {
                 return Ok(FileUploadReport::AllocationUncertain);
             }
             Err(error) => return Err(error),
@@ -771,6 +771,32 @@ impl SlackService {
         false
     }
 
+    async fn reconcile_text_draft_creation(
+        &self,
+        client_msg_id: &str,
+        destination: &DraftDestination,
+        blocks: &[serde_json::Value],
+    ) -> Option<Draft> {
+        for delay_ms in self.draft_reconciliation_delays_ms {
+            if *delay_ms != 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            let Ok(drafts) = self.complete_active_draft_snapshot().await else {
+                continue;
+            };
+            let mut matches = drafts
+                .into_iter()
+                .filter(|draft| is_exact_text_draft(draft, client_msg_id, destination, blocks));
+            let Some(draft) = matches.next() else {
+                continue;
+            };
+            if matches.next().is_none() {
+                return Some(draft);
+            }
+        }
+        None
+    }
+
     pub(crate) fn validate_upload_request(
         conversation: &str,
         thread_ts: Option<&str>,
@@ -882,7 +908,7 @@ impl SlackService {
                     reconciled: true,
                 });
             }
-            Err(error) if reaction_error_is_ambiguous(&error) => true,
+            Err(error) if mutation_error_is_ambiguous(&error) => true,
             Err(error) => return Err(error),
         };
 
@@ -1031,24 +1057,34 @@ impl SlackService {
             broadcast,
             ..DraftDestination::default()
         };
+        let client_msg_id = Uuid::new_v4().to_string();
         let response = self
             .api
             .drafts_create(
-                &Uuid::new_v4().to_string(),
+                &client_msg_id,
                 std::slice::from_ref(&destination),
                 &rendered.blocks,
                 &[],
             )
-            .await?;
-        let draft = normalize_draft(response.draft, "drafts.create")?;
-        require_supported_draft(&draft)?;
-        if draft.destinations.len() != 1 || !same_draft_route(&draft.destinations[0], &destination)
-        {
-            return Err(Error::InvalidResponse {
-                method: "drafts.create",
-            });
+            .await;
+        match response {
+            Ok(response) => {
+                if let Ok(draft) = normalize_draft(response.draft, "drafts.create")
+                    && is_exact_text_draft(&draft, &client_msg_id, &destination, &rendered.blocks)
+                {
+                    return Ok(draft);
+                }
+            }
+            Err(error) if mutation_error_is_ambiguous(&error) => {}
+            Err(error) => return Err(error),
         }
-        Ok(draft)
+        if let Some(draft) = self
+            .reconcile_text_draft_creation(&client_msg_id, &destination, &rendered.blocks)
+            .await
+        {
+            return Ok(draft);
+        }
+        Err(Error::DraftCreationUncertain { client_msg_id })
     }
 
     pub(crate) async fn create_file_draft(
@@ -1106,7 +1142,7 @@ impl SlackService {
             .await
         {
             Ok(allocation) => allocation,
-            Err(error) if upload_allocation_error_is_ambiguous(&error) => {
+            Err(error) if mutation_error_is_ambiguous(&error) => {
                 return Ok(FileDraftCreateReport::AllocationUncertain);
             }
             Err(error) => return Err(error),
@@ -1195,7 +1231,7 @@ impl SlackService {
                             same_rendered_draft_blocks(actual, &rendered.blocks)
                         })
                 }),
-            Err(error) if draft_mutation_error_is_ambiguous(&error) => None,
+            Err(error) if mutation_error_is_ambiguous(&error) => None,
             Err(error) => {
                 return Ok(FileDraftCreateReport::DraftNotCreated {
                     file_id,
@@ -1264,7 +1300,7 @@ impl SlackService {
             .await;
         match response {
             Ok(_) => {}
-            Err(error) if draft_mutation_error_is_ambiguous(&error) => {}
+            Err(error) if mutation_error_is_ambiguous(&error) => {}
             Err(error) => return Err(error),
         }
         for delay_ms in self.draft_reconciliation_delays_ms {
@@ -1301,56 +1337,34 @@ impl SlackService {
         validate_draft_id(draft_id)?;
         let current = self.get_draft(draft_id).await?;
         require_supported_draft(&current)?;
-        if current.file_ids.is_empty() {
-            self.api
-                .drafts_delete(&current.id, &current.client_last_updated_ts, false)
-                .await?;
+        let file_id = current.file_ids.first().cloned();
+        let delete = self
+            .api
+            .drafts_delete(
+                &current.id,
+                &current.client_last_updated_ts,
+                file_id.is_some(),
+            )
+            .await;
+        match delete {
+            Ok(_) => {
+                return Ok(DraftDeleteReport {
+                    id: current.id,
+                    deleted: true,
+                    file_deleted: file_id.as_ref().map(|_| false),
+                    file_id,
+                });
+            }
+            Err(error) if mutation_error_is_ambiguous(&error) => {}
+            Err(error) => return Err(error),
+        }
+        if self.reconcile_draft_absence(&current.id).await {
             return Ok(DraftDeleteReport {
                 id: current.id,
                 deleted: true,
-                file_id: None,
-                file_deleted: None,
+                file_deleted: file_id.as_ref().map(|_| false),
+                file_id,
             });
-        }
-        let file_id = current
-            .file_ids
-            .first()
-            .cloned()
-            .ok_or(Error::InvalidResponse {
-                method: "drafts.info",
-            })?;
-        match self
-            .api
-            .drafts_delete(&current.id, &current.client_last_updated_ts, false)
-            .await
-        {
-            Ok(_) => {}
-            Err(error) if draft_mutation_error_is_ambiguous(&error) => {}
-            Err(error) => return Err(error),
-        }
-        for delay_ms in self.draft_reconciliation_delays_ms {
-            if *delay_ms != 0 {
-                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
-            }
-            let Ok(drafts) = self.complete_active_draft_snapshot().await else {
-                continue;
-            };
-            if drafts.iter().any(|draft| {
-                draft.id == current.id || draft.file_ids.iter().any(|id| id == &file_id)
-            }) {
-                continue;
-            }
-            match self.api.files_info(&file_id).await {
-                Err(error) if file_is_absent(&error) => {
-                    return Ok(DraftDeleteReport {
-                        id: current.id,
-                        deleted: true,
-                        file_id: Some(file_id),
-                        file_deleted: Some(true),
-                    });
-                }
-                _ => continue,
-            }
         }
         Err(Error::DraftMutationUncertain {
             draft_id: current.id,
@@ -1475,7 +1489,7 @@ impl SlackService {
                         cleanup_warning: None,
                     });
                 }
-                let reason = if draft_mutation_error_is_ambiguous(&error) {
+                let reason = if mutation_error_is_ambiguous(&error) {
                     Error::DraftMutationUncertain {
                         draft_id: draft.id.clone(),
                         action: "post-publication cleanup",
@@ -2644,6 +2658,23 @@ fn same_draft_route(actual: &DraftDestination, requested: &DraftDestination) -> 
         && actual.broadcast == requested.broadcast
 }
 
+fn is_exact_text_draft(
+    draft: &Draft,
+    client_msg_id: &str,
+    destination: &DraftDestination,
+    blocks: &[serde_json::Value],
+) -> bool {
+    draft.is_supported
+        && draft.client_msg_id.as_deref() == Some(client_msg_id)
+        && draft.file_ids.is_empty()
+        && draft.destinations.len() == 1
+        && same_draft_route(&draft.destinations[0], destination)
+        && draft
+            .blocks
+            .as_deref()
+            .is_some_and(|actual| same_rendered_draft_blocks(actual, blocks))
+}
+
 fn draft_mutation_destination(destination: &DraftDestination) -> DraftDestination {
     DraftDestination {
         channel_id: destination.channel_id.clone(),
@@ -3265,7 +3296,7 @@ fn normalize_message(channel: &str, message: RawMessage, method: &'static str) -
     })
 }
 
-fn reaction_error_is_ambiguous(error: &Error) -> bool {
+fn mutation_error_is_ambiguous(error: &Error) -> bool {
     matches!(
         error,
         Error::HttpStatus { .. }
@@ -3276,28 +3307,6 @@ fn reaction_error_is_ambiguous(error: &Error) -> bool {
     ) || matches!(
         error,
         Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
-    )
-}
-
-fn draft_mutation_error_is_ambiguous(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::HttpStatus { .. }
-            | Error::ResponseTooLarge { .. }
-            | Error::InvalidResponse { .. }
-            | Error::Timeout { .. }
-            | Error::Transport { .. }
-    ) || matches!(
-        error,
-        Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
-    )
-}
-
-fn file_is_absent(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::SlackApi { method: "files.info", code }
-            if matches!(code.as_str(), "file_not_found" | "file_deleted")
     )
 }
 
@@ -3398,20 +3407,6 @@ fn validate_upload_input(field: &'static str, value: &str, maximum: usize) -> Re
         ));
     }
     Ok(())
-}
-
-fn upload_allocation_error_is_ambiguous(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::HttpStatus { .. }
-            | Error::ResponseTooLarge { .. }
-            | Error::InvalidResponse { .. }
-            | Error::Timeout { .. }
-            | Error::Transport { .. }
-    ) || matches!(
-        error,
-        Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
-    )
 }
 
 fn completion_has_exact_file(completion: &RawFileUploadCompletion, file_id: &str) -> bool {
@@ -3909,6 +3904,16 @@ mod tests {
                 None
             }
         })
+    }
+
+    fn assert_creation_uncertain_matches_request(error: Error, calls: &Mutex<Vec<DraftCall>>) {
+        let Error::DraftCreationUncertain { client_msg_id } = error else {
+            panic!("expected a structured uncertain creation");
+        };
+        assert_eq!(
+            last_created_client_msg_id(calls).as_deref(),
+            Some(client_msg_id.as_str())
+        );
     }
 
     #[async_trait]
@@ -4905,9 +4910,10 @@ mod tests {
                 draft: updated.clone(),
             },
         ]));
-        api.draft_create = RawDraftResponse {
-            draft: raw_draft("DR-created", "4000", "C123", "created"),
-        };
+        let mut created = raw_draft("DR-created", "4000", "C123", "created");
+        created.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        created.blocks = Some(render_markdown("**created**").unwrap().blocks);
+        api.draft_create = RawDraftResponse { draft: created };
         api.draft_update = RawDraftResponse { draft: updated };
         let calls = api.draft_calls.clone();
         let service = service(api);
@@ -5016,9 +5022,9 @@ mod tests {
             RawDraftResponse { draft: updated },
             RawDraftResponse { draft: existing },
         ]));
-        api.draft_create = RawDraftResponse {
-            draft: raw_self_dm_draft("DR-created", "3000", "created"),
-        };
+        let mut created = raw_self_dm_draft("DR-created", "3000", "created");
+        created.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        api.draft_create = RawDraftResponse { draft: created };
         api.draft_update = RawDraftResponse {
             draft: raw_self_dm_draft("DR-existing", "2001", "transient"),
         };
@@ -5202,16 +5208,132 @@ mod tests {
 
         for (draft, requested_thread, requested_broadcast) in cases {
             let mut api = fake_api();
+            let mut draft = draft;
+            draft.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
             api.draft_create = RawDraftResponse { draft };
-            assert!(matches!(
-                service(api)
-                    .create_draft("D123", requested_thread, requested_broadcast, "synthetic")
-                    .await,
-                Err(Error::InvalidResponse {
-                    method: "drafts.create"
-                })
-            ));
+            let calls = api.draft_calls.clone();
+            let error = service(api)
+                .create_draft("D123", requested_thread, requested_broadcast, "synthetic")
+                .await
+                .unwrap_err();
+            assert_creation_uncertain_matches_request(error, &calls);
         }
+    }
+
+    #[tokio::test]
+    async fn text_draft_creation_rejects_each_mismatched_acknowledgement_dimension() {
+        for mismatch in ["client_msg_id", "file_ids", "blocks"] {
+            let mut response = raw_draft("DR-created", "1000", "C123", "synthetic");
+            response.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+            match mismatch {
+                "client_msg_id" => {
+                    response.client_msg_id = Some("00000000-0000-4000-8000-000000000002".into());
+                }
+                "file_ids" => response.file_ids = vec!["F123".into()],
+                "blocks" => {
+                    response.blocks = Some(render_markdown("different").unwrap().blocks);
+                }
+                _ => unreachable!(),
+            }
+            let mut api = fake_api();
+            api.draft_create = RawDraftResponse { draft: response };
+            let calls = api.draft_calls.clone();
+
+            let error = service(api)
+                .create_draft("C123", None, false, "synthetic")
+                .await
+                .unwrap_err();
+
+            assert_creation_uncertain_matches_request(error, &calls);
+        }
+    }
+
+    #[tokio::test]
+    async fn text_draft_creation_reconciles_ambiguous_or_mismatched_acknowledgements() {
+        for response in ["timeout", "mismatched"] {
+            let mut exact = raw_draft("DR-created", "1000", "C123", "synthetic");
+            exact.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+            let mut api = fake_api();
+            api.drafts_page = active_drafts(vec![exact]);
+            if response == "timeout" {
+                api.draft_create_error = Some("timeout");
+            } else {
+                api.draft_create = RawDraftResponse {
+                    draft: raw_draft("DR-unrelated", "1000", "C999", "unrelated"),
+                };
+            }
+            let calls = api.draft_calls.clone();
+
+            let created = service(api)
+                .create_draft("C123", None, false, "synthetic")
+                .await
+                .unwrap();
+
+            assert_eq!(created.id, "DR-created");
+            let calls = calls.lock().unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| matches!(call, DraftCall::Create { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| matches!(call, DraftCall::List { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_text_draft_creation_retains_the_client_id_without_retrying() {
+        let mut api = fake_api();
+        api.draft_create_error = Some("timeout");
+        let calls = api.draft_calls.clone();
+
+        let error = service(api)
+            .create_draft("C123", None, false, "synthetic")
+            .await
+            .unwrap_err();
+        assert_creation_uncertain_matches_request(error, &calls);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Create { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DraftCall::List { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_text_draft_creation_reconciliation_stays_uncertain() {
+        let mut first = raw_draft("DR-first", "1000", "C123", "synthetic");
+        first.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        let mut second = raw_draft("DR-second", "1001", "C123", "synthetic");
+        second.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        let mut api = fake_api();
+        api.draft_create_error = Some("timeout");
+        api.drafts_page = active_drafts(vec![first, second]);
+        let calls = api.draft_calls.clone();
+
+        let error = service(api)
+            .create_draft("C123", None, false, "synthetic")
+            .await
+            .unwrap_err();
+
+        assert_creation_uncertain_matches_request(error, &calls);
     }
 
     #[tokio::test]
@@ -5928,14 +6050,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deletes_only_a_proved_draft_owned_file_and_reconciles_ambiguity() {
-        for (ambiguous, terminal_code) in [
-            (false, "file_not_found"),
-            (false, "file_deleted"),
-            (true, "file_not_found"),
-            (true, "file_deleted"),
-        ] {
+    async fn one_file_draft_deletion_always_preserves_the_file() {
+        for ambiguous in [false, true] {
             let draft = raw_file_draft("DR-file", "900", "C123", "delete", "FPRIVATE");
+            let concurrent = raw_file_draft("DR-concurrent", "901", "C123", "other", "FPRIVATE");
             let mut api = fake_api();
             api.draft_infos = Mutex::new(VecDeque::from([
                 RawDraftResponse {
@@ -5947,42 +6065,37 @@ mod tests {
             ]));
             api.draft_pages = Mutex::new(VecDeque::from([
                 active_drafts(vec![draft]),
-                active_drafts(vec![]),
+                active_drafts(vec![concurrent]),
             ]));
-            api.file_info_results = Mutex::new(VecDeque::from([
-                Ok(RawFileResponse {
-                    file: private_draft_file("FPRIVATE"),
-                }),
-                Err(Error::SlackApi {
-                    method: "files.info",
-                    code: terminal_code.into(),
-                }),
-            ]));
+            api.file_response = RawFileResponse {
+                file: private_draft_file("FPRIVATE"),
+            };
             api.draft_delete_ambiguous = ambiguous;
             let calls = api.draft_calls.clone();
+            let file_info_calls = api.file_info_calls.clone();
             let service = service(api);
 
             let report = service.delete_draft("DR-file", true).await.unwrap();
             assert_eq!(report.file_id.as_deref(), Some("FPRIVATE"));
-            assert_eq!(report.file_deleted, Some(true));
+            assert_eq!(report.file_deleted, Some(false));
+            let calls = calls.lock().unwrap();
             assert_eq!(
                 calls
-                    .lock()
-                    .unwrap()
                     .iter()
                     .filter(|call| matches!(call, DraftCall::Delete { .. }))
                     .count(),
                 1
             );
-            assert!(calls.lock().unwrap().iter().any(|call| {
+            assert!(calls.iter().any(|call| {
                 matches!(
                     call,
                     DraftCall::Delete {
-                        skip_file_deletion: false,
+                        skip_file_deletion: true,
                         ..
                     }
                 )
             }));
+            assert_eq!(file_info_calls.lock().unwrap().as_slice(), ["FPRIVATE"]);
         }
     }
 
@@ -6032,6 +6145,68 @@ mod tests {
                 .filter(|call| matches!(call, DraftCall::List { .. }))
                 .count(),
             7
+        );
+        assert!(calls.iter().any(|call| {
+            matches!(
+                call,
+                DraftCall::Delete {
+                    skip_file_deletion: true,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn text_draft_delete_reconciles_ambiguity_or_reports_uncertain() {
+        let current = raw_draft("DR-text", "920", "C123", "delete");
+        let mut absent = fake_api();
+        absent.draft_info = RawDraftResponse {
+            draft: current.clone(),
+        };
+        absent.drafts_page = active_drafts(vec![]);
+        absent.draft_delete_ambiguous = true;
+        let calls = absent.draft_calls.clone();
+
+        let report = service(absent).delete_draft("DR-text", true).await.unwrap();
+        assert!(report.deleted);
+        assert_eq!(report.file_id, None);
+        assert_eq!(report.file_deleted, None);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            1
+        );
+
+        let mut unresolved = fake_api();
+        unresolved.draft_info = RawDraftResponse {
+            draft: current.clone(),
+        };
+        unresolved.drafts_page = active_drafts(vec![current]);
+        unresolved.draft_delete_ambiguous = true;
+        let calls = unresolved.draft_calls.clone();
+        let mut service = service(unresolved);
+        service.draft_reconciliation_delays_ms = &[0, 0, 0, 0, 0, 0];
+
+        assert!(matches!(
+            service.delete_draft("DR-text", true).await,
+            Err(Error::DraftMutationUncertain {
+                action: "delete",
+                ..
+            })
+        ));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            1
         );
     }
 
