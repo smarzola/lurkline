@@ -500,7 +500,11 @@ pub struct MessageSearchMatch {
     pub ts: String,
     pub thread_ts: Option<String>,
     pub author_id: Option<String>,
+    /// Slack username or message-supplied author name when known.
     pub author_name: Option<String>,
+    /// Slack profile display name, falling back to the profile's real name.
+    pub author_display_name: Option<String>,
+    pub author_resolution: AuthorResolution,
     pub text: String,
     /// Raw Slack Block Kit JSON. `None` means Slack omitted `blocks`; an empty
     /// vector means Slack explicitly returned an empty array.
@@ -698,7 +702,11 @@ pub struct Message {
     pub ts: String,
     pub thread_ts: Option<String>,
     pub author_id: Option<String>,
+    /// Slack username or message-supplied author name when known.
     pub author_name: Option<String>,
+    /// Slack profile display name, falling back to the profile's real name.
+    pub author_display_name: Option<String>,
+    pub author_resolution: AuthorResolution,
     pub text: String,
     /// Raw Slack Block Kit JSON. Unknown block and element fields are retained.
     pub blocks: Option<Vec<Value>>,
@@ -710,6 +718,25 @@ pub struct Message {
     pub latest_reply: Option<String>,
     pub reactions: Vec<Reaction>,
     pub files: Vec<FileReference>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorResolution {
+    /// Slack supplied the author name directly on the message.
+    Provided,
+    /// Lurkline resolved the author through the bounded user directory.
+    Directory,
+    /// This path preserved the author ID without requesting directory enrichment.
+    NotAttempted,
+    /// A complete directory did not contain a usable identity for this ID.
+    Unresolved,
+    /// The bounded directory ended before every Slack user could be scanned.
+    Incomplete,
+    /// The auxiliary directory request failed; the message itself is intact.
+    Unavailable,
+    /// Slack supplied neither an author ID nor an author name.
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

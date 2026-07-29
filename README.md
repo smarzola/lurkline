@@ -392,6 +392,30 @@ unchanged. For either field, `null` means Slack omitted it and `[]` means Slack
 returned an explicit empty array.
 
 Message results also normalize author, thread, reaction, and file metadata.
+Channel, thread, exact-message, and search commands resolve known people
+through the bounded Slack user directory. Human output shows `@username`, or a
+profile display name when no username is usable. A raw-ID fallback includes
+one of these labels:
+
+- `[unresolved]`: `author_resolution` is `unresolved`; a complete directory did
+  not contain a usable identity.
+- `[resolution incomplete]`: `author_resolution` is `incomplete`; Slack
+  advertised another page after Lurkline reached its 20-page bound, which
+  scans up to 4,000 users.
+- `[resolution unavailable]`: `author_resolution` is `unavailable`; the
+  auxiliary directory request failed.
+- `[resolution not attempted]`: `author_resolution` is `not_attempted`; this
+  result type does not perform author enrichment, such as inbox entries and
+  sent-message acknowledgements.
+
+JSON and MCP results retain `author_id` and add `author_name`,
+`author_display_name`, and `author_resolution`. The resolution value is
+`provided` for a name included on the message, `directory` for a user-directory
+match, one of the explicitly mapped fallback values above, or `unknown` when
+Slack supplied neither an ID nor a name. Lurkline performs at most one bounded
+user-directory scan for each targeted read and reuses a scan required to
+resolve a conversation name; it never looks up each message separately.
+
 Reaction `user_ids` can be shorter than `count`; check `user_ids_complete`
 before treating that list as exhaustive. Slack guarantees that the
 authenticated user remains present when that user reacted. Nullable or omitted

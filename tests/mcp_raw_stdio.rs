@@ -191,6 +191,40 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             .unwrap()
             .contains("force a colliding name")
     );
+    for tool_name in [
+        "slack_read_channel",
+        "slack_read_thread",
+        "slack_get_message",
+        "slack_search_messages",
+        "slack_read_inbox",
+        "slack_send_message",
+    ] {
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == tool_name)
+            .unwrap();
+        let output_schema = serde_json::to_string(&tool["outputSchema"]).unwrap();
+        for expected in [
+            "author_id",
+            "author_name",
+            "author_display_name",
+            "author_resolution",
+            "provided",
+            "directory",
+            "not_attempted",
+            "unresolved",
+            "incomplete",
+            "unavailable",
+            "unknown",
+        ] {
+            assert!(
+                output_schema.contains(expected),
+                "{tool_name} output schema omits {expected}"
+            );
+        }
+    }
 
     send(
         &mut stdin,
