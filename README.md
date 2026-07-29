@@ -86,8 +86,12 @@ The following safeguards apply to Slack writes:
   and a cleanup warning instead of reporting a failed send.
 - If the post outcome is unknown, Lurkline returns `publication_uncertain`, the
   client message ID, and instructions not to retry automatically.
-- File-draft updates and deletions preserve or delete only the exact file that
-  a complete Slack-state scan proves belongs exclusively to that draft.
+- Text-draft creation accepts only an exact correlated acknowledgement or an
+  exact bounded reread. An unresolved result returns
+  `draft_creation_uncertain`, its client message ID, and instructions not to
+  retry automatically.
+- One-file draft deletion always preserves the Slack file because no
+  client-side ownership scan can be atomic with the later deletion request.
 
 Lurkline doesn't ask for confirmation when it reads, renders Markdown locally,
 or lists and inspects drafts.
@@ -109,9 +113,9 @@ provide binaries for Linux x86-64, Linux ARM64, and macOS ARM64.
 Verify and install the macOS ARM64 archive:
 
 ```sh
-shasum -a 256 -c lurkline-v0.8.0-macos-aarch64.tar.gz.sha256
-tar -xzf lurkline-v0.8.0-macos-aarch64.tar.gz
-sudo install lurkline-v0.8.0-macos-aarch64/lurkline /usr/local/bin/lurkline
+shasum -a 256 -c lurkline-v0.8.1-macos-aarch64.tar.gz.sha256
+tar -xzf lurkline-v0.8.1-macos-aarch64.tar.gz
+sudo install lurkline-v0.8.1-macos-aarch64/lurkline /usr/local/bin/lurkline
 lurkline --version
 ```
 
@@ -347,7 +351,11 @@ conversation ID. Lurkline:
 
 Inbox doesn't infer exact unread message boundaries, fetch unread thread
 roots, or mark anything read. JSON reports `total_unread_conversations`,
-`has_more_conversations`, and Slack's unread-thread summary.
+`has_more_conversations`, `truncation_reason`, and Slack's unread-thread
+summary. The complete pretty-serialized inbox report cannot exceed
+`LURKLINE_MAX_RESPONSE_BYTES`. Lurkline stops after the first history result
+that doesn't fit and reports `byte_limit`; otherwise a requested conversation
+cap reports `conversation_limit`.
 
 If bounded discovery can't find a selected conversation,
 `metadata_is_complete` is `false`. Treat archive, membership, privacy, and
@@ -578,7 +586,7 @@ lurkline drafts get DR123 --json
 Create a root-message draft from standard input:
 
 ```sh
-printf '%s\n' 'Review **release 0.8.0**.' \
+printf '%s\n' 'Review **release 0.8.1**.' \
   | lurkline drafts create platform
 ```
 
@@ -631,6 +639,11 @@ Text drafts are supported when they have one root or thread destination, Slack
 `rich_text` blocks, and no files, attachments, sent state, deleted state, or
 unrecognized destination fields. For DM destinations, Lurkline validates
 Slack's `user_ids` participant metadata but routes only by `channel_id`.
+Creation uses a fresh UUID v4 client message ID and accepts only the exact
+client ID, destination, empty file set, and authored rich-text blocks. A
+mismatched or ambiguous acknowledgement triggers bounded exact active-draft
+rereads. If no unique match is proved, Lurkline returns
+`draft_creation_uncertain` with the same client message ID and doesn't retry.
 
 A one-file draft is supported only after `drafts get` proves all of the
 following Slack state:
@@ -673,9 +686,11 @@ an ambiguous result. Use the returned `stage` to recover:
 Updating a proved one-file draft sends the exact same file ID and reproves the
 new revision. An ambiguous update returns `draft_mutation_uncertain` and isn't
 retried. Deleting a proved one-file draft sends one deletion request with file
-deletion enabled and reports success only after the draft is absent and
-`files.info` reports the file as not found or deleted. An unknown deletion
-outcome also returns `draft_mutation_uncertain`.
+preservation enabled (`skip_file_deletion=true`), so a successful result
+reports `file_deleted: false`.
+Lurkline reports success only after Slack acknowledges deletion or a bounded
+reread proves the draft absent. Text and one-file draft deletions return
+`draft_mutation_uncertain` when an ambiguous outcome can't be reconciled.
 
 Publishing a one-file draft uses Slack's browser `files.share` contract with
 the exact draft and file IDs plus a fresh UUID v4 client message ID. Lurkline
@@ -695,7 +710,7 @@ their contract.
 Send a root message from standard input:
 
 ```sh
-printf '%s\n' 'Release **0.8.0** is ready.' \
+printf '%s\n' 'Release **0.8.1** is ready.' \
   | lurkline message send platform --confirm --json
 ```
 
@@ -863,7 +878,7 @@ The following table lists primary and auxiliary bounds:
 | Conversation list | One page of 200 | Up to 20 user pages of 200 for DMs |
 | Conversation find | 100 | 20 conversation pages and 20 user pages of 200 |
 | Message search | One page of 100 | With `--in`: 20 conversation pages; exact names can also scan 20 user pages |
-| Inbox | 50 conversations; one history page of 200 each | 20 conversation pages and, for DMs, 20 user pages |
+| Inbox | 50 conversations; one history page of 200 each; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages and, for DMs, 20 user pages |
 | Channel history | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Thread replies | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Exact message | One message | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
@@ -952,10 +967,15 @@ Verify a development checkout:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+cargo test --locked --all-targets
 cargo build --release --locked
 python3 scripts/check-no-secrets.py
+rustup run 1.88.0 cargo check --locked --all-targets
 ```
+
+CI runs these gates on Linux, repeats all tests on macOS ARM64, and checks the
+declared Rust 1.88 minimum. Tagged release builds start only after the exact
+tagged source passes that reusable workflow.
 
 ## License
 

@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
   pull_request:
 
@@ -41,16 +42,19 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --all-targets
 
       - name: Build release binary
         run: cargo build --release --locked
+
+      - name: Scan tracked files for credentials
+        run: python3 scripts/check-no-secrets.py
 
       - name: Smoke-test release packaging
         shell: bash
@@ -66,3 +70,40 @@ jobs:
             cd "$RUNNER_TEMP/release"
             shasum -a 256 -c "lurkline-v${version}-linux-x86_64.tar.gz.sha256"
           )
+
+  rust-1-88:
+    name: Rust 1.88 compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal
+
+      - name: Check all targets with Rust 1.88
+        run: rustup run 1.88.0 cargo check --locked --all-targets
+
+  macos:
+    name: Test on macOS ARM64
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select Rust toolchain
+        run: rustup default stable
+
+      - name: Test all targets
+        run: cargo test --locked --all-targets

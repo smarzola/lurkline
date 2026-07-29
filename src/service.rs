@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::{self, Write},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -19,15 +20,15 @@ use crate::{
         CustomEmojiList, DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport,
         DraftDestination, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
         FileDraftCreateReport, FileReference, FileShare, FileShareVisibility, FileUploadReport,
-        InboxConversation, InboxReport, Message, MessagePage, MessageSearchMatch,
-        MessageSearchPage, RawAuthTestResponse, RawConversation, RawConversationsPage, RawDraft,
-        RawDraftResponse, RawDraftRevision, RawDraftsPage, RawEmojiResponse, RawFile,
-        RawFileResponse, RawFileUploadAllocation, RawFileUploadCompletion, RawMessage,
-        RawMessagePage, RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList,
-        RawMutationResponse, RawPostMessageResponse, RawReaction, RawReactionItemResponse,
-        RawUnread, RawUser, RawUsersPage, Reaction, ReactionMutationReport, SentMessage,
-        ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
-        UserSearchTruncationReason,
+        InboxConversation, InboxReport, InboxTruncationReason, Message, MessagePage,
+        MessageSearchMatch, MessageSearchPage, RawAuthTestResponse, RawConversation,
+        RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision, RawDraftsPage,
+        RawEmojiResponse, RawFile, RawFileResponse, RawFileUploadAllocation,
+        RawFileUploadCompletion, RawMessage, RawMessagePage, RawMessageSearchMatch,
+        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
+        RawReaction, RawReactionItemResponse, RawUnread, RawUser, RawUsersPage, Reaction,
+        ReactionMutationReport, SentMessage, ThreadPage, UnreadConversation, UnreadReport,
+        UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
     },
 };
 
@@ -306,9 +307,82 @@ pub(crate) struct SlackService {
     api: Arc<dyn SlackApi>,
     team_id: String,
     workspace_url: String,
+    inbox_byte_limit: usize,
     now_millis: fn() -> Result<String>,
     upload_reconciliation_delays_ms: &'static [u64],
     draft_reconciliation_delays_ms: &'static [u64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UploadPreparation {
+    Ready { file_id: String },
+    AllocationUncertain,
+    Allocated { file_id: String },
+    SourceChanged { file_id: String },
+    TransferUncertain { file_id: String },
+}
+
+impl UploadPreparation {
+    fn into_file_upload(self) -> std::result::Result<String, FileUploadReport> {
+        match self {
+            Self::Ready { file_id } => Ok(file_id),
+            Self::AllocationUncertain => Err(FileUploadReport::AllocationUncertain),
+            Self::Allocated { file_id } => Err(FileUploadReport::Allocated { file_id }),
+            Self::SourceChanged { file_id } => Err(FileUploadReport::SourceChanged { file_id }),
+            Self::TransferUncertain { file_id } => {
+                Err(FileUploadReport::TransferUncertain { file_id })
+            }
+        }
+    }
+
+    fn into_file_draft(self) -> std::result::Result<String, FileDraftCreateReport> {
+        match self {
+            Self::Ready { file_id } => Ok(file_id),
+            Self::AllocationUncertain => Err(FileDraftCreateReport::AllocationUncertain),
+            Self::Allocated { file_id } => Err(FileDraftCreateReport::Allocated { file_id }),
+            Self::SourceChanged { file_id } => {
+                Err(FileDraftCreateReport::SourceChanged { file_id })
+            }
+            Self::TransferUncertain { file_id } => {
+                Err(FileDraftCreateReport::TransferUncertain { file_id })
+            }
+        }
+    }
+}
+
+struct ByteLimitWriter {
+    bytes_written: usize,
+    limit: usize,
+}
+
+impl ByteLimitWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes_written: 0,
+            limit,
+        }
+    }
+}
+
+impl Write for ByteLimitWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next_size) = self.bytes_written.checked_add(buffer.len()) else {
+            return Err(io::Error::other("serialized output exceeds byte limit"));
+        };
+        if next_size > self.limit {
+            return Err(io::Error::other("serialized output exceeds byte limit"));
+        }
+        self.bytes_written = next_size;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_fits(value: &impl serde::Serialize, limit: usize) -> bool {
+    serde_json::to_writer_pretty(ByteLimitWriter::new(limit), value).is_ok()
 }
 
 struct VerifiedFileDraft {
@@ -327,6 +401,7 @@ impl SlackService {
             api: Arc::new(api),
             team_id: config.team_id.clone(),
             workspace_url: config.base_url.origin().ascii_serialization(),
+            inbox_byte_limit: config.max_response_bytes,
             now_millis: system_unix_milliseconds,
             upload_reconciliation_delays_ms: UPLOAD_RECONCILIATION_DELAYS_MS,
             draft_reconciliation_delays_ms: DRAFT_RECONCILIATION_DELAYS_MS,
@@ -405,6 +480,54 @@ impl SlackService {
         })
     }
 
+    async fn prepare_upload(
+        &self,
+        source: &mut UploadSource,
+        alt_text: Option<&str>,
+    ) -> Result<UploadPreparation> {
+        if source.size() > MAX_FILE_UPLOAD_BYTES {
+            return Err(Error::invalid_input(
+                "max_bytes",
+                "Slack file is larger than the 1 GiB hard limit",
+            ));
+        }
+        let raw_allocation = match self
+            .api
+            .files_get_upload_url(source.file_name(), source.size(), alt_text)
+            .await
+        {
+            Ok(allocation) => allocation,
+            Err(error) if mutation_error_is_ambiguous(&error) => {
+                return Ok(UploadPreparation::AllocationUncertain);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(file_id) = raw_allocation
+            .file_id
+            .filter(|file_id| is_valid_file_id(file_id))
+        else {
+            return Ok(UploadPreparation::AllocationUncertain);
+        };
+        let Some(raw_upload_url) = raw_allocation.upload_url else {
+            return Ok(UploadPreparation::Allocated { file_id });
+        };
+        let upload_url = Zeroizing::new(raw_upload_url);
+        if !is_safe_upload_url(&upload_url) {
+            return Ok(UploadPreparation::Allocated { file_id });
+        }
+        if !matches!(source.is_stable(), Ok(true)) {
+            return Ok(UploadPreparation::SourceChanged { file_id });
+        }
+        let upload_pass = match self.api.upload_edge_file(&upload_url, source).await {
+            Ok(upload_pass) => upload_pass,
+            Err(_) => return Ok(UploadPreparation::TransferUncertain { file_id }),
+        };
+        if !matches!(source.upload_pass_matches(&upload_pass), Ok(true)) {
+            return Ok(UploadPreparation::SourceChanged { file_id });
+        }
+        Ok(UploadPreparation::Ready { file_id })
+    }
+
     pub(crate) async fn upload_file(
         &self,
         conversation: &str,
@@ -436,48 +559,14 @@ impl SlackService {
                 ));
             }
         }
-        if source.size() > MAX_FILE_UPLOAD_BYTES {
-            return Err(Error::invalid_input(
-                "max_bytes",
-                "Slack file is larger than the 1 GiB hard limit",
-            ));
-        }
-
-        let raw_allocation = match self
-            .api
-            .files_get_upload_url(source.file_name(), source.size(), alt_text)
-            .await
+        let file_id = match self
+            .prepare_upload(&mut source, alt_text)
+            .await?
+            .into_file_upload()
         {
-            Ok(allocation) => allocation,
-            Err(error) if upload_allocation_error_is_ambiguous(&error) => {
-                return Ok(FileUploadReport::AllocationUncertain);
-            }
-            Err(error) => return Err(error),
+            Ok(file_id) => file_id,
+            Err(report) => return Ok(report),
         };
-        let Some(file_id) = raw_allocation
-            .file_id
-            .filter(|file_id| is_valid_file_id(file_id))
-        else {
-            return Ok(FileUploadReport::AllocationUncertain);
-        };
-        let Some(raw_upload_url) = raw_allocation.upload_url else {
-            return Ok(FileUploadReport::Allocated { file_id });
-        };
-        let upload_url = Zeroizing::new(raw_upload_url);
-        if !is_safe_upload_url(&upload_url) {
-            return Ok(FileUploadReport::Allocated { file_id });
-        }
-        if !matches!(source.is_stable(), Ok(true)) {
-            return Ok(FileUploadReport::SourceChanged { file_id });
-        }
-
-        let upload_pass = match self.api.upload_edge_file(&upload_url, &mut source).await {
-            Ok(upload_pass) => upload_pass,
-            Err(_) => return Ok(FileUploadReport::TransferUncertain { file_id }),
-        };
-        if !matches!(source.upload_pass_matches(&upload_pass), Ok(true)) {
-            return Ok(FileUploadReport::SourceChanged { file_id });
-        }
 
         let completion_client_msg_id = Uuid::new_v4().to_string();
         let completion = self
@@ -771,6 +860,32 @@ impl SlackService {
         false
     }
 
+    async fn reconcile_text_draft_creation(
+        &self,
+        client_msg_id: &str,
+        destination: &DraftDestination,
+        blocks: &[serde_json::Value],
+    ) -> Option<Draft> {
+        for delay_ms in self.draft_reconciliation_delays_ms {
+            if *delay_ms != 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            let Ok(drafts) = self.complete_active_draft_snapshot().await else {
+                continue;
+            };
+            let mut matches = drafts
+                .into_iter()
+                .filter(|draft| is_exact_text_draft(draft, client_msg_id, destination, blocks));
+            let Some(draft) = matches.next() else {
+                continue;
+            };
+            if matches.next().is_none() {
+                return Some(draft);
+            }
+        }
+        None
+    }
+
     pub(crate) fn validate_upload_request(
         conversation: &str,
         thread_ts: Option<&str>,
@@ -882,7 +997,7 @@ impl SlackService {
                     reconciled: true,
                 });
             }
-            Err(error) if reaction_error_is_ambiguous(&error) => true,
+            Err(error) if mutation_error_is_ambiguous(&error) => true,
             Err(error) => return Err(error),
         };
 
@@ -1031,24 +1146,34 @@ impl SlackService {
             broadcast,
             ..DraftDestination::default()
         };
+        let client_msg_id = Uuid::new_v4().to_string();
         let response = self
             .api
             .drafts_create(
-                &Uuid::new_v4().to_string(),
+                &client_msg_id,
                 std::slice::from_ref(&destination),
                 &rendered.blocks,
                 &[],
             )
-            .await?;
-        let draft = normalize_draft(response.draft, "drafts.create")?;
-        require_supported_draft(&draft)?;
-        if draft.destinations.len() != 1 || !same_draft_route(&draft.destinations[0], &destination)
-        {
-            return Err(Error::InvalidResponse {
-                method: "drafts.create",
-            });
+            .await;
+        match response {
+            Ok(response) => {
+                if let Ok(draft) = normalize_draft(response.draft, "drafts.create")
+                    && is_exact_text_draft(&draft, &client_msg_id, &destination, &rendered.blocks)
+                {
+                    return Ok(draft);
+                }
+            }
+            Err(error) if mutation_error_is_ambiguous(&error) => {}
+            Err(error) => return Err(error),
         }
-        Ok(draft)
+        if let Some(draft) = self
+            .reconcile_text_draft_creation(&client_msg_id, &destination, &rendered.blocks)
+            .await
+        {
+            return Ok(draft);
+        }
+        Err(Error::DraftCreationUncertain { client_msg_id })
     }
 
     pub(crate) async fn create_file_draft(
@@ -1077,12 +1202,6 @@ impl SlackService {
         )?;
         let expected_file_name = source.file_name().to_owned();
         let expected_file_size = source.size();
-        if source.size() > MAX_FILE_UPLOAD_BYTES {
-            return Err(Error::invalid_input(
-                "max_bytes",
-                "Slack file is larger than the 1 GiB hard limit",
-            ));
-        }
         let channel_id = self.resolve_conversation_id(conversation).await?;
         if let Some(thread_ts) = thread_ts {
             let root = self.get_message_by_id(&channel_id, thread_ts).await?;
@@ -1100,41 +1219,14 @@ impl SlackService {
             ..DraftDestination::default()
         };
 
-        let raw_allocation = match self
-            .api
-            .files_get_upload_url(source.file_name(), source.size(), alt_text)
-            .await
+        let file_id = match self
+            .prepare_upload(&mut source, alt_text)
+            .await?
+            .into_file_draft()
         {
-            Ok(allocation) => allocation,
-            Err(error) if upload_allocation_error_is_ambiguous(&error) => {
-                return Ok(FileDraftCreateReport::AllocationUncertain);
-            }
-            Err(error) => return Err(error),
+            Ok(file_id) => file_id,
+            Err(report) => return Ok(report),
         };
-        let Some(file_id) = raw_allocation
-            .file_id
-            .filter(|file_id| is_valid_file_id(file_id))
-        else {
-            return Ok(FileDraftCreateReport::AllocationUncertain);
-        };
-        let Some(raw_upload_url) = raw_allocation.upload_url else {
-            return Ok(FileDraftCreateReport::Allocated { file_id });
-        };
-        let upload_url = Zeroizing::new(raw_upload_url);
-        if !is_safe_upload_url(&upload_url) {
-            return Ok(FileDraftCreateReport::Allocated { file_id });
-        }
-        if !matches!(source.is_stable(), Ok(true)) {
-            return Ok(FileDraftCreateReport::SourceChanged { file_id });
-        }
-
-        let upload_pass = match self.api.upload_edge_file(&upload_url, &mut source).await {
-            Ok(pass) => pass,
-            Err(_) => return Ok(FileDraftCreateReport::TransferUncertain { file_id }),
-        };
-        if !matches!(source.upload_pass_matches(&upload_pass), Ok(true)) {
-            return Ok(FileDraftCreateReport::SourceChanged { file_id });
-        }
 
         let completion = self.api.files_complete_draft_upload(&file_id, title).await;
         if !completion
@@ -1195,7 +1287,7 @@ impl SlackService {
                             same_rendered_draft_blocks(actual, &rendered.blocks)
                         })
                 }),
-            Err(error) if draft_mutation_error_is_ambiguous(&error) => None,
+            Err(error) if mutation_error_is_ambiguous(&error) => None,
             Err(error) => {
                 return Ok(FileDraftCreateReport::DraftNotCreated {
                     file_id,
@@ -1264,7 +1356,7 @@ impl SlackService {
             .await;
         match response {
             Ok(_) => {}
-            Err(error) if draft_mutation_error_is_ambiguous(&error) => {}
+            Err(error) if mutation_error_is_ambiguous(&error) => {}
             Err(error) => return Err(error),
         }
         for delay_ms in self.draft_reconciliation_delays_ms {
@@ -1301,56 +1393,34 @@ impl SlackService {
         validate_draft_id(draft_id)?;
         let current = self.get_draft(draft_id).await?;
         require_supported_draft(&current)?;
-        if current.file_ids.is_empty() {
-            self.api
-                .drafts_delete(&current.id, &current.client_last_updated_ts, false)
-                .await?;
+        let file_id = current.file_ids.first().cloned();
+        let delete = self
+            .api
+            .drafts_delete(
+                &current.id,
+                &current.client_last_updated_ts,
+                file_id.is_some(),
+            )
+            .await;
+        match delete {
+            Ok(_) => {
+                return Ok(DraftDeleteReport {
+                    id: current.id,
+                    deleted: true,
+                    file_deleted: file_id.as_ref().map(|_| false),
+                    file_id,
+                });
+            }
+            Err(error) if mutation_error_is_ambiguous(&error) => {}
+            Err(error) => return Err(error),
+        }
+        if self.reconcile_draft_absence(&current.id).await {
             return Ok(DraftDeleteReport {
                 id: current.id,
                 deleted: true,
-                file_id: None,
-                file_deleted: None,
+                file_deleted: file_id.as_ref().map(|_| false),
+                file_id,
             });
-        }
-        let file_id = current
-            .file_ids
-            .first()
-            .cloned()
-            .ok_or(Error::InvalidResponse {
-                method: "drafts.info",
-            })?;
-        match self
-            .api
-            .drafts_delete(&current.id, &current.client_last_updated_ts, false)
-            .await
-        {
-            Ok(_) => {}
-            Err(error) if draft_mutation_error_is_ambiguous(&error) => {}
-            Err(error) => return Err(error),
-        }
-        for delay_ms in self.draft_reconciliation_delays_ms {
-            if *delay_ms != 0 {
-                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
-            }
-            let Ok(drafts) = self.complete_active_draft_snapshot().await else {
-                continue;
-            };
-            if drafts.iter().any(|draft| {
-                draft.id == current.id || draft.file_ids.iter().any(|id| id == &file_id)
-            }) {
-                continue;
-            }
-            match self.api.files_info(&file_id).await {
-                Err(error) if file_is_absent(&error) => {
-                    return Ok(DraftDeleteReport {
-                        id: current.id,
-                        deleted: true,
-                        file_id: Some(file_id),
-                        file_deleted: Some(true),
-                    });
-                }
-                _ => continue,
-            }
         }
         Err(Error::DraftMutationUncertain {
             draft_id: current.id,
@@ -1475,7 +1545,7 @@ impl SlackService {
                         cleanup_warning: None,
                     });
                 }
-                let reason = if draft_mutation_error_is_ambiguous(&error) {
+                let reason = if mutation_error_is_ambiguous(&error) {
                     Error::DraftMutationUncertain {
                         draft_id: draft.id.clone(),
                         action: "post-publication cleanup",
@@ -1672,12 +1742,28 @@ impl SlackService {
             .into_iter()
             .take(conversation_limit)
             .collect::<Vec<_>>();
+        let selected_count = selected.len();
         let selected_ids = selected
             .iter()
             .map(|unread| unread.id.clone())
             .collect::<HashSet<_>>();
         let directory = self.load_conversations_by_id(&selected_ids).await?;
-        let mut conversations = Vec::with_capacity(selected.len());
+        let mut report = InboxReport {
+            team_id: self.team_id.clone(),
+            conversations: Vec::with_capacity(selected.len()),
+            total_unread_conversations,
+            has_more_conversations: total_unread_conversations > 0,
+            truncation_reason: (total_unread_conversations > 0)
+                .then_some(InboxTruncationReason::ByteLimit),
+            threads: unreads.threads,
+        };
+        if !serialized_json_fits(&report, self.inbox_byte_limit) {
+            return Err(Error::ResponseTooLarge {
+                method: "inbox",
+                limit: self.inbox_byte_limit,
+            });
+        }
+        let mut byte_limited = false;
         for unread in selected {
             let conversation = directory
                 .get(&unread.id)
@@ -1691,19 +1777,40 @@ impl SlackService {
             let messages = self
                 .read_channel_by_id(&unread.id, None, message_limit)
                 .await?;
-            conversations.push(InboxConversation {
+            report.conversations.push(InboxConversation {
                 conversation,
                 unread,
                 messages,
             });
+            report.has_more_conversations = true;
+            report.truncation_reason = if report.conversations.len() == selected_count
+                && total_unread_conversations > selected_count
+            {
+                Some(InboxTruncationReason::ConversationLimit)
+            } else {
+                Some(InboxTruncationReason::ByteLimit)
+            };
+            if !serialized_json_fits(&report, self.inbox_byte_limit) {
+                report.conversations.pop();
+                byte_limited = true;
+                break;
+            }
         }
-        Ok(InboxReport {
-            team_id: self.team_id.clone(),
-            has_more_conversations: total_unread_conversations > conversations.len(),
-            total_unread_conversations,
-            conversations,
-            threads: unreads.threads,
-        })
+        report.has_more_conversations = total_unread_conversations > report.conversations.len();
+        report.truncation_reason = if byte_limited {
+            Some(InboxTruncationReason::ByteLimit)
+        } else if report.has_more_conversations {
+            Some(InboxTruncationReason::ConversationLimit)
+        } else {
+            None
+        };
+        if !serialized_json_fits(&report, self.inbox_byte_limit) {
+            return Err(Error::ResponseTooLarge {
+                method: "inbox",
+                limit: self.inbox_byte_limit,
+            });
+        }
+        Ok(report)
     }
 
     pub(crate) async fn list_conversations(
@@ -2644,6 +2751,23 @@ fn same_draft_route(actual: &DraftDestination, requested: &DraftDestination) -> 
         && actual.broadcast == requested.broadcast
 }
 
+fn is_exact_text_draft(
+    draft: &Draft,
+    client_msg_id: &str,
+    destination: &DraftDestination,
+    blocks: &[serde_json::Value],
+) -> bool {
+    draft.is_supported
+        && draft.client_msg_id.as_deref() == Some(client_msg_id)
+        && draft.file_ids.is_empty()
+        && draft.destinations.len() == 1
+        && same_draft_route(&draft.destinations[0], destination)
+        && draft
+            .blocks
+            .as_deref()
+            .is_some_and(|actual| same_rendered_draft_blocks(actual, blocks))
+}
+
 fn draft_mutation_destination(destination: &DraftDestination) -> DraftDestination {
     DraftDestination {
         channel_id: destination.channel_id.clone(),
@@ -2946,22 +3070,12 @@ fn push_bounded(output: &mut String, value: &str) -> bool {
 }
 
 fn classify_publication_error(client_msg_id: &str, error: Error) -> Error {
-    match error {
-        Error::HttpStatus { .. }
-        | Error::ResponseTooLarge { .. }
-        | Error::InvalidResponse { .. }
-        | Error::Timeout { .. }
-        | Error::Transport { .. } => Error::PublicationUncertain {
+    if mutation_error_is_ambiguous(&error) {
+        Error::PublicationUncertain {
             client_msg_id: client_msg_id.to_owned(),
-        },
-        Error::SlackApi { code, .. }
-            if matches!(code.as_str(), "fatal_error" | "internal_error") =>
-        {
-            Error::PublicationUncertain {
-                client_msg_id: client_msg_id.to_owned(),
-            }
         }
-        definitive => definitive,
+    } else {
+        error
     }
 }
 
@@ -3265,7 +3379,7 @@ fn normalize_message(channel: &str, message: RawMessage, method: &'static str) -
     })
 }
 
-fn reaction_error_is_ambiguous(error: &Error) -> bool {
+fn mutation_error_is_ambiguous(error: &Error) -> bool {
     matches!(
         error,
         Error::HttpStatus { .. }
@@ -3276,28 +3390,6 @@ fn reaction_error_is_ambiguous(error: &Error) -> bool {
     ) || matches!(
         error,
         Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
-    )
-}
-
-fn draft_mutation_error_is_ambiguous(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::HttpStatus { .. }
-            | Error::ResponseTooLarge { .. }
-            | Error::InvalidResponse { .. }
-            | Error::Timeout { .. }
-            | Error::Transport { .. }
-    ) || matches!(
-        error,
-        Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
-    )
-}
-
-fn file_is_absent(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::SlackApi { method: "files.info", code }
-            if matches!(code.as_str(), "file_not_found" | "file_deleted")
     )
 }
 
@@ -3398,20 +3490,6 @@ fn validate_upload_input(field: &'static str, value: &str, maximum: usize) -> Re
         ));
     }
     Ok(())
-}
-
-fn upload_allocation_error_is_ambiguous(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::HttpStatus { .. }
-            | Error::ResponseTooLarge { .. }
-            | Error::InvalidResponse { .. }
-            | Error::Timeout { .. }
-            | Error::Transport { .. }
-    ) || matches!(
-        error,
-        Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
-    )
 }
 
 fn completion_has_exact_file(completion: &RawFileUploadCompletion, file_id: &str) -> bool {
@@ -3909,6 +3987,16 @@ mod tests {
                 None
             }
         })
+    }
+
+    fn assert_creation_uncertain_matches_request(error: Error, calls: &Mutex<Vec<DraftCall>>) {
+        let Error::DraftCreationUncertain { client_msg_id } = error else {
+            panic!("expected a structured uncertain creation");
+        };
+        assert_eq!(
+            last_created_client_msg_id(calls).as_deref(),
+            Some(client_msg_id.as_str())
+        );
     }
 
     #[async_trait]
@@ -4564,7 +4652,7 @@ mod tests {
     }
 
     fn service(api: impl SlackApi + 'static) -> SlackService {
-        let config = Config::for_test(Url::parse("http://127.0.0.1:1234").unwrap(), 1024);
+        let config = Config::for_test(Url::parse("http://127.0.0.1:1234").unwrap(), 1024 * 1024);
         let mut service = SlackService::new(api, &config);
         service.now_millis = || Ok("9000123".into());
         service.upload_reconciliation_delays_ms = &[0];
@@ -4905,9 +4993,10 @@ mod tests {
                 draft: updated.clone(),
             },
         ]));
-        api.draft_create = RawDraftResponse {
-            draft: raw_draft("DR-created", "4000", "C123", "created"),
-        };
+        let mut created = raw_draft("DR-created", "4000", "C123", "created");
+        created.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        created.blocks = Some(render_markdown("**created**").unwrap().blocks);
+        api.draft_create = RawDraftResponse { draft: created };
         api.draft_update = RawDraftResponse { draft: updated };
         let calls = api.draft_calls.clone();
         let service = service(api);
@@ -5016,9 +5105,9 @@ mod tests {
             RawDraftResponse { draft: updated },
             RawDraftResponse { draft: existing },
         ]));
-        api.draft_create = RawDraftResponse {
-            draft: raw_self_dm_draft("DR-created", "3000", "created"),
-        };
+        let mut created = raw_self_dm_draft("DR-created", "3000", "created");
+        created.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        api.draft_create = RawDraftResponse { draft: created };
         api.draft_update = RawDraftResponse {
             draft: raw_self_dm_draft("DR-existing", "2001", "transient"),
         };
@@ -5202,16 +5291,132 @@ mod tests {
 
         for (draft, requested_thread, requested_broadcast) in cases {
             let mut api = fake_api();
+            let mut draft = draft;
+            draft.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
             api.draft_create = RawDraftResponse { draft };
-            assert!(matches!(
-                service(api)
-                    .create_draft("D123", requested_thread, requested_broadcast, "synthetic")
-                    .await,
-                Err(Error::InvalidResponse {
-                    method: "drafts.create"
-                })
-            ));
+            let calls = api.draft_calls.clone();
+            let error = service(api)
+                .create_draft("D123", requested_thread, requested_broadcast, "synthetic")
+                .await
+                .unwrap_err();
+            assert_creation_uncertain_matches_request(error, &calls);
         }
+    }
+
+    #[tokio::test]
+    async fn text_draft_creation_rejects_each_mismatched_acknowledgement_dimension() {
+        for mismatch in ["client_msg_id", "file_ids", "blocks"] {
+            let mut response = raw_draft("DR-created", "1000", "C123", "synthetic");
+            response.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+            match mismatch {
+                "client_msg_id" => {
+                    response.client_msg_id = Some("00000000-0000-4000-8000-000000000002".into());
+                }
+                "file_ids" => response.file_ids = vec!["F123".into()],
+                "blocks" => {
+                    response.blocks = Some(render_markdown("different").unwrap().blocks);
+                }
+                _ => unreachable!(),
+            }
+            let mut api = fake_api();
+            api.draft_create = RawDraftResponse { draft: response };
+            let calls = api.draft_calls.clone();
+
+            let error = service(api)
+                .create_draft("C123", None, false, "synthetic")
+                .await
+                .unwrap_err();
+
+            assert_creation_uncertain_matches_request(error, &calls);
+        }
+    }
+
+    #[tokio::test]
+    async fn text_draft_creation_reconciles_ambiguous_or_mismatched_acknowledgements() {
+        for response in ["timeout", "mismatched"] {
+            let mut exact = raw_draft("DR-created", "1000", "C123", "synthetic");
+            exact.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+            let mut api = fake_api();
+            api.drafts_page = active_drafts(vec![exact]);
+            if response == "timeout" {
+                api.draft_create_error = Some("timeout");
+            } else {
+                api.draft_create = RawDraftResponse {
+                    draft: raw_draft("DR-unrelated", "1000", "C999", "unrelated"),
+                };
+            }
+            let calls = api.draft_calls.clone();
+
+            let created = service(api)
+                .create_draft("C123", None, false, "synthetic")
+                .await
+                .unwrap();
+
+            assert_eq!(created.id, "DR-created");
+            let calls = calls.lock().unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| matches!(call, DraftCall::Create { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| matches!(call, DraftCall::List { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unresolved_text_draft_creation_retains_the_client_id_without_retrying() {
+        let mut api = fake_api();
+        api.draft_create_error = Some("timeout");
+        let calls = api.draft_calls.clone();
+
+        let error = service(api)
+            .create_draft("C123", None, false, "synthetic")
+            .await
+            .unwrap_err();
+        assert_creation_uncertain_matches_request(error, &calls);
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Create { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, DraftCall::List { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_text_draft_creation_reconciliation_stays_uncertain() {
+        let mut first = raw_draft("DR-first", "1000", "C123", "synthetic");
+        first.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        let mut second = raw_draft("DR-second", "1001", "C123", "synthetic");
+        second.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
+        let mut api = fake_api();
+        api.draft_create_error = Some("timeout");
+        api.drafts_page = active_drafts(vec![first, second]);
+        let calls = api.draft_calls.clone();
+
+        let error = service(api)
+            .create_draft("C123", None, false, "synthetic")
+            .await
+            .unwrap_err();
+
+        assert_creation_uncertain_matches_request(error, &calls);
     }
 
     #[tokio::test]
@@ -5928,14 +6133,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deletes_only_a_proved_draft_owned_file_and_reconciles_ambiguity() {
-        for (ambiguous, terminal_code) in [
-            (false, "file_not_found"),
-            (false, "file_deleted"),
-            (true, "file_not_found"),
-            (true, "file_deleted"),
-        ] {
+    async fn one_file_draft_deletion_always_preserves_the_file() {
+        for ambiguous in [false, true] {
             let draft = raw_file_draft("DR-file", "900", "C123", "delete", "FPRIVATE");
+            let concurrent = raw_file_draft("DR-concurrent", "901", "C123", "other", "FPRIVATE");
             let mut api = fake_api();
             api.draft_infos = Mutex::new(VecDeque::from([
                 RawDraftResponse {
@@ -5947,42 +6148,37 @@ mod tests {
             ]));
             api.draft_pages = Mutex::new(VecDeque::from([
                 active_drafts(vec![draft]),
-                active_drafts(vec![]),
+                active_drafts(vec![concurrent]),
             ]));
-            api.file_info_results = Mutex::new(VecDeque::from([
-                Ok(RawFileResponse {
-                    file: private_draft_file("FPRIVATE"),
-                }),
-                Err(Error::SlackApi {
-                    method: "files.info",
-                    code: terminal_code.into(),
-                }),
-            ]));
+            api.file_response = RawFileResponse {
+                file: private_draft_file("FPRIVATE"),
+            };
             api.draft_delete_ambiguous = ambiguous;
             let calls = api.draft_calls.clone();
+            let file_info_calls = api.file_info_calls.clone();
             let service = service(api);
 
             let report = service.delete_draft("DR-file", true).await.unwrap();
             assert_eq!(report.file_id.as_deref(), Some("FPRIVATE"));
-            assert_eq!(report.file_deleted, Some(true));
+            assert_eq!(report.file_deleted, Some(false));
+            let calls = calls.lock().unwrap();
             assert_eq!(
                 calls
-                    .lock()
-                    .unwrap()
                     .iter()
                     .filter(|call| matches!(call, DraftCall::Delete { .. }))
                     .count(),
                 1
             );
-            assert!(calls.lock().unwrap().iter().any(|call| {
+            assert!(calls.iter().any(|call| {
                 matches!(
                     call,
                     DraftCall::Delete {
-                        skip_file_deletion: false,
+                        skip_file_deletion: true,
                         ..
                     }
                 )
             }));
+            assert_eq!(file_info_calls.lock().unwrap().as_slice(), ["FPRIVATE"]);
         }
     }
 
@@ -6032,6 +6228,68 @@ mod tests {
                 .filter(|call| matches!(call, DraftCall::List { .. }))
                 .count(),
             7
+        );
+        assert!(calls.iter().any(|call| {
+            matches!(
+                call,
+                DraftCall::Delete {
+                    skip_file_deletion: true,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn text_draft_delete_reconciles_ambiguity_or_reports_uncertain() {
+        let current = raw_draft("DR-text", "920", "C123", "delete");
+        let mut absent = fake_api();
+        absent.draft_info = RawDraftResponse {
+            draft: current.clone(),
+        };
+        absent.drafts_page = active_drafts(vec![]);
+        absent.draft_delete_ambiguous = true;
+        let calls = absent.draft_calls.clone();
+
+        let report = service(absent).delete_draft("DR-text", true).await.unwrap();
+        assert!(report.deleted);
+        assert_eq!(report.file_id, None);
+        assert_eq!(report.file_deleted, None);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            1
+        );
+
+        let mut unresolved = fake_api();
+        unresolved.draft_info = RawDraftResponse {
+            draft: current.clone(),
+        };
+        unresolved.drafts_page = active_drafts(vec![current]);
+        unresolved.draft_delete_ambiguous = true;
+        let calls = unresolved.draft_calls.clone();
+        let mut service = service(unresolved);
+        service.draft_reconciliation_delays_ms = &[0, 0, 0, 0, 0, 0];
+
+        assert!(matches!(
+            service.delete_draft("DR-text", true).await,
+            Err(Error::DraftMutationUncertain {
+                action: "delete",
+                ..
+            })
+        ));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| matches!(call, DraftCall::Delete { .. }))
+                .count(),
+            1
         );
     }
 
@@ -6790,6 +7048,10 @@ mod tests {
         assert_eq!(report.total_unread_conversations, 3);
         assert!(report.has_more_conversations);
         assert_eq!(
+            report.truncation_reason,
+            Some(InboxTruncationReason::ConversationLimit)
+        );
+        assert_eq!(
             report
                 .conversations
                 .iter()
@@ -6843,6 +7105,7 @@ mod tests {
 
         assert_eq!(report.total_unread_conversations, 1);
         assert!(!report.has_more_conversations);
+        assert_eq!(report.truncation_reason, None);
         assert_eq!(report.conversations.len(), 1);
         assert_eq!(
             report.conversations[0].conversation.kind,
@@ -6877,6 +7140,112 @@ mod tests {
         assert!(!report.has_more_conversations);
         assert!(report.threads.has_unreads);
         assert_eq!(report.threads.mention_count, 4);
+        assert_eq!(report.truncation_reason, None);
+        assert!(conversation_calls.lock().unwrap().is_empty());
+        assert!(history_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_caps_the_complete_report_and_stops_after_the_first_oversized_history() {
+        let make_api = || {
+            let mut api = fake_api();
+            api.counts.channels = vec![
+                entry("CAAA", true, 3),
+                entry("CBBB", true, 2),
+                entry("CCCC", true, 1),
+            ];
+            api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+                channels: vec![
+                    raw_conversation("CAAA", "alpha"),
+                    raw_conversation("CBBB", "beta"),
+                    raw_conversation("CCCC", "gamma"),
+                ],
+                ..RawConversationsPage::default()
+            }]));
+            api.history.messages = vec![raw_message(
+                "100.000001",
+                "a bounded synthetic message whose serialized size is intentionally nontrivial",
+            )];
+            api
+        };
+
+        let full_report = service(make_api()).inbox(3, 1).await.unwrap();
+        let mut one_conversation_report = full_report.clone();
+        one_conversation_report.conversations.truncate(1);
+        one_conversation_report.has_more_conversations = true;
+        one_conversation_report.truncation_reason = Some(InboxTruncationReason::ByteLimit);
+        let byte_limit = serde_json::to_vec_pretty(&one_conversation_report)
+            .unwrap()
+            .len();
+
+        let api = make_api();
+        let history_calls = api.history_calls.clone();
+        let mut bounded_service = service(api);
+        bounded_service.inbox_byte_limit = byte_limit;
+        let report = bounded_service.inbox(3, 1).await.unwrap();
+
+        assert_eq!(report.conversations.len(), 1);
+        assert!(report.has_more_conversations);
+        assert_eq!(
+            report.truncation_reason,
+            Some(InboxTruncationReason::ByteLimit)
+        );
+        assert!(serde_json::to_vec_pretty(&report).unwrap().len() <= byte_limit);
+        assert_eq!(
+            history_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| call.channel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CAAA", "CBBB"]
+        );
+
+        let mut two_conversation_report = full_report;
+        two_conversation_report.conversations.truncate(2);
+        two_conversation_report.has_more_conversations = true;
+        two_conversation_report.truncation_reason = Some(InboxTruncationReason::ByteLimit);
+        let boundary_limit = serde_json::to_vec_pretty(&two_conversation_report)
+            .unwrap()
+            .len();
+        two_conversation_report.truncation_reason = Some(InboxTruncationReason::ConversationLimit);
+        assert!(
+            serde_json::to_vec_pretty(&two_conversation_report)
+                .unwrap()
+                .len()
+                > boundary_limit
+        );
+
+        let api = make_api();
+        let history_calls = api.history_calls.clone();
+        let mut bounded_service = service(api);
+        bounded_service.inbox_byte_limit = boundary_limit;
+        let report = bounded_service.inbox(2, 1).await.unwrap();
+
+        assert_eq!(report.conversations.len(), 1);
+        assert_eq!(
+            report.truncation_reason,
+            Some(InboxTruncationReason::ByteLimit)
+        );
+        assert!(serde_json::to_vec_pretty(&report).unwrap().len() <= boundary_limit);
+        assert_eq!(history_calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn inbox_fails_closed_when_even_empty_metadata_exceeds_the_byte_limit() {
+        let api = fake_api();
+        let conversation_calls = api.conversation_calls.clone();
+        let history_calls = api.history_calls.clone();
+        let mut bounded_service = service(api);
+        bounded_service.inbox_byte_limit = 1;
+
+        assert!(matches!(
+            bounded_service.inbox(1, 1).await,
+            Err(Error::ResponseTooLarge {
+                method: "inbox",
+                limit: 1
+            })
+        ));
         assert!(conversation_calls.lock().unwrap().is_empty());
         assert!(history_calls.lock().unwrap().is_empty());
     }
