@@ -2041,6 +2041,8 @@ mod tests {
                 thread_ts: None,
                 author_id: Some("U456".into()),
                 author_name: None,
+                author_display_name: None,
+                author_resolution: crate::model::AuthorResolution::Unresolved,
                 text: "hello\r\x1b".into(),
                 blocks: None,
                 attachments: None,

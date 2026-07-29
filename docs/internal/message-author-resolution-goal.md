@@ -132,7 +132,7 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: Deliver bounded typed author resolution.
+- [x] Milestone 1: Deliver bounded typed author resolution.
 - [ ] Milestone 2: Deliver ergonomic CLI/MCP behavior and operator guidance.
 
 ### Checkpoint Protocol
@@ -180,7 +180,23 @@ cargo test --locked service::tests
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Status: Not started.
+Status: Complete (2026-07-29). Typed message and search results now preserve
+stable IDs and expose bounded names, display names, and `provided`,
+`directory`, `not_attempted`, `unresolved`, `incomplete`, `unavailable`, or
+`unknown` resolution state. `not_attempted` keeps inbox and write
+acknowledgements truthful without adding auxiliary reads. Name-based routing
+reuses its directory; Slack-shaped routes scan only when unresolved IDs need
+enrichment. Unusable supplied names become absent and take the normal fallback
+path. Auxiliary directory errors preserve the message as `unavailable`, while
+name-routing errors retain their existing failure behavior.
+
+Verification passed `cargo fmt --all -- --check`,
+`cargo test --locked service::tests` (116 passed),
+`cargo clippy --locked --all-targets -- -D warnings`, and `git diff --check`.
+The retained reviewer found two blocking truthfulness defects: unusable
+supplied names discarded primary messages, and unenriched inbox/send results
+claimed a complete miss. Repairs made unusable names fall back safely and
+introduced `not_attempted`; re-review reported no blocking findings.
 
 ## Milestone 2: Ergonomic CLI/MCP Behavior And Guidance
 

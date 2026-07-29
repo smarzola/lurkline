@@ -15,7 +15,7 @@ use crate::{
     local_file::{BoundedDownload, DownloadDurability, UploadPass, UploadSource},
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     model::{
-        ClientCountsPayload, Conversation, ConversationKind, ConversationPage,
+        AuthorResolution, ClientCountsPayload, Conversation, ConversationKind, ConversationPage,
         ConversationSearchReport, ConversationSearchTruncationReason, CustomEmoji, CustomEmojiKind,
         CustomEmojiList, DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport,
         DraftDestination, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
@@ -393,6 +393,16 @@ struct VerifiedFileDraft {
 struct UserDirectory {
     users: HashMap<String, User>,
     complete: bool,
+}
+
+struct ResolvedNamedConversation {
+    conversation: Conversation,
+    user_directory: UserDirectory,
+}
+
+enum AuthorDirectory {
+    Loaded(UserDirectory),
+    Unavailable,
 }
 
 impl SlackService {
@@ -1946,8 +1956,12 @@ impl SlackService {
                 "must not be later than before",
             ));
         }
+        let mut user_directory = None;
         if let Some(reference) = conversation {
-            let conversation = self.resolve_search_conversation(reference).await?;
+            let (conversation, resolved_user_directory) = self
+                .resolve_search_conversation_for_message_read(reference)
+                .await?;
+            user_directory = resolved_user_directory;
             let target = if conversation.kind == ConversationKind::DirectMessage {
                 format!(
                     "<@{}>",
@@ -2013,7 +2027,9 @@ impl SlackService {
                 method: "search.messages",
             });
         }
-        let matches = normalize_search_matches(raw.messages.matches)?;
+        let mut matches = normalize_search_matches(raw.messages.matches)?;
+        self.enrich_search_authors(&mut matches, user_directory)
+            .await;
         Ok(MessageSearchPage {
             query: applied_query,
             has_more: next_cursor.is_some(),
@@ -2031,8 +2047,11 @@ impl SlackService {
     ) -> Result<MessagePage> {
         validate_limit("limit", limit, MAX_MESSAGES)?;
         validate_cursor(cursor)?;
-        let channel = self.resolve_conversation_id(channel).await?;
-        self.read_channel_by_id(&channel, cursor, limit).await
+        let (channel, user_directory) = self.resolve_conversation_for_message_read(channel).await?;
+        let mut page = self.read_channel_by_id(&channel, cursor, limit).await?;
+        self.enrich_message_authors(&mut page.messages, user_directory)
+            .await;
+        Ok(page)
     }
 
     async fn read_channel_by_id(
@@ -2067,7 +2086,7 @@ impl SlackService {
         validate_timestamp("thread_ts", thread_ts)?;
         validate_limit("limit", limit, MAX_MESSAGES)?;
         validate_cursor(cursor)?;
-        let channel = self.resolve_conversation_id(channel).await?;
+        let (channel, user_directory) = self.resolve_conversation_for_message_read(channel).await?;
         let raw = self
             .api
             .conversation_replies(&channel, thread_ts, cursor, limit)
@@ -2076,10 +2095,14 @@ impl SlackService {
         let next_cursor =
             response_cursor("conversations.replies", raw.response_metadata.next_cursor)?;
         reject_repeated_cursor("conversations.replies", cursor, next_cursor.as_deref())?;
+        let mut messages =
+            normalize_messages(&channel, raw.messages, limit, "conversations.replies")?;
+        self.enrich_message_authors(&mut messages, user_directory)
+            .await;
         Ok(ThreadPage {
             channel_id: channel.clone(),
             thread_ts: thread_ts.to_owned(),
-            messages: normalize_messages(&channel, raw.messages, limit, "conversations.replies")?,
+            messages,
             has_more: raw.has_more || next_cursor.is_some() || locally_truncated,
             next_cursor,
         })
@@ -2087,8 +2110,11 @@ impl SlackService {
 
     pub(crate) async fn get_message(&self, channel: &str, message_ts: &str) -> Result<Message> {
         validate_timestamp("message_ts", message_ts)?;
-        let channel = self.resolve_conversation_id(channel).await?;
-        self.get_message_by_id(&channel, message_ts).await
+        let (channel, user_directory) = self.resolve_conversation_for_message_read(channel).await?;
+        let mut message = self.get_message_by_id(&channel, message_ts).await?;
+        self.enrich_message_authors(std::slice::from_mut(&mut message), user_directory)
+            .await;
+        Ok(message)
     }
 
     async fn get_message_by_id(&self, channel: &str, message_ts: &str) -> Result<Message> {
@@ -2202,14 +2228,43 @@ impl SlackService {
         Ok(self.resolve_named_conversation(reference).await?.id)
     }
 
-    async fn resolve_search_conversation(&self, reference: &str) -> Result<Conversation> {
+    async fn resolve_conversation_for_message_read(
+        &self,
+        reference: &str,
+    ) -> Result<(String, Option<UserDirectory>)> {
         if is_slack_shaped_conversation_id(reference) {
-            return self.find_conversation_by_id(reference).await;
+            return Ok((reference.to_owned(), None));
         }
-        self.resolve_named_conversation(reference).await
+        let resolved = self
+            .resolve_named_conversation_with_directory(reference)
+            .await?;
+        Ok((resolved.conversation.id, Some(resolved.user_directory)))
+    }
+
+    async fn resolve_search_conversation_for_message_read(
+        &self,
+        reference: &str,
+    ) -> Result<(Conversation, Option<UserDirectory>)> {
+        if is_slack_shaped_conversation_id(reference) {
+            return Ok((self.find_conversation_by_id(reference).await?, None));
+        }
+        let resolved = self
+            .resolve_named_conversation_with_directory(reference)
+            .await?;
+        Ok((resolved.conversation, Some(resolved.user_directory)))
     }
 
     async fn resolve_named_conversation(&self, reference: &str) -> Result<Conversation> {
+        Ok(self
+            .resolve_named_conversation_with_directory(reference)
+            .await?
+            .conversation)
+    }
+
+    async fn resolve_named_conversation_with_directory(
+        &self,
+        reference: &str,
+    ) -> Result<ResolvedNamedConversation> {
         let needle = validate_conversation_reference(reference)?.to_lowercase();
         let user_directory = self.load_user_directory().await?;
         let mut cursor: Option<String> = None;
@@ -2248,8 +2303,11 @@ impl SlackService {
                         limit: USERS_PAGE_SIZE * MAX_USER_PAGES,
                     });
                 }
-                return matched.ok_or(Error::NotFound {
-                    resource: "Slack conversation",
+                return Ok(ResolvedNamedConversation {
+                    conversation: matched.ok_or(Error::NotFound {
+                        resource: "Slack conversation",
+                    })?,
+                    user_directory,
                 });
             };
             if !seen_cursors.insert(next.clone()) {
@@ -2373,6 +2431,62 @@ impl SlackService {
             .into_iter()
             .map(|conversation| (conversation.id.clone(), conversation))
             .collect())
+    }
+
+    async fn enrich_message_authors(
+        &self,
+        messages: &mut [Message],
+        user_directory: Option<UserDirectory>,
+    ) {
+        if !messages.iter().any(message_author_needs_directory) {
+            return;
+        }
+        let directory = self.author_directory(user_directory).await;
+        for message in messages
+            .iter_mut()
+            .filter(|message| message_author_needs_directory(message))
+        {
+            enrich_author(
+                message.author_id.as_deref(),
+                &mut message.author_name,
+                &mut message.author_display_name,
+                &mut message.author_resolution,
+                &directory,
+            );
+        }
+    }
+
+    async fn enrich_search_authors(
+        &self,
+        messages: &mut [MessageSearchMatch],
+        user_directory: Option<UserDirectory>,
+    ) {
+        if !messages.iter().any(search_author_needs_directory) {
+            return;
+        }
+        let directory = self.author_directory(user_directory).await;
+        for message in messages
+            .iter_mut()
+            .filter(|message| search_author_needs_directory(message))
+        {
+            enrich_author(
+                message.author_id.as_deref(),
+                &mut message.author_name,
+                &mut message.author_display_name,
+                &mut message.author_resolution,
+                &directory,
+            );
+        }
+    }
+
+    async fn author_directory(&self, user_directory: Option<UserDirectory>) -> AuthorDirectory {
+        if let Some(user_directory) = user_directory {
+            return AuthorDirectory::Loaded(user_directory);
+        }
+        match self.load_user_directory().await {
+            Ok(user_directory) => AuthorDirectory::Loaded(user_directory),
+            Err(_) => AuthorDirectory::Unavailable,
+        }
     }
 
     async fn load_user_directory(&self) -> Result<UserDirectory> {
@@ -2573,15 +2687,8 @@ fn normalize_search_matches(
                     method: "search.messages",
                 });
             }
-            let author_name = raw.username.filter(|value| !value.is_empty());
-            if author_name
-                .as_deref()
-                .is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control))
-            {
-                return Err(Error::InvalidResponse {
-                    method: "search.messages",
-                });
-            }
+            let author_name = normalize_message_author_name(raw.username);
+            let author_resolution = initial_author_resolution(&author_id, &author_name);
             let permalink = raw.permalink.filter(|value| !value.is_empty());
             if permalink
                 .as_deref()
@@ -2598,6 +2705,8 @@ fn normalize_search_matches(
                 thread_ts: raw.thread_ts,
                 author_id,
                 author_name,
+                author_display_name: None,
+                author_resolution,
                 text: raw.text,
                 blocks: raw.blocks,
                 attachments: normalize_attachments(raw.attachments, "search.messages")?,
@@ -3362,13 +3471,96 @@ fn normalize_custom_emoji(name: String, value: String) -> Result<CustomEmoji> {
     })
 }
 
+fn message_author_needs_directory(message: &Message) -> bool {
+    message.author_resolution == AuthorResolution::NotAttempted
+}
+
+fn search_author_needs_directory(message: &MessageSearchMatch) -> bool {
+    message.author_resolution == AuthorResolution::NotAttempted
+}
+
+fn enrich_author(
+    author_id: Option<&str>,
+    author_name: &mut Option<String>,
+    author_display_name: &mut Option<String>,
+    author_resolution: &mut AuthorResolution,
+    directory: &AuthorDirectory,
+) {
+    let Some(author_id) = author_id else {
+        *author_resolution = AuthorResolution::Unknown;
+        return;
+    };
+    let AuthorDirectory::Loaded(directory) = directory else {
+        *author_resolution = AuthorResolution::Unavailable;
+        return;
+    };
+    if let Some(user) = directory.users.get(author_id) {
+        *author_name = directory_author_label(&user.name);
+        *author_display_name = directory_author_label(&user.display_name)
+            .or_else(|| directory_author_label(&user.real_name));
+        if author_name.is_some() || author_display_name.is_some() {
+            *author_resolution = AuthorResolution::Directory;
+            return;
+        }
+    }
+    *author_resolution = if directory.complete {
+        AuthorResolution::Unresolved
+    } else {
+        AuthorResolution::Incomplete
+    };
+}
+
+fn directory_author_label(value: &str) -> Option<String> {
+    let value = value.trim();
+    is_valid_author_label(value).then(|| value.to_owned())
+}
+
+fn normalize_message_author_name(author_name: Option<String>) -> Option<String> {
+    let author_name = author_name?;
+    if author_name.trim().is_empty() || !is_valid_author_label(&author_name) {
+        return None;
+    }
+    Some(author_name)
+}
+
+fn is_valid_author_label(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn initial_author_resolution(
+    author_id: &Option<String>,
+    author_name: &Option<String>,
+) -> AuthorResolution {
+    if author_name.is_some() {
+        AuthorResolution::Provided
+    } else if author_id.is_some() {
+        AuthorResolution::NotAttempted
+    } else {
+        AuthorResolution::Unknown
+    }
+}
+
 fn normalize_message(channel: &str, message: RawMessage, method: &'static str) -> Result<Message> {
+    let author_id = message
+        .user
+        .or(message.bot_id)
+        .filter(|value| !value.is_empty());
+    if author_id
+        .as_deref()
+        .is_some_and(|value| !is_valid_user_id(value))
+    {
+        return Err(Error::InvalidResponse { method });
+    }
+    let author_name = normalize_message_author_name(message.username);
+    let author_resolution = initial_author_resolution(&author_id, &author_name);
     Ok(Message {
         channel_id: channel.to_owned(),
         ts: message.ts,
         thread_ts: message.thread_ts,
-        author_id: message.user.or(message.bot_id),
-        author_name: message.username,
+        author_id,
+        author_name,
+        author_display_name: None,
+        author_resolution,
         text: message.text,
         blocks: message.blocks,
         attachments: normalize_attachments(message.attachments, method)?,
@@ -3850,6 +4042,8 @@ mod tests {
         conversation_calls: Arc<Mutex<Vec<ConversationCall>>>,
         conversation_pages: Mutex<VecDeque<RawConversationsPage>>,
         user_pages: Mutex<VecDeque<RawUsersPage>>,
+        user_calls: Arc<Mutex<Vec<UserCall>>>,
+        user_list_error: bool,
         drafts_page: RawDraftsPage,
         draft_pages: Mutex<VecDeque<RawDraftsPage>>,
         draft_info: RawDraftResponse,
@@ -3917,6 +4111,12 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ConversationCall {
+        cursor: Option<String>,
+        limit: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct UserCall {
         cursor: Option<String>,
         limit: usize,
     }
@@ -4087,7 +4287,14 @@ mod tests {
             Ok(self.search.clone())
         }
 
-        async fn users_list(&self, _cursor: Option<&str>, _limit: usize) -> Result<RawUsersPage> {
+        async fn users_list(&self, cursor: Option<&str>, limit: usize) -> Result<RawUsersPage> {
+            self.user_calls.lock().unwrap().push(UserCall {
+                cursor: cursor.map(str::to_owned),
+                limit,
+            });
+            if self.user_list_error {
+                return Err(Error::Authentication);
+            }
             Ok(self
                 .user_pages
                 .lock()
@@ -4599,6 +4806,8 @@ mod tests {
             conversation_calls: Arc::new(Mutex::new(Vec::new())),
             conversation_pages: Mutex::new(VecDeque::new()),
             user_pages: Mutex::new(VecDeque::new()),
+            user_calls: Arc::new(Mutex::new(Vec::new())),
+            user_list_error: false,
             drafts_page: RawDraftsPage::default(),
             draft_pages: Mutex::new(VecDeque::new()),
             draft_info: RawDraftResponse::default(),
@@ -4956,6 +5165,16 @@ mod tests {
             },
             ..RawUser::default()
         }
+    }
+
+    fn assert_single_user_directory_call(calls: &Mutex<Vec<UserCall>>) {
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[UserCall {
+                cursor: None,
+                limit: USERS_PAGE_SIZE,
+            }]
+        );
     }
 
     fn raw_conversation(id: &str, name: &str) -> RawConversation {
@@ -7799,6 +8018,10 @@ mod tests {
             channels: vec![raw_conversation("CGENERAL", "general")],
             ..RawConversationsPage::default()
         }]));
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("U123", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
         api.search = RawMessageSearchResponse {
             query: "ignored server echo".into(),
             messages: RawMessageSearchMatches {
@@ -7824,6 +8047,7 @@ mod tests {
             ..RawMessageSearchResponse::default()
         };
         let calls = api.search_calls.clone();
+        let user_calls = api.user_calls.clone();
 
         let page = service(api)
             .search_messages(
@@ -7843,6 +8067,15 @@ mod tests {
         assert_eq!(page.matches.len(), 1);
         assert_eq!(page.matches[0].channel_name, "general");
         assert_eq!(page.matches[0].thread_ts.as_deref(), Some("100.000000"));
+        assert_eq!(page.matches[0].author_name.as_deref(), Some("alice"));
+        assert_eq!(
+            page.matches[0].author_display_name.as_deref(),
+            Some("Alice Example")
+        );
+        assert_eq!(
+            page.matches[0].author_resolution,
+            AuthorResolution::Directory
+        );
         assert_eq!(page.total, 2);
         assert!(page.has_more);
         assert_eq!(page.next_cursor.as_deref(), Some("next-search-page"));
@@ -7854,6 +8087,7 @@ mod tests {
                 limit: 1,
             }]
         );
+        assert_single_user_directory_call(&user_calls);
     }
 
     #[tokio::test]
@@ -9554,6 +9788,324 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolves_message_authors_in_one_bounded_directory_batch() {
+        let mut api = fake_api();
+        let first = raw_message("100.000001", "first");
+        let mut second = raw_message("100.000002", "second");
+        second.user = Some("U456".into());
+        api.history.messages = vec![first, second];
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![
+                raw_user("U123", "alice", "Alice Example"),
+                raw_user("U456", "bob", "Bob Example"),
+            ],
+            ..RawUsersPage::default()
+        }]));
+        let user_calls = api.user_calls.clone();
+
+        let page = service(api).read_channel("C123", None, 2).await.unwrap();
+
+        assert_single_user_directory_call(&user_calls);
+        assert_eq!(page.messages[0].author_id.as_deref(), Some("U123"));
+        assert_eq!(page.messages[0].author_name.as_deref(), Some("alice"));
+        assert_eq!(
+            page.messages[0].author_display_name.as_deref(),
+            Some("Alice Example")
+        );
+        assert_eq!(
+            page.messages[0].author_resolution,
+            AuthorResolution::Directory
+        );
+        assert_eq!(page.messages[1].author_name.as_deref(), Some("bob"));
+        assert_eq!(
+            page.messages[1].author_display_name.as_deref(),
+            Some("Bob Example")
+        );
+        assert_eq!(
+            page.messages[1].author_resolution,
+            AuthorResolution::Directory
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_thread_authors_without_per_message_requests() {
+        let mut api = fake_api();
+        let first = raw_message("100.000001", "root");
+        let mut second = raw_message("100.000002", "reply");
+        second.thread_ts = Some("100.000001".into());
+        api.replies.messages = vec![first, second];
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("U123", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
+        let user_calls = api.user_calls.clone();
+
+        let page = service(api)
+            .read_thread("C123", "100.000001", None, 2)
+            .await
+            .unwrap();
+
+        assert_single_user_directory_call(&user_calls);
+        assert_eq!(page.messages.len(), 2);
+        assert!(
+            page.messages
+                .iter()
+                .all(|message| message.author_name.as_deref() == Some("alice"))
+        );
+    }
+
+    #[tokio::test]
+    async fn directly_named_and_authorless_messages_skip_auxiliary_resolution() {
+        let mut api = fake_api();
+        let mut provided = raw_message("100.000001", "provided");
+        provided.user = None;
+        provided.bot_id = Some("B123".into());
+        provided.username = Some("build-bot".into());
+        let authorless = RawMessage {
+            ts: "100.000002".into(),
+            text: "system event".into(),
+            ..RawMessage::default()
+        };
+        api.history.messages = vec![provided, authorless];
+        let user_calls = api.user_calls.clone();
+
+        let page = service(api).read_channel("C123", None, 2).await.unwrap();
+
+        assert!(user_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            page.messages[0].author_resolution,
+            AuthorResolution::Provided
+        );
+        assert_eq!(page.messages[0].author_name.as_deref(), Some("build-bot"));
+        assert_eq!(
+            page.messages[1].author_resolution,
+            AuthorResolution::Unknown
+        );
+        assert_eq!(page.messages[1].author_id, None);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_author_failure_preserves_an_addressable_message() {
+        let mut api = fake_api();
+        let mut message = raw_message("100.000001", "still readable");
+        message.username = Some("unsafe\nname".into());
+        api.history.messages = vec![message];
+        api.user_list_error = true;
+        let user_calls = api.user_calls.clone();
+
+        let page = service(api).read_channel("C123", None, 1).await.unwrap();
+
+        assert_single_user_directory_call(&user_calls);
+        assert_eq!(page.messages[0].text, "still readable");
+        assert_eq!(page.messages[0].author_id.as_deref(), Some("U123"));
+        assert_eq!(
+            page.messages[0].author_resolution,
+            AuthorResolution::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_directory_resolves_scanned_users_and_marks_misses() {
+        let mut api = fake_api();
+        let first = raw_message("100.000001", "found");
+        let mut missing = raw_message("100.000002", "not scanned");
+        missing.user = Some("U999".into());
+        api.history.messages = vec![first, missing];
+        api.user_pages = Mutex::new(
+            (0..MAX_USER_PAGES)
+                .map(|page| RawUsersPage {
+                    members: if page == 0 {
+                        vec![raw_user("U123", "alice", "Alice Example")]
+                    } else {
+                        vec![]
+                    },
+                    response_metadata: RawResponseMetadata {
+                        next_cursor: format!("users-{}", page + 1),
+                    },
+                })
+                .collect(),
+        );
+        let user_calls = api.user_calls.clone();
+
+        let page = service(api).read_channel("C123", None, 2).await.unwrap();
+
+        assert_eq!(user_calls.lock().unwrap().len(), MAX_USER_PAGES);
+        assert_eq!(
+            page.messages[0].author_resolution,
+            AuthorResolution::Directory
+        );
+        assert_eq!(page.messages[0].author_name.as_deref(), Some("alice"));
+        assert_eq!(
+            page.messages[1].author_resolution,
+            AuthorResolution::Incomplete
+        );
+        assert_eq!(page.messages[1].author_name, None);
+    }
+
+    #[tokio::test]
+    async fn display_only_directory_identity_is_usable_and_bounded() {
+        let mut api = fake_api();
+        api.history.messages = vec![raw_message("100.000001", "display only")];
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("U123", "\n", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
+
+        let page = service(api).read_channel("C123", None, 1).await.unwrap();
+
+        assert_eq!(page.messages[0].author_name, None);
+        assert_eq!(
+            page.messages[0].author_display_name.as_deref(),
+            Some("Alice Example")
+        );
+        assert_eq!(
+            page.messages[0].author_resolution,
+            AuthorResolution::Directory
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_supplied_author_names_fall_back_without_losing_messages() {
+        let mut channel_api = fake_api();
+        let mut channel_message = raw_message("100.000001", "safe primary data");
+        channel_message.username = Some("bad\nname".into());
+        channel_api.history.messages = vec![channel_message];
+        channel_api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("U123", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
+        let channel = service(channel_api)
+            .read_channel("C123", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(channel.messages[0].text, "safe primary data");
+        assert_eq!(channel.messages[0].author_name.as_deref(), Some("alice"));
+        assert_eq!(
+            channel.messages[0].author_resolution,
+            AuthorResolution::Directory
+        );
+
+        let mut search_api = fake_api();
+        search_api.search = RawMessageSearchResponse {
+            messages: RawMessageSearchMatches {
+                matches: vec![RawMessageSearchMatch {
+                    channel: RawMessageSearchChannel {
+                        id: "C123".into(),
+                        name: "general".into(),
+                    },
+                    ts: "100.000001".into(),
+                    user: Some("U999".into()),
+                    username: Some("x".repeat(257)),
+                    text: "search result survives".into(),
+                    ..RawMessageSearchMatch::default()
+                }],
+                total: 1,
+                ..RawMessageSearchMatches::default()
+            },
+            ..RawMessageSearchResponse::default()
+        };
+        let search = service(search_api)
+            .search_messages("survives", None, None, None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(search.matches[0].text, "search result survives");
+        assert_eq!(search.matches[0].author_name, None);
+        assert_eq!(
+            search.matches[0].author_resolution,
+            AuthorResolution::Unresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn named_channel_and_dm_reads_reuse_the_routing_directory() {
+        let mut channel_api = fake_api();
+        channel_api.history.messages = vec![raw_message("100.000001", "channel")];
+        channel_api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("U123", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
+        channel_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("CGENERAL", "general")],
+            ..RawConversationsPage::default()
+        }]));
+        let channel_user_calls = channel_api.user_calls.clone();
+        let channel = service(channel_api)
+            .read_channel("general", None, 1)
+            .await
+            .unwrap();
+        assert_single_user_directory_call(&channel_user_calls);
+        assert_eq!(channel.messages[0].author_name.as_deref(), Some("alice"));
+
+        let mut dm_api = fake_api();
+        dm_api.history.messages = vec![raw_message("100.000001", "dm")];
+        dm_api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("U123", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
+        dm_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![RawConversation {
+                id: "D123".into(),
+                is_im: true,
+                user: Some("U123".into()),
+                ..RawConversation::default()
+            }],
+            ..RawConversationsPage::default()
+        }]));
+        let dm_user_calls = dm_api.user_calls.clone();
+        let dm = service(dm_api)
+            .read_channel("@alice", None, 1)
+            .await
+            .unwrap();
+        assert_single_user_directory_call(&dm_user_calls);
+        assert_eq!(dm.messages[0].author_name.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn named_route_failure_remains_a_routing_error() {
+        let mut api = fake_api();
+        api.history.messages = vec![raw_message("100.000001", "not addressable")];
+        api.user_list_error = true;
+        assert!(matches!(
+            service(api).read_channel("general", None, 1).await,
+            Err(Error::Authentication)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unenriched_inbox_and_sent_messages_report_not_attempted() {
+        let mut inbox_api = fake_api();
+        inbox_api.counts.channels = vec![entry("C123", true, 1)];
+        inbox_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C123", "general")],
+            ..RawConversationsPage::default()
+        }]));
+        inbox_api.history.messages = vec![raw_message("100.000001", "inbox")];
+        let user_calls = inbox_api.user_calls.clone();
+
+        let inbox = service(inbox_api).inbox(1, 1).await.unwrap();
+        assert!(user_calls.lock().unwrap().is_empty());
+        let inbox_json = serde_json::to_value(&inbox).unwrap();
+        assert_eq!(
+            inbox_json["conversations"][0]["messages"]["messages"][0]["author_resolution"],
+            "not_attempted"
+        );
+
+        let sent = normalize_sent_message(
+            "C123",
+            None,
+            "00000000-0000-4000-8000-000000000001".into(),
+            RawPostMessageResponse {
+                channel: "C123".into(),
+                ts: "100.000001".into(),
+                message: raw_message("100.000001", "sent"),
+            },
+        )
+        .unwrap();
+        let sent_json = serde_json::to_value(sent).unwrap();
+        assert_eq!(sent_json["message"]["author_resolution"], "not_attempted");
+    }
+
+    #[tokio::test]
     async fn gets_an_exact_message_from_hydrated_channel_data() {
         let mut api = fake_api();
         api.message_list.messages_data = BTreeMap::from([(
@@ -9565,11 +10117,17 @@ mod tests {
                 ],
             },
         )]);
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("U123", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
+        let user_calls = api.user_calls.clone();
         let message = service(api)
             .get_message("C123", "100.000002")
             .await
             .unwrap();
         assert_eq!(message.text, "target");
+        assert_single_user_directory_call(&user_calls);
         assert_eq!(
             serde_json::to_value(message).unwrap(),
             serde_json::json!({
@@ -9577,7 +10135,9 @@ mod tests {
                 "ts": "100.000002",
                 "thread_ts": null,
                 "author_id": "U123",
-                "author_name": null,
+                "author_name": "alice",
+                "author_display_name": "Alice Example",
+                "author_resolution": "directory",
                 "text": "target",
                 "blocks": null,
                 "attachments": null,
