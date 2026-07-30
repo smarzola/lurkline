@@ -236,7 +236,8 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Started on 2026-07-30 from
+Status: Release candidate completed locally on 2026-07-30; PR, merge, and
+release delivery remain pending. Started from
 `521d95ee1cfc53833afbd4cc8d97a2229094a71a`, exact `v0.13.0`
 `origin/main`, on `fix/nullable-user-identities`.
 
@@ -249,6 +250,36 @@ Design decisions:
   fallback. Do not add sentinel strings or serializer-only rewrites.
 - Use a readable explicit placeholder in human user rows while preserving JSON
   null and generated nullable schemas.
+
+Local release-candidate evidence:
+
+- Implementation commit
+  `35c207983d714a964b84a68620464af933f708a7` makes the raw and public
+  identity labels optional, normalizes safe values once, reuses those typed
+  options for author, mention, and unread enrichment, preserves ordinary
+  conversation fallbacks, aligns generated schemas and human output, documents
+  the compatibility change, and sets all version sources to `0.14.0`.
+- The retained adversarial reviewer found one inconsistent second-stage label
+  filter. The repair moved control-character and 256-byte enforcement into the
+  user boundary and added public-user, author, mention, unread, real-name
+  fallback, overlong-label, and literal-`"null"` regressions. Re-review was
+  clean.
+- Formatting, strict locked Clippy, all 278 library tests, 12 CLI-process
+  tests, 2 raw-MCP tests, the package-metadata test, locked release build,
+  Rust 1.88 compatibility, credential scan, and diff checks passed. The
+  sandboxed all-target attempt could not bind loopback listeners; its permitted
+  rerun passed every test.
+- Two local macOS ARM64 packages were byte-identical. Checksum, exact
+  versioned archive layout, permissions, and packaged binary readback as
+  `lurkline 0.14.0` passed.
+- The fresh context-independent audit at implementation commit `35c2079` was
+  clean across issue scope, UX, correctness, security and privacy, CLI/MCP
+  parity, schemas, compatibility, documentation, tests, code quality, and
+  release readiness.
+- An authorized read-only `sfera` smoke returned 100 typed user records,
+  including 8 genuine JSON-null display names and zero invalid identity field
+  types. Only aggregate counts were emitted; no Slack write occurred, and the
+  mode-0600 raw temporary file was removed with zero residue.
 
 ## Milestone 2: Filtered Complete Activity Scope (`v0.15.0`, #26)
 
