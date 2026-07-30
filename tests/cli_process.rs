@@ -118,6 +118,7 @@ fn version_and_help_expose_the_complete_cli_without_configuration() {
     assert!(inbox.contains("--json"));
     assert!(inbox.contains("from 1 through 50"));
     assert!(inbox.contains("from 1 through 200"));
+    assert!(inbox.contains("resolving message authors once per snapshot"));
 
     let search = stdout(&["search", "messages", "--help"]);
     for option in [

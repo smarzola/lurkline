@@ -348,6 +348,8 @@ conversation ID. Lurkline:
 2. Selects at most the requested number of unread conversations.
 3. Resolves bounded conversation metadata.
 4. Reads at most the requested recent messages for each selection.
+5. Resolves message authors through one shared bounded user directory when
+   needed, reusing the directory already loaded for any selected DM.
 
 Inbox doesn't infer exact unread message boundaries, fetch unread thread
 roots, or mark anything read. JSON reports `total_unread_conversations`,
@@ -360,6 +362,10 @@ cap reports `conversation_limit`.
 If bounded discovery can't find a selected conversation,
 `metadata_is_complete` is `false`. Treat archive, membership, privacy, and
 member-count fields as unavailable rather than authoritative in that case.
+Human-readable inbox messages prefer `@username`, then profile display name,
+then an explicitly labeled raw-ID fallback. A complete directory miss, bounded
+partial scan, or auxiliary request failure remains visible in
+`author_resolution` without discarding otherwise useful inbox messages.
 
 ## Read messages and users
 
@@ -392,10 +398,10 @@ unchanged. For either field, `null` means Slack omitted it and `[]` means Slack
 returned an explicit empty array.
 
 Message results also normalize author, thread, reaction, and file metadata.
-Channel, thread, exact-message, and search commands resolve known people
+Channel, thread, exact-message, search, and inbox commands resolve known people
 through the bounded Slack user directory. Human output shows `@username`, or a
-profile display name when no username is usable. A raw-ID fallback includes
-one of these labels:
+profile display name when no username is usable. A raw-ID fallback includes one
+of these labels:
 
 - `[unresolved]`: `author_resolution` is `unresolved`; a complete directory did
   not contain a usable identity.
@@ -405,16 +411,17 @@ one of these labels:
 - `[resolution unavailable]`: `author_resolution` is `unavailable`; the
   auxiliary directory request failed.
 - `[resolution not attempted]`: `author_resolution` is `not_attempted`; this
-  result type does not perform author enrichment, such as inbox entries and
-  sent-message acknowledgements.
+  result type does not perform author enrichment, such as sent-message
+  acknowledgements.
 
 JSON and MCP results retain `author_id` and add `author_name`,
 `author_display_name`, and `author_resolution`. The resolution value is
 `provided` for a name included on the message, `directory` for a user-directory
 match, one of the explicitly mapped fallback values above, or `unknown` when
 Slack supplied neither an ID nor a name. Lurkline performs at most one bounded
-user-directory scan for each targeted read and reuses a scan required to
-resolve a conversation name; it never looks up each message separately.
+user-directory scan for each targeted read or inbox snapshot and reuses a scan
+required to resolve a conversation name; it never looks up each message
+separately.
 
 Reaction `user_ids` can be shorter than `count`; check `user_ids_complete`
 before treating that list as exhaustive. Slack guarantees that the
@@ -909,7 +916,7 @@ The following table lists primary and auxiliary bounds:
 | Conversation list | One page of 200 | Up to 20 user pages of 200 for DMs |
 | Conversation find | 100 | 20 conversation pages and 20 user pages of 200 |
 | Message search | One page of 100 | With `--in`: 20 conversation pages; exact names can also scan 20 user pages |
-| Inbox | 50 conversations; one history page of 200 each; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages and, for DMs, 20 user pages |
+| Inbox | 50 conversations; one history page of 200 each; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages and one shared scan of up to 20 user pages when DM naming or author resolution needs it |
 | Channel history | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Thread replies | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Exact message | One message | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |

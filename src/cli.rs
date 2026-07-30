@@ -67,7 +67,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Read a bounded snapshot of conversations Slack explicitly marks unread.
+    /// Read bounded unread conversations while resolving message authors once per snapshot.
     Inbox {
         /// Maximum unread conversations to load, from 1 through 50.
         #[arg(long = "conversations", default_value_t = 10)]

@@ -764,7 +764,7 @@ impl McpServer {
         tool_result(self.service.unreads().await)
     }
 
-    /// Read a bounded snapshot of conversations Slack explicitly marks unread.
+    /// Read bounded unread conversations while resolving message authors once per snapshot.
     #[tool(
         name = "slack_read_inbox",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<InboxReport>>(),

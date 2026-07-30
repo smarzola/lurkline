@@ -172,6 +172,12 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         .iter()
         .find(|tool| tool["name"] == "slack_read_inbox")
         .unwrap();
+    assert!(
+        inbox_tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("resolving message authors once per snapshot")
+    );
     let inbox_output_schema = serde_json::to_string(&inbox_tool["outputSchema"]).unwrap();
     for expected in ["truncation_reason", "conversation_limit", "byte_limit"] {
         assert!(
