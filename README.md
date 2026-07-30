@@ -327,6 +327,30 @@ or exact name before it applies the conversation filter. Dates must be valid
 The reported total is Slack's workspace match count. Only a returned cursor
 indicates another page.
 
+## List unreads
+
+List every conversation and thread count Slack explicitly marks unread:
+
+```sh
+lurkline unreads
+```
+
+Human output keeps each stable conversation ID and adds `#channel`,
+`@username`, a profile display name, or a readable group-DM participant list.
+JSON adds nullable `name` and `display_name` fields plus a typed
+`name_resolution`: `resolved`, `inaccessible`, `incomplete`, `unnamed`, or
+`unavailable`. These states distinguish a complete discovery miss, a bounded
+scan, metadata without a safe label, and a failed or conflicting auxiliary
+lookup observed during the scan without hiding Slack's authoritative unread
+count.
+
+Naming uses one bounded conversation scan for the snapshot, stopping as soon
+as every unread ID is accounted for, and, only when a matched DM needs it, one
+shared target-aware user scan with the same early-completion rule. It never
+makes one request per result and never marks a conversation read. The inbox
+command reuses its existing conversation and user discovery for the same
+fields.
+
 ## Read the inbox
 
 Read recent context from the ten highest-priority unread conversations:
@@ -916,6 +940,7 @@ The following table lists primary and auxiliary bounds:
 | Conversation list | One page of 200 | Up to 20 user pages of 200 for DMs |
 | Conversation find | 100 | 20 conversation pages and 20 user pages of 200 |
 | Message search | One page of 100 | With `--in`: 20 conversation pages; exact names can also scan 20 user pages |
+| Unreads | Every explicit unread count in the snapshot | One scan of up to 20 conversation pages and, only for matched DMs, one shared scan of up to 20 user pages |
 | Inbox | 50 conversations; one history page of 200 each; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages and one shared scan of up to 20 user pages when DM naming or author resolution needs it |
 | Channel history | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Thread replies | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |

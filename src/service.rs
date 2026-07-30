@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     io::{self, Write},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -15,20 +15,21 @@ use crate::{
     local_file::{BoundedDownload, DownloadDurability, UploadPass, UploadSource},
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     model::{
-        AuthorResolution, ClientCountsPayload, Conversation, ConversationKind, ConversationPage,
-        ConversationSearchReport, ConversationSearchTruncationReason, CustomEmoji, CustomEmojiKind,
-        CustomEmojiList, DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport,
-        DraftDestination, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
-        FileDraftCreateReport, FileReference, FileShare, FileShareVisibility, FileUploadReport,
-        InboxConversation, InboxReport, InboxTruncationReason, Message, MessagePage,
-        MessageSearchMatch, MessageSearchPage, RawAuthTestResponse, RawConversation,
-        RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision, RawDraftsPage,
-        RawEmojiResponse, RawFile, RawFileResponse, RawFileUploadAllocation,
-        RawFileUploadCompletion, RawMessage, RawMessagePage, RawMessageSearchMatch,
-        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
-        RawReaction, RawReactionItemResponse, RawUnread, RawUser, RawUsersPage, Reaction,
-        ReactionMutationReport, SentMessage, ThreadPage, UnreadConversation, UnreadReport,
-        UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
+        AuthorResolution, ClientCountsPayload, Conversation, ConversationKind,
+        ConversationNameResolution, ConversationPage, ConversationSearchReport,
+        ConversationSearchTruncationReason, CustomEmoji, CustomEmojiKind, CustomEmojiList,
+        DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport, DraftDestination, DraftPage,
+        DraftSendReport, FileDownloadReport, FileDraftAssociation, FileDraftCreateReport,
+        FileReference, FileShare, FileShareVisibility, FileUploadReport, InboxConversation,
+        InboxReport, InboxTruncationReason, Message, MessagePage, MessageSearchMatch,
+        MessageSearchPage, RawAuthTestResponse, RawConversation, RawConversationsPage, RawDraft,
+        RawDraftResponse, RawDraftRevision, RawDraftsPage, RawEmojiResponse, RawFile,
+        RawFileResponse, RawFileUploadAllocation, RawFileUploadCompletion, RawMessage,
+        RawMessagePage, RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList,
+        RawMutationResponse, RawPostMessageResponse, RawReaction, RawReactionItemResponse,
+        RawUnread, RawUser, RawUsersPage, Reaction, ReactionMutationReport, SentMessage,
+        ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
+        UserSearchTruncationReason,
     },
 };
 
@@ -394,12 +395,55 @@ struct VerifiedFileDraft {
 
 struct UserDirectory {
     users: HashMap<String, User>,
+    conflicting_ids: HashSet<String>,
     complete: bool,
+}
+
+struct UnreadCountSnapshot {
+    team_id: String,
+    conversations: Vec<UnreadCount>,
+    threads: UnreadThreads,
+}
+
+struct UnreadCount {
+    id: String,
+    kind: ConversationKind,
+    has_unreads: bool,
+    mention_count: u64,
+    last_read: Option<String>,
+    latest: Option<String>,
+}
+
+struct ResolvedUnreadName {
+    name: Option<String>,
+    display_name: Option<String>,
+    resolution: ConversationNameResolution,
+}
+
+#[derive(Clone, Copy)]
+enum DirectoryCompletion {
+    Complete,
+    Incomplete,
+    Unavailable,
+}
+
+struct UnreadConversationDirectory {
+    conversations: HashMap<String, RawConversation>,
+    conflicting_ids: HashSet<String>,
+    completion: DirectoryCompletion,
+    user_directory: Option<UnreadUserDirectory>,
+}
+
+struct UnreadUserDirectory {
+    users: HashMap<String, User>,
+    conflicting_ids: HashSet<String>,
+    completion: DirectoryCompletion,
 }
 
 struct LoadedInboxConversations {
     conversations: HashMap<String, Conversation>,
     author_directory: Option<AuthorDirectory>,
+    conversation_scan_complete: bool,
 }
 
 struct ResolvedNamedConversation {
@@ -1723,6 +1767,27 @@ impl SlackService {
     }
 
     pub(crate) async fn unreads(&self) -> Result<UnreadReport> {
+        let counts = self.unread_counts().await?;
+        let mut names = self
+            .resolve_unread_conversation_names(&counts.conversations)
+            .await;
+        Ok(UnreadReport {
+            team_id: counts.team_id,
+            conversations: counts
+                .conversations
+                .into_iter()
+                .map(|unread| {
+                    let name = names
+                        .remove(&unread.id)
+                        .unwrap_or_else(unavailable_unread_name);
+                    named_unread(unread, name)
+                })
+                .collect(),
+            threads: counts.threads,
+        })
+    }
+
+    async fn unread_counts(&self) -> Result<UnreadCountSnapshot> {
         let counts = self.api.client_counts().await?;
         if counts
             .threads
@@ -1760,7 +1825,7 @@ impl SlackService {
                 .cmp(&left.mention_count)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        Ok(UnreadReport {
+        Ok(UnreadCountSnapshot {
             team_id: self.team_id.clone(),
             conversations,
             threads: UnreadThreads {
@@ -1782,7 +1847,7 @@ impl SlackService {
             MAX_INBOX_CONVERSATIONS,
         )?;
         validate_limit("message_limit", message_limit, MAX_MESSAGES)?;
-        let unreads = self.unreads().await?;
+        let unreads = self.unread_counts().await?;
         let total_unread_conversations = unreads.conversations.len();
         let selected = unreads
             .conversations
@@ -1812,6 +1877,13 @@ impl SlackService {
         }
         let mut byte_limited = false;
         for unread in selected {
+            let resolved_name = loaded
+                .conversations
+                .get(&unread.id)
+                .map(|conversation| {
+                    loaded_inbox_conversation_name(conversation, loaded.author_directory.as_ref())
+                })
+                .unwrap_or_else(|| unresolved_unread_name(loaded.conversation_scan_complete));
             let conversation = loaded
                 .conversations
                 .get(&unread.id)
@@ -1835,7 +1907,7 @@ impl SlackService {
             }
             report.conversations.push(InboxConversation {
                 conversation,
-                unread,
+                unread: named_unread(unread, resolved_name),
                 messages,
             });
             report.has_more_conversations = true;
@@ -1887,6 +1959,7 @@ impl SlackService {
         } else {
             UserDirectory {
                 users: HashMap::new(),
+                conflicting_ids: HashSet::new(),
                 complete: true,
             }
         };
@@ -2414,6 +2487,161 @@ impl SlackService {
         unreachable!("bounded conversation ID lookup always returns")
     }
 
+    async fn resolve_unread_conversation_names(
+        &self,
+        unreads: &[UnreadCount],
+    ) -> HashMap<String, ResolvedUnreadName> {
+        if unreads.is_empty() {
+            return HashMap::new();
+        }
+        let wanted = unreads
+            .iter()
+            .map(|unread| (unread.id.clone(), unread.kind))
+            .collect::<HashMap<_, _>>();
+        let mut conversations = HashMap::new();
+        let mut conflicting_ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut completion = DirectoryCompletion::Unavailable;
+
+        for page_index in 0..MAX_CONVERSATION_PAGES {
+            let page = match self
+                .api
+                .conversations_list(cursor.as_deref(), CONVERSATIONS_PAGE_SIZE)
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => break,
+            };
+            if page.channels.len() > CONVERSATIONS_PAGE_SIZE {
+                break;
+            }
+            for raw in page.channels {
+                if !wanted.contains_key(&raw.id) || conflicting_ids.contains(&raw.id) {
+                    continue;
+                }
+                let id = raw.id.clone();
+                match conversations.entry(id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(raw);
+                    }
+                    Entry::Occupied(entry) => {
+                        let (id, _) = entry.remove_entry();
+                        conflicting_ids.insert(id);
+                    }
+                }
+            }
+            if conversations.len() + conflicting_ids.len() == wanted.len() {
+                completion = DirectoryCompletion::Complete;
+                break;
+            }
+            let next =
+                match response_cursor("conversations.list", page.response_metadata.next_cursor) {
+                    Ok(next) => next,
+                    Err(_) => break,
+                };
+            let Some(next) = next else {
+                completion = DirectoryCompletion::Complete;
+                break;
+            };
+            if !seen_cursors.insert(next.clone()) {
+                break;
+            }
+            cursor = Some(next);
+            if page_index + 1 == MAX_CONVERSATION_PAGES {
+                completion = DirectoryCompletion::Incomplete;
+            }
+        }
+
+        let wanted_users = conversations
+            .iter()
+            .filter(|(id, conversation)| {
+                wanted.get(*id) == Some(&ConversationKind::DirectMessage)
+                    && conversation.is_im
+                    && !conversation.is_mpim
+            })
+            .filter_map(|(_, conversation)| {
+                conversation
+                    .user
+                    .as_deref()
+                    .filter(|id| is_valid_user_id(id))
+            })
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        let user_directory = if wanted_users.is_empty() {
+            None
+        } else {
+            Some(self.resolve_unread_user_directory(&wanted_users).await)
+        };
+        let directory = UnreadConversationDirectory {
+            conversations,
+            conflicting_ids,
+            completion,
+            user_directory,
+        };
+        unreads
+            .iter()
+            .map(|unread| (unread.id.clone(), resolved_unread_name(unread, &directory)))
+            .collect()
+    }
+
+    async fn resolve_unread_user_directory(&self, wanted: &HashSet<String>) -> UnreadUserDirectory {
+        let mut users = HashMap::new();
+        let mut conflicting_ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut completion = DirectoryCompletion::Unavailable;
+
+        for page_index in 0..MAX_USER_PAGES {
+            let page = match self
+                .api
+                .users_list(cursor.as_deref(), USERS_PAGE_SIZE)
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => break,
+            };
+            let (page_users, next) = match normalize_user_directory_page(page, &seen_cursors) {
+                Ok(page) => page,
+                Err(_) => break,
+            };
+            for user in page_users {
+                if !wanted.contains(&user.id) || conflicting_ids.contains(&user.id) {
+                    continue;
+                }
+                let id = user.id.clone();
+                match users.entry(id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(user);
+                    }
+                    Entry::Occupied(entry) => {
+                        let (id, _) = entry.remove_entry();
+                        conflicting_ids.insert(id);
+                    }
+                }
+            }
+            if users.len() + conflicting_ids.len() == wanted.len() {
+                completion = DirectoryCompletion::Complete;
+                break;
+            }
+            let Some(next) = next else {
+                completion = DirectoryCompletion::Complete;
+                break;
+            };
+            seen_cursors.insert(next.clone());
+            cursor = Some(next);
+            if page_index + 1 == MAX_USER_PAGES {
+                completion = DirectoryCompletion::Incomplete;
+            }
+        }
+
+        UnreadUserDirectory {
+            users,
+            conflicting_ids,
+            completion,
+        }
+    }
+
     async fn load_conversations_by_id(
         &self,
         ids: &HashSet<String>,
@@ -2422,6 +2650,7 @@ impl SlackService {
             return Ok(LoadedInboxConversations {
                 conversations: HashMap::new(),
                 author_directory: None,
+                conversation_scan_complete: true,
             });
         }
 
@@ -2429,6 +2658,7 @@ impl SlackService {
         let mut matched_ids = HashSet::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
+        let mut conversation_scan_complete = false;
 
         for page_index in 0..MAX_CONVERSATION_PAGES {
             let page = self
@@ -2453,11 +2683,13 @@ impl SlackService {
                 }
             }
             if matched_ids.len() == ids.len() {
+                conversation_scan_complete = true;
                 break;
             }
 
             let next = response_cursor("conversations.list", page.response_metadata.next_cursor)?;
             let Some(next) = next else {
+                conversation_scan_complete = true;
                 break;
             };
             if !seen_cursors.insert(next.clone()) {
@@ -2487,6 +2719,7 @@ impl SlackService {
                 .map(|conversation| (conversation.id.clone(), conversation))
                 .collect(),
             author_directory,
+            conversation_scan_complete,
         })
     }
 
@@ -2546,6 +2779,7 @@ impl SlackService {
 
     async fn scan_user_directory(&self) -> UserDirectoryScan {
         let mut users = HashMap::new();
+        let mut conflicting_ids = HashSet::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
 
@@ -2560,6 +2794,7 @@ impl SlackService {
                     return UserDirectoryScan::Interrupted {
                         directory: UserDirectory {
                             users,
+                            conflicting_ids,
                             complete: false,
                         },
                         error,
@@ -2572,6 +2807,7 @@ impl SlackService {
                     return UserDirectoryScan::Interrupted {
                         directory: UserDirectory {
                             users,
+                            conflicting_ids,
                             complete: false,
                         },
                         error,
@@ -2579,11 +2815,24 @@ impl SlackService {
                 }
             };
             for user in page_users {
-                users.insert(user.id.clone(), user);
+                if conflicting_ids.contains(&user.id) {
+                    continue;
+                }
+                let id = user.id.clone();
+                match users.entry(id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(user);
+                    }
+                    Entry::Occupied(entry) => {
+                        let (id, _) = entry.remove_entry();
+                        conflicting_ids.insert(id);
+                    }
+                }
             }
             let Some(next) = next else {
                 return UserDirectoryScan::Finished(UserDirectory {
                     users,
+                    conflicting_ids,
                     complete: true,
                 });
             };
@@ -2592,6 +2841,7 @@ impl SlackService {
             if page_index + 1 == MAX_USER_PAGES {
                 return UserDirectoryScan::Finished(UserDirectory {
                     users,
+                    conflicting_ids,
                     complete: false,
                 });
             }
@@ -2679,7 +2929,7 @@ fn normalize_conversations(
         .collect()
 }
 
-fn fallback_conversation(unread: &UnreadConversation) -> Conversation {
+fn fallback_conversation(unread: &UnreadCount) -> Conversation {
     Conversation {
         id: unread.id.clone(),
         name: unread.id.clone(),
@@ -2693,6 +2943,226 @@ fn fallback_conversation(unread: &UnreadConversation) -> Conversation {
         member_count: None,
         user_id: None,
     }
+}
+
+fn named_unread(unread: UnreadCount, name: ResolvedUnreadName) -> UnreadConversation {
+    UnreadConversation {
+        id: unread.id,
+        kind: unread.kind,
+        name: name.name,
+        display_name: name.display_name,
+        name_resolution: name.resolution,
+        has_unreads: unread.has_unreads,
+        mention_count: unread.mention_count,
+        last_read: unread.last_read,
+        latest: unread.latest,
+    }
+}
+
+fn unavailable_unread_name() -> ResolvedUnreadName {
+    ResolvedUnreadName {
+        name: None,
+        display_name: None,
+        resolution: ConversationNameResolution::Unavailable,
+    }
+}
+
+fn unread_name_with_resolution(resolution: ConversationNameResolution) -> ResolvedUnreadName {
+    ResolvedUnreadName {
+        name: None,
+        display_name: None,
+        resolution,
+    }
+}
+
+fn unresolved_unread_name(conversation_scan_complete: bool) -> ResolvedUnreadName {
+    unread_name_with_resolution(if conversation_scan_complete {
+        ConversationNameResolution::Inaccessible
+    } else {
+        ConversationNameResolution::Incomplete
+    })
+}
+
+fn resolved_unread_name(
+    unread: &UnreadCount,
+    directory: &UnreadConversationDirectory,
+) -> ResolvedUnreadName {
+    if directory.conflicting_ids.contains(&unread.id) {
+        return unavailable_unread_name();
+    }
+    let Some(conversation) = directory.conversations.get(&unread.id) else {
+        return unread_name_with_resolution(match directory.completion {
+            DirectoryCompletion::Complete => ConversationNameResolution::Inaccessible,
+            DirectoryCompletion::Incomplete => ConversationNameResolution::Incomplete,
+            DirectoryCompletion::Unavailable => ConversationNameResolution::Unavailable,
+        });
+    };
+    let Some(kind) = raw_conversation_kind(conversation) else {
+        return unavailable_unread_name();
+    };
+    if kind != unread.kind || !is_valid_conversation_id(&conversation.id, unread.kind) {
+        return unavailable_unread_name();
+    }
+    match kind {
+        ConversationKind::Channel => resolved_plain_conversation_name(&conversation.name),
+        ConversationKind::GroupDirectMessage => {
+            let Some(display_name) = readable_group_dm_name(&conversation.name) else {
+                return unread_name_with_resolution(ConversationNameResolution::Unnamed);
+            };
+            ResolvedUnreadName {
+                name: Some(display_name.clone()),
+                display_name: Some(display_name),
+                resolution: ConversationNameResolution::Resolved,
+            }
+        }
+        ConversationKind::DirectMessage => {
+            let Some(user_id) = conversation
+                .user
+                .as_deref()
+                .filter(|id| is_valid_user_id(id))
+            else {
+                return unavailable_unread_name();
+            };
+            let Some(user_directory) = &directory.user_directory else {
+                return unavailable_unread_name();
+            };
+            if user_directory.conflicting_ids.contains(user_id) {
+                return unavailable_unread_name();
+            }
+            if let Some(user) = user_directory.users.get(user_id) {
+                return resolved_user_conversation_name(user);
+            }
+            missing_unread_user_name(user_directory)
+        }
+    }
+}
+
+fn raw_conversation_kind(conversation: &RawConversation) -> Option<ConversationKind> {
+    if conversation.is_im && conversation.is_mpim {
+        None
+    } else if conversation.is_im {
+        Some(ConversationKind::DirectMessage)
+    } else if conversation.is_mpim {
+        Some(ConversationKind::GroupDirectMessage)
+    } else {
+        Some(ConversationKind::Channel)
+    }
+}
+
+fn resolved_plain_conversation_name(value: &str) -> ResolvedUnreadName {
+    let value = value.trim();
+    if !is_valid_conversation_name(value) {
+        return unread_name_with_resolution(ConversationNameResolution::Unnamed);
+    }
+    ResolvedUnreadName {
+        name: Some(value.to_owned()),
+        display_name: Some(value.to_owned()),
+        resolution: ConversationNameResolution::Resolved,
+    }
+}
+
+fn resolved_user_conversation_name(user: &User) -> ResolvedUnreadName {
+    let name = directory_author_label(&user.name);
+    let display_name = directory_author_label(&user.display_name)
+        .or_else(|| directory_author_label(&user.real_name))
+        .or_else(|| name.clone());
+    if name.is_none() && display_name.is_none() {
+        return unread_name_with_resolution(ConversationNameResolution::Unnamed);
+    }
+    ResolvedUnreadName {
+        name,
+        display_name,
+        resolution: ConversationNameResolution::Resolved,
+    }
+}
+
+fn missing_user_conversation_name(directory: &AuthorDirectory) -> ResolvedUnreadName {
+    unread_name_with_resolution(match directory {
+        AuthorDirectory::Loaded(directory) if directory.complete => {
+            ConversationNameResolution::Unnamed
+        }
+        AuthorDirectory::Loaded(_) => ConversationNameResolution::Incomplete,
+        AuthorDirectory::Interrupted(_) => ConversationNameResolution::Unavailable,
+    })
+}
+
+fn missing_unread_user_name(directory: &UnreadUserDirectory) -> ResolvedUnreadName {
+    unread_name_with_resolution(match directory.completion {
+        DirectoryCompletion::Complete => ConversationNameResolution::Unnamed,
+        DirectoryCompletion::Incomplete => ConversationNameResolution::Incomplete,
+        DirectoryCompletion::Unavailable => ConversationNameResolution::Unavailable,
+    })
+}
+
+fn loaded_inbox_conversation_name(
+    conversation: &Conversation,
+    author_directory: Option<&AuthorDirectory>,
+) -> ResolvedUnreadName {
+    match conversation.kind {
+        ConversationKind::Channel => resolved_plain_conversation_name(&conversation.name),
+        ConversationKind::GroupDirectMessage => {
+            let Some(display_name) = readable_group_dm_name(&conversation.name) else {
+                return unread_name_with_resolution(ConversationNameResolution::Unnamed);
+            };
+            ResolvedUnreadName {
+                name: Some(display_name.clone()),
+                display_name: Some(display_name),
+                resolution: ConversationNameResolution::Resolved,
+            }
+        }
+        ConversationKind::DirectMessage if !conversation.name_is_fallback => ResolvedUnreadName {
+            name: Some(conversation.name.clone()),
+            display_name: Some(conversation.display_name.clone()),
+            resolution: ConversationNameResolution::Resolved,
+        },
+        ConversationKind::DirectMessage => {
+            if conversation.user_id.as_deref().is_some_and(|user_id| {
+                author_directory
+                    .is_some_and(|directory| author_directory_conflicts(directory, user_id))
+            }) {
+                return unavailable_unread_name();
+            }
+            if conversation
+                .user_id
+                .as_deref()
+                .is_some_and(|user_id| conversation.display_name != user_id)
+                && is_valid_conversation_name(&conversation.display_name)
+            {
+                return ResolvedUnreadName {
+                    name: None,
+                    display_name: Some(conversation.display_name.clone()),
+                    resolution: ConversationNameResolution::Resolved,
+                };
+            }
+            author_directory
+                .map(missing_user_conversation_name)
+                .unwrap_or_else(unavailable_unread_name)
+        }
+    }
+}
+
+fn readable_group_dm_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !is_valid_conversation_name(value) {
+        return None;
+    }
+    let Some(encoded) = value.strip_prefix("mpdm-") else {
+        return Some(value.to_owned());
+    };
+    let (participants, suffix) = encoded.rsplit_once('-')?;
+    if suffix.is_empty() || suffix.len() > 10 || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let participants = participants.split("--").collect::<Vec<_>>();
+    if !(2..=32).contains(&participants.len())
+        || participants
+            .iter()
+            .any(|participant| !is_valid_conversation_name(participant))
+    {
+        return None;
+    }
+    let display_name = participants.join(", ");
+    is_valid_conversation_name(&display_name).then_some(display_name)
 }
 
 fn conversation_matches(conversation: &Conversation, needle: &str) -> bool {
@@ -2782,7 +3252,7 @@ fn normalize_search_matches(
 }
 
 fn append_unreads(
-    target: &mut Vec<UnreadConversation>,
+    target: &mut Vec<UnreadCount>,
     seen_ids: &mut HashSet<String>,
     source: Vec<RawUnread>,
     kind: ConversationKind,
@@ -2794,7 +3264,7 @@ fn append_unreads(
             });
         }
         if entry.has_unreads {
-            target.push(UnreadConversation {
+            target.push(UnreadCount {
                 id: entry.id,
                 kind,
                 has_unreads: entry.has_unreads,
@@ -3546,6 +4016,14 @@ fn author_directory_users(directory: &AuthorDirectory) -> &HashMap<String, User>
     }
 }
 
+fn author_directory_conflicts(directory: &AuthorDirectory, user_id: &str) -> bool {
+    match directory {
+        AuthorDirectory::Loaded(directory) | AuthorDirectory::Interrupted(directory) => {
+            directory.conflicting_ids.contains(user_id)
+        }
+    }
+}
+
 fn enrich_message_authors_from_directory(messages: &mut [Message], directory: &AuthorDirectory) {
     for message in messages
         .iter_mut()
@@ -3587,6 +4065,10 @@ fn enrich_author(
         ),
         AuthorDirectory::Interrupted(directory) => (directory, AuthorResolution::Unavailable),
     };
+    if directory.conflicting_ids.contains(author_id) {
+        *author_resolution = AuthorResolution::Unavailable;
+        return;
+    }
     if let Some(user) = directory.users.get(author_id) {
         *author_name = directory_author_label(&user.name);
         *author_display_name = directory_author_label(&user.display_name)
@@ -4144,6 +4626,7 @@ mod tests {
 
     struct FakeApi {
         counts: ClientCountsPayload,
+        count_calls: Arc<Mutex<usize>>,
         history: RawMessagePage,
         history_pages: Mutex<VecDeque<RawMessagePage>>,
         replies: RawMessagePage,
@@ -4318,6 +4801,7 @@ mod tests {
     #[async_trait]
     impl SlackApi for FakeApi {
         async fn client_counts(&self) -> Result<ClientCountsPayload> {
+            *self.count_calls.lock().unwrap() += 1;
             Ok(self.counts.clone())
         }
 
@@ -4911,6 +5395,7 @@ mod tests {
     fn fake_api() -> FakeApi {
         FakeApi {
             counts: empty_counts(),
+            count_calls: Arc::new(Mutex::new(0)),
             history: RawMessagePage::default(),
             history_pages: Mutex::new(VecDeque::new()),
             replies: RawMessagePage::default(),
@@ -5111,6 +5596,14 @@ mod tests {
             last_read: Some("100.0".into()),
             latest: Some("200.0".into()),
         }
+    }
+
+    fn unread_entry<'a>(report: &'a UnreadReport, id: &str) -> &'a UnreadConversation {
+        report
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == id)
+            .unwrap_or_else(|| panic!("missing unread conversation {id}"))
     }
 
     fn raw_message(ts: &str, text: &str) -> RawMessage {
@@ -7318,6 +7811,9 @@ mod tests {
                     {
                         "id": "DONE",
                         "kind": "direct_message",
+                        "name": null,
+                        "display_name": null,
+                        "name_resolution": "inaccessible",
                         "has_unreads": true,
                         "mention_count": 1,
                         "last_read": "100.0",
@@ -7326,6 +7822,9 @@ mod tests {
                     {
                         "id": "GONE",
                         "kind": "group_direct_message",
+                        "name": null,
+                        "display_name": null,
+                        "name_resolution": "inaccessible",
                         "has_unreads": true,
                         "mention_count": 1,
                         "last_read": "100.0",
@@ -7334,6 +7833,9 @@ mod tests {
                     {
                         "id": "CNULL",
                         "kind": "channel",
+                        "name": null,
+                        "display_name": null,
+                        "name_resolution": "inaccessible",
                         "has_unreads": true,
                         "mention_count": 0,
                         "last_read": null,
@@ -7350,6 +7852,433 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn unread_names_resolve_all_kinds_with_one_bounded_shared_scan() {
+        let mut api = fake_api();
+        api.counts = ClientCountsPayload {
+            channels: vec![entry("CGENERAL", true, 2)],
+            ims: vec![entry("DALI", true, 4), entry("DBOB", true, 3)],
+            mpims: vec![entry("GTEAM", true, 1)],
+            threads: RawThreadCounts::default(),
+        };
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                raw_conversation("CGENERAL", "general"),
+                RawConversation {
+                    id: "DALI".into(),
+                    is_im: true,
+                    user: Some("WALI".into()),
+                    ..RawConversation::default()
+                },
+                RawConversation {
+                    id: "DBOB".into(),
+                    is_im: true,
+                    user: Some("WBOB".into()),
+                    ..RawConversation::default()
+                },
+                RawConversation {
+                    is_mpim: true,
+                    ..raw_conversation("GTEAM", "mpdm-alice--bob-1")
+                },
+            ],
+            response_metadata: RawResponseMetadata {
+                next_cursor: "unused-because-all-counted".into(),
+            },
+        }]));
+        let mut display_only = raw_user("WBOB", "bad\nname", "Bob Example");
+        display_only.real_name.clear();
+        display_only.profile.real_name.clear();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("WALI", "alice", "Alice Example"), display_only],
+            response_metadata: RawResponseMetadata {
+                next_cursor: "unused-because-all-users-found".into(),
+            },
+        }]));
+        let count_calls = api.count_calls.clone();
+        let conversation_calls = api.conversation_calls.clone();
+        let user_calls = api.user_calls.clone();
+
+        let report = service(api).unreads().await.unwrap();
+
+        assert_eq!(*count_calls.lock().unwrap(), 1);
+        assert_eq!(conversation_calls.lock().unwrap().len(), 1);
+        assert_single_user_directory_call(&user_calls);
+        assert_eq!(
+            (
+                unread_entry(&report, "CGENERAL").name.as_deref(),
+                unread_entry(&report, "CGENERAL").display_name.as_deref(),
+                unread_entry(&report, "CGENERAL").name_resolution,
+            ),
+            (
+                Some("general"),
+                Some("general"),
+                ConversationNameResolution::Resolved,
+            )
+        );
+        assert_eq!(
+            (
+                unread_entry(&report, "DALI").name.as_deref(),
+                unread_entry(&report, "DALI").display_name.as_deref(),
+                unread_entry(&report, "DALI").name_resolution,
+            ),
+            (
+                Some("alice"),
+                Some("Alice Example"),
+                ConversationNameResolution::Resolved,
+            )
+        );
+        assert_eq!(
+            (
+                unread_entry(&report, "DBOB").name.as_deref(),
+                unread_entry(&report, "DBOB").display_name.as_deref(),
+                unread_entry(&report, "DBOB").name_resolution,
+            ),
+            (
+                None,
+                Some("Bob Example"),
+                ConversationNameResolution::Resolved,
+            )
+        );
+        assert_eq!(
+            (
+                unread_entry(&report, "GTEAM").name.as_deref(),
+                unread_entry(&report, "GTEAM").display_name.as_deref(),
+                unread_entry(&report, "GTEAM").name_resolution,
+            ),
+            (
+                Some("alice, bob"),
+                Some("alice, bob"),
+                ConversationNameResolution::Resolved,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_dm_name_resolution_rejects_target_user_conflicts() {
+        let mut same_page_api = fake_api();
+        same_page_api.counts.ims = vec![entry("DCONFLICT", true, 1)];
+        same_page_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![RawConversation {
+                id: "DCONFLICT".into(),
+                is_im: true,
+                user: Some("WCONFLICT".into()),
+                ..RawConversation::default()
+            }],
+            ..RawConversationsPage::default()
+        }]));
+        same_page_api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![
+                raw_user("WCONFLICT", "first", "First User"),
+                raw_user("WCONFLICT", "second", "Second User"),
+            ],
+            ..RawUsersPage::default()
+        }]));
+        let same_page = service(same_page_api).unreads().await.unwrap();
+        assert_eq!(
+            unread_entry(&same_page, "DCONFLICT").name_resolution,
+            ConversationNameResolution::Unavailable
+        );
+
+        let mut cross_page_api = fake_api();
+        cross_page_api.counts.ims = vec![entry("DCONFLICT", true, 2), entry("DOTHER", true, 1)];
+        cross_page_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                RawConversation {
+                    id: "DCONFLICT".into(),
+                    is_im: true,
+                    user: Some("WCONFLICT".into()),
+                    ..RawConversation::default()
+                },
+                RawConversation {
+                    id: "DOTHER".into(),
+                    is_im: true,
+                    user: Some("WOTHER".into()),
+                    ..RawConversation::default()
+                },
+            ],
+            ..RawConversationsPage::default()
+        }]));
+        cross_page_api.user_pages = Mutex::new(VecDeque::from([
+            RawUsersPage {
+                members: vec![raw_user("WCONFLICT", "first", "First User")],
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "users-2".into(),
+                },
+            },
+            RawUsersPage {
+                members: vec![
+                    raw_user("WCONFLICT", "second", "Second User"),
+                    raw_user("WOTHER", "other", "Other User"),
+                ],
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "unused-because-all-users-accounted".into(),
+                },
+            },
+        ]));
+        let cross_page_calls = cross_page_api.user_calls.clone();
+        let cross_page = service(cross_page_api).unreads().await.unwrap();
+        assert_eq!(cross_page_calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            unread_entry(&cross_page, "DCONFLICT").name_resolution,
+            ConversationNameResolution::Unavailable
+        );
+        assert_eq!(
+            (
+                unread_entry(&cross_page, "DOTHER").name.as_deref(),
+                unread_entry(&cross_page, "DOTHER").name_resolution,
+            ),
+            (Some("other"), ConversationNameResolution::Resolved,)
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_name_resolution_preserves_valid_matches_and_marks_unsafe_names() {
+        let mut api = fake_api();
+        api.counts.channels = vec![entry("CGENERAL", true, 2), entry("CUNNAMED", true, 1)];
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                raw_conversation("CGENERAL", "general"),
+                raw_conversation("CUNNAMED", "bad\nname"),
+            ],
+            ..RawConversationsPage::default()
+        }]));
+
+        let report = service(api).unreads().await.unwrap();
+
+        assert_eq!(
+            unread_entry(&report, "CGENERAL").name_resolution,
+            ConversationNameResolution::Resolved
+        );
+        let unnamed = unread_entry(&report, "CUNNAMED");
+        assert_eq!(unnamed.name, None);
+        assert_eq!(unnamed.display_name, None);
+        assert_eq!(unnamed.name_resolution, ConversationNameResolution::Unnamed);
+    }
+
+    #[tokio::test]
+    async fn unread_name_resolution_reports_conversation_scan_bounds() {
+        let mut api = fake_api();
+        api.counts.channels = vec![entry("CMISSING", true, 1)];
+        api.conversation_pages = Mutex::new(
+            (0..MAX_CONVERSATION_PAGES)
+                .map(|page| RawConversationsPage {
+                    response_metadata: RawResponseMetadata {
+                        next_cursor: format!("conversation-page-{page}"),
+                    },
+                    ..RawConversationsPage::default()
+                })
+                .collect(),
+        );
+        let conversation_calls = api.conversation_calls.clone();
+
+        let report = service(api).unreads().await.unwrap();
+
+        assert_eq!(
+            unread_entry(&report, "CMISSING").name_resolution,
+            ConversationNameResolution::Incomplete
+        );
+        assert_eq!(
+            conversation_calls.lock().unwrap().len(),
+            MAX_CONVERSATION_PAGES
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_name_resolution_retains_matches_when_discovery_becomes_unavailable() {
+        let mut api = fake_api();
+        api.counts.channels = vec![entry("CKNOWN", true, 2), entry("CMISSING", true, 1)];
+        api.conversation_pages = Mutex::new(VecDeque::from([
+            RawConversationsPage {
+                channels: vec![raw_conversation("CKNOWN", "known")],
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "page-2".into(),
+                },
+            },
+            RawConversationsPage {
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "page-2".into(),
+                },
+                ..RawConversationsPage::default()
+            },
+        ]));
+
+        let report = service(api).unreads().await.unwrap();
+
+        assert_eq!(
+            unread_entry(&report, "CKNOWN").name_resolution,
+            ConversationNameResolution::Resolved
+        );
+        assert_eq!(
+            unread_entry(&report, "CMISSING").name_resolution,
+            ConversationNameResolution::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_name_resolution_degrades_conflicting_and_malformed_matches() {
+        let mut api = fake_api();
+        api.counts.channels = vec![
+            entry("CCONFLICT", true, 3),
+            entry("CMISMATCH", true, 2),
+            entry("CBROKEN", true, 1),
+        ];
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                raw_conversation("CCONFLICT", "first"),
+                raw_conversation("CCONFLICT", "second"),
+                RawConversation {
+                    id: "CMISMATCH".into(),
+                    is_im: true,
+                    user: Some("WALI".into()),
+                    ..RawConversation::default()
+                },
+                RawConversation {
+                    id: "CBROKEN".into(),
+                    is_im: true,
+                    is_mpim: true,
+                    ..RawConversation::default()
+                },
+            ],
+            ..RawConversationsPage::default()
+        }]));
+
+        let report = service(api).unreads().await.unwrap();
+
+        assert_eq!(report.conversations.len(), 3);
+        for id in ["CCONFLICT", "CMISMATCH", "CBROKEN"] {
+            assert_eq!(
+                unread_entry(&report, id).name_resolution,
+                ConversationNameResolution::Unavailable,
+                "{id} should retain its authoritative count identity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unread_dm_name_resolution_distinguishes_complete_bounded_and_interrupted_users() {
+        let mut complete_api = fake_api();
+        complete_api.counts.ims = vec![entry("DMISSING", true, 1)];
+        complete_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![RawConversation {
+                id: "DMISSING".into(),
+                is_im: true,
+                user: Some("WMISSING".into()),
+                ..RawConversation::default()
+            }],
+            ..RawConversationsPage::default()
+        }]));
+        complete_api.user_pages = Mutex::new(VecDeque::from([RawUsersPage::default()]));
+        let complete = service(complete_api).unreads().await.unwrap();
+        assert_eq!(
+            unread_entry(&complete, "DMISSING").name_resolution,
+            ConversationNameResolution::Unnamed
+        );
+
+        let mut bounded_api = fake_api();
+        bounded_api.counts.ims = vec![entry("DKNOWN", true, 2), entry("DMISSING", true, 1)];
+        bounded_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                RawConversation {
+                    id: "DKNOWN".into(),
+                    is_im: true,
+                    user: Some("WKNOWN".into()),
+                    ..RawConversation::default()
+                },
+                RawConversation {
+                    id: "DMISSING".into(),
+                    is_im: true,
+                    user: Some("WMISSING".into()),
+                    ..RawConversation::default()
+                },
+            ],
+            ..RawConversationsPage::default()
+        }]));
+        bounded_api.user_pages = Mutex::new(
+            (0..MAX_USER_PAGES)
+                .map(|page| RawUsersPage {
+                    members: (page == 0)
+                        .then(|| raw_user("WKNOWN", "known", "Known User"))
+                        .into_iter()
+                        .collect(),
+                    response_metadata: RawResponseMetadata {
+                        next_cursor: format!("users-{page}"),
+                    },
+                })
+                .collect(),
+        );
+        let bounded_user_calls = bounded_api.user_calls.clone();
+        let bounded = service(bounded_api).unreads().await.unwrap();
+        assert_eq!(
+            unread_entry(&bounded, "DKNOWN").name_resolution,
+            ConversationNameResolution::Resolved
+        );
+        assert_eq!(
+            unread_entry(&bounded, "DMISSING").name_resolution,
+            ConversationNameResolution::Incomplete
+        );
+        assert_eq!(bounded_user_calls.lock().unwrap().len(), MAX_USER_PAGES);
+
+        let mut interrupted_api = fake_api();
+        interrupted_api.counts.ims = vec![entry("DKNOWN", true, 2), entry("DMISSING", true, 1)];
+        interrupted_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                RawConversation {
+                    id: "DKNOWN".into(),
+                    is_im: true,
+                    user: Some("WKNOWN".into()),
+                    ..RawConversation::default()
+                },
+                RawConversation {
+                    id: "DMISSING".into(),
+                    is_im: true,
+                    user: Some("WMISSING".into()),
+                    ..RawConversation::default()
+                },
+            ],
+            ..RawConversationsPage::default()
+        }]));
+        interrupted_api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("WKNOWN", "known", "Known User")],
+            response_metadata: RawResponseMetadata {
+                next_cursor: "users-2".into(),
+            },
+        }]));
+        interrupted_api.user_list_error_after = Some(1);
+        let interrupted = service(interrupted_api).unreads().await.unwrap();
+        assert_eq!(
+            unread_entry(&interrupted, "DKNOWN").name_resolution,
+            ConversationNameResolution::Resolved
+        );
+        assert_eq!(
+            unread_entry(&interrupted, "DMISSING").name_resolution,
+            ConversationNameResolution::Unavailable
+        );
+    }
+
+    #[test]
+    fn group_dm_names_decode_only_the_bounded_known_shape() {
+        assert_eq!(
+            readable_group_dm_name("mpdm-alice--bob-1").as_deref(),
+            Some("alice, bob")
+        );
+        assert_eq!(
+            readable_group_dm_name("project-chat").as_deref(),
+            Some("project-chat")
+        );
+        for unsafe_name in [
+            "mpdm-alice-1",
+            "mpdm-alice--bob-x",
+            "mpdm-alice--bad\nname-1",
+            "mpdm-alice--bob-12345678901",
+        ] {
+            assert_eq!(
+                readable_group_dm_name(unsafe_name),
+                None,
+                "{unsafe_name:?} should never be displayed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7389,6 +8318,8 @@ mod tests {
             ..RawUsersPage::default()
         }]));
         api.history.messages = vec![raw_message("100.000001", "recent")];
+        let count_calls = api.count_calls.clone();
+        let conversation_calls = api.conversation_calls.clone();
         let history_calls = api.history_calls.clone();
         let user_calls = api.user_calls.clone();
 
@@ -7416,6 +8347,30 @@ mod tests {
         assert!(!report.conversations[0].conversation.name_is_fallback);
         assert!(report.conversations[0].conversation.metadata_is_complete);
         assert_eq!(report.conversations[1].conversation.name, "general");
+        assert_eq!(
+            (
+                report.conversations[0].unread.name.as_deref(),
+                report.conversations[0].unread.display_name.as_deref(),
+                report.conversations[0].unread.name_resolution,
+            ),
+            (
+                Some("alice"),
+                Some("Alice Example"),
+                ConversationNameResolution::Resolved,
+            )
+        );
+        assert_eq!(
+            (
+                report.conversations[1].unread.name.as_deref(),
+                report.conversations[1].unread.display_name.as_deref(),
+                report.conversations[1].unread.name_resolution,
+            ),
+            (
+                Some("general"),
+                Some("general"),
+                ConversationNameResolution::Resolved,
+            )
+        );
         assert_eq!(report.conversations[0].messages.messages.len(), 1);
         assert!(report.conversations.iter().all(|entry| {
             let message = &entry.messages.messages[0];
@@ -7423,6 +8378,8 @@ mod tests {
                 && message.author_display_name.as_deref() == Some("Carol Example")
                 && message.author_resolution == AuthorResolution::Directory
         }));
+        assert_eq!(*count_calls.lock().unwrap(), 1);
+        assert_eq!(conversation_calls.lock().unwrap().len(), 1);
         assert_single_user_directory_call(&user_calls);
         assert!(report.threads.has_unreads);
         assert_eq!(report.threads.mention_count, 2);
@@ -7440,6 +8397,49 @@ mod tests {
                     limit: 7,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_never_uses_conflicting_user_metadata_for_dm_or_message_names() {
+        let mut api = fake_api();
+        api.counts.ims = vec![entry("DCONFLICT", true, 1)];
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![RawConversation {
+                id: "DCONFLICT".into(),
+                is_im: true,
+                user: Some("WCONFLICT".into()),
+                ..RawConversation::default()
+            }],
+            ..RawConversationsPage::default()
+        }]));
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![
+                raw_user("WCONFLICT", "first", "First User"),
+                raw_user("WCONFLICT", "second", "Second User"),
+            ],
+            ..RawUsersPage::default()
+        }]));
+        let mut message = raw_message("100.000001", "synthetic");
+        message.user = Some("WCONFLICT".into());
+        api.history.messages = vec![message];
+        let user_calls = api.user_calls.clone();
+
+        let report = service(api).inbox(1, 1).await.unwrap();
+
+        assert_single_user_directory_call(&user_calls);
+        let entry = &report.conversations[0];
+        assert!(entry.conversation.name_is_fallback);
+        assert_eq!(entry.unread.name, None);
+        assert_eq!(entry.unread.display_name, None);
+        assert_eq!(
+            entry.unread.name_resolution,
+            ConversationNameResolution::Unavailable
+        );
+        assert_eq!(entry.messages.messages[0].author_name, None);
+        assert_eq!(
+            entry.messages.messages[0].author_resolution,
+            AuthorResolution::Unavailable
         );
     }
 

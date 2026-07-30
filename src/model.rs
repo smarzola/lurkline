@@ -422,10 +422,23 @@ pub enum ConversationKind {
     GroupDirectMessage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationNameResolution {
+    Resolved,
+    Incomplete,
+    Inaccessible,
+    Unnamed,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct UnreadConversation {
     pub id: String,
     pub kind: ConversationKind,
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub name_resolution: ConversationNameResolution,
     pub has_unreads: bool,
     pub mention_count: u64,
     pub last_read: Option<String>,

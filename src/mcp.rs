@@ -748,7 +748,7 @@ impl McpServer {
         )
     }
 
-    /// List channels, DMs, group DMs, and thread counts Slack explicitly marks unread.
+    /// List named channels, DMs, group DMs, and thread counts Slack explicitly marks unread.
     #[tool(
         name = "slack_list_unreads",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<UnreadReport>>(),
