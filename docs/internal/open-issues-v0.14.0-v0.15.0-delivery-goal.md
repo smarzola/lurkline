@@ -182,7 +182,7 @@ The goal is complete only when:
 ## Milestones
 
 - [x] Milestone 1: Normalize nullable identities and release `v0.14.0` for #27.
-- [ ] Milestone 2: Traverse filtered activity scope and release `v0.15.0` for #26.
+- [x] Milestone 2: Traverse filtered activity scope and release `v0.15.0` for #26.
 
 ### Per-Issue Checkpoint And Delivery Protocol
 
@@ -359,6 +359,41 @@ Design decisions:
 - Preserve canonical ordering within each slice and document the canonical
   timestamp/conversation-ID merge comparator for callers combining multiple
   scope slices.
+
+Checkpoint evidence (2026-07-30):
+
+- Implementation commit `314975aacb70d74b6848a987312ce128a2d1922f`
+  adds canonical typed kind filtering before selection, stable ID-ordered
+  per-call scope slices, tagged message/scope cursor phases, bounded scope
+  reconstruction and digest validation before history, explicit structured and
+  human progress, CLI/MCP parity, synthetic regressions, documentation, and
+  aligned `0.15.0` metadata.
+- The retained adversarial reviewer found one medium test-coverage gap around
+  byte-shortened message-to-scope handoff and large mixed-kind traversal. The
+  repair proves `messages` to `messages` to `conversation_scope` to completion
+  without overlap or omission, covers 60 mixed channel/DM/group-DM
+  conversations, and preserves the existing 55-channel traversal. Re-review
+  was clean.
+- Formatting, strict locked Clippy, all 284 library tests, 12 CLI-process
+  tests, 2 raw-MCP tests, the package-metadata test, locked release build,
+  Rust 1.88 compatibility, credential scan, and diff/status checks passed.
+- Two local macOS ARM64 packages were byte-identical. Checksum, exact
+  versioned archive layout, permissions, linker-signed ARM64 Mach-O shape, and
+  packaged binary readback as `lurkline 0.15.0` passed; all artifacts were
+  removed.
+- An authorized read-only `sfera` smoke traversed two disjoint one-conversation
+  channel slices from a 32-conversation eligible scope, advancing scope
+  offsets from 0 to 1 with complete directory discovery. Only aggregate shape
+  and progress were emitted; no Slack write occurred, and all mode-0600 raw
+  temporary files were removed with zero residue.
+- A fresh context-independent audit found one low documentation gap: completed
+  scope slices cannot be revalidated because Slack does not provide an
+  immutable whole-scope snapshot. Commit
+  `28ea804c76304313ad8d25b99629a8f4bd64e833` documents that limitation, and
+  exact-head re-audit was clean.
+- This is the verified local release checkpoint required before publication.
+  PR, merge, tag, workflow, GitHub Release, asset verification, and issue
+  closure remain pending and are not implied by the checked milestone alone.
 
 ## Final Verification
 
