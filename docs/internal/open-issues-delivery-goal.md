@@ -204,7 +204,7 @@ The goal is complete only when:
 
 - [x] Milestone 1: Fix hosted file downloads and release `v0.9.1` for #17.
 - [x] Milestone 2: Resolve inbox authors and release `v0.9.2` for #16.
-- [ ] Milestone 3: Name unread conversations and release `v0.10.0` for #18.
+- [x] Milestone 3: Name unread conversations and release `v0.10.0` for #18.
 - [ ] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
 - [ ] Milestone 5: Expose canonical permalinks and release `v0.12.0` for #19.
 - [ ] Milestone 6: Deliver recent activity and release `v0.13.0` for #15.
@@ -445,6 +445,14 @@ marks affected DM names and message authors `unavailable`, and proves both
 outputs reuse one user scan. Both reviewers cleared the final diff with no
 finding at any severity. No live Slack operation was performed.
 
+PR #22 passed CI run `30539890076` and was squash-merged as
+`bb53551675740f676ab0d1c174a435689a16128e`, closing #18. Annotated tag
+`v0.10.0` dereferences to that exact commit. Release workflow `30540107144`,
+tag CI `30540107293`, and main CI `30540076365` all succeeded. GitHub Release
+`362399557` contained exactly six expected assets; every downloaded checksum
+and exact versioned `lurkline`, `README.md`, and `LICENSE` archive layout
+passed independent verification.
+
 ## Milestone 4: Fidelity-Preserving Mention Rendering (`v0.11.0`, #14)
 
 Acceptance criteria:
@@ -472,7 +480,36 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Not started.
+Status: Started on 2026-07-30 from
+`bb53551675740f676ab0d1c174a435689a16128e`, the exact `v0.10.0`
+`origin/main`.
+
+Design decisions:
+
+- Canonical Slack `text`, raw blocks, and attachments remain untouched.
+  Structured messages add a separate always-present `rendered_text`, a typed
+  `not_needed`, `not_attempted`, `complete`, `partial`, or `unavailable`
+  resolution state, and encounter-ordered unique mention records with stable
+  user IDs plus optional username and display name.
+- Rich-text blocks are the rendering source when they form a supported
+  lossless Slack rich-text tree. Explicit `user` elements resolve, while
+  preformatted or code-styled text nodes remain literal. Otherwise, a bounded
+  canonical-text scanner resolves only well-formed `<@USER>` tokens outside
+  backtick-delimited code.
+- Author and mention resolution share one existing bounded user directory per
+  operation. Inbox reuses its single lazy directory across every selected
+  conversation; no mention or message performs a per-ID request.
+- Username is preferred, then display name. Unknown or unsafe identities leave
+  the original token intact. A complete or bounded miss is `partial`; an
+  interrupted or conflicting lookup with unresolved mentions is
+  `unavailable`; validated identities survive later directory failure.
+- Read, thread, exact-message, inbox, and search human output uses
+  `rendered_text`. Send and reply requests still use only canonical outbound
+  text and blocks; acknowledgement messages with mentions remain explicitly
+  `not_attempted` unless a read operation enriches them.
+- A live smoke would leave an undeletable synthetic Slack message and adds
+  little confidence over deterministic block/text and exact outbound request
+  fixtures, so no live Slack operation is planned.
 
 ## Milestone 5: Canonical Message Permalinks (`v0.12.0`, #19)
 
