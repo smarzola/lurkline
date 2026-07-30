@@ -476,6 +476,9 @@ six digits and are never truncated. A noncanonical timestamp or missing
 metadata degrades only the affected links; the message remains available.
 Slack-provided search URLs are not forwarded, preventing unexpected origins,
 tracking parameters, fragments, or ambiguous encodings from reaching output.
+When search omits a separate thread timestamp, a strictly validated Slack
+route may supply that missing root timestamp before Lurkline reconstructs both
+links locally.
 The same behavior covers channels (`C…`), direct messages (`D…`), and group
 DMs (`G…`).
 
