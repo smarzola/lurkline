@@ -116,6 +116,7 @@ impl fmt::Debug for CredentialBundle {
 
 pub(crate) struct Config {
     pub base_url: Url,
+    pub workspace_url: Url,
     pub team_id: String,
     pub timeout: Duration,
     pub max_response_bytes: usize,
@@ -128,6 +129,7 @@ impl fmt::Debug for Config {
         formatter
             .debug_struct("Config")
             .field("base_url", &self.base_url)
+            .field("workspace_url", &self.workspace_url)
             .field("team_id", &self.team_id)
             .field("timeout", &self.timeout)
             .field("max_response_bytes", &self.max_response_bytes)
@@ -165,6 +167,7 @@ impl Config {
         )? as usize;
 
         Ok(Self {
+            workspace_url: bundle.base_url.clone(),
             base_url: bundle.base_url,
             team_id: bundle.team_id,
             token: bundle.token,
@@ -176,7 +179,7 @@ impl Config {
 
     pub(crate) fn into_bundle(self) -> CredentialBundle {
         CredentialBundle {
-            base_url: self.base_url,
+            base_url: self.workspace_url,
             team_id: self.team_id,
             token: self.token,
             cookie: self.cookie,
@@ -187,6 +190,7 @@ impl Config {
     pub(crate) fn for_test(base_url: Url, max_response_bytes: usize) -> Self {
         Self {
             base_url,
+            workspace_url: Url::parse("https://example.slack.com").unwrap(),
             team_id: "T000TEST".into(),
             token: Secret("xoxc-test-secret".into()),
             cookie: Secret("d=xoxd-test-secret; b=test".into()),
@@ -264,6 +268,23 @@ pub(crate) fn validate_base_url(raw: &str) -> Result<Url> {
         ));
     }
     Ok(url)
+}
+
+pub(crate) fn is_valid_workspace_origin(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    let workspace = host.strip_suffix(".slack.com").unwrap_or_default();
+    url.scheme() == "https"
+        && !workspace.is_empty()
+        && !workspace.contains('.')
+        && workspace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.port().is_none_or(|port| port == 443)
 }
 
 pub(crate) fn validate_identifier(name: &'static str, value: &str) -> Result<()> {
@@ -424,5 +445,15 @@ mod tests {
             );
             assert!(!error.to_string().contains(invalid_url));
         }
+    }
+
+    #[test]
+    fn synthetic_api_transport_has_an_independent_safe_workspace_origin() {
+        let config = Config::for_test(
+            Url::parse("http://127.0.0.1:1234").unwrap(),
+            DEFAULT_MAX_RESPONSE_BYTES,
+        );
+        assert_eq!(config.base_url.as_str(), "http://127.0.0.1:1234/");
+        assert_eq!(config.workspace_url.as_str(), "https://example.slack.com/");
     }
 }

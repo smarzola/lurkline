@@ -521,6 +521,17 @@ pub enum MentionResolution {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermalinkResolution {
+    /// Every link applicable to this message is available.
+    Complete,
+    /// At least one applicable link is available.
+    Partial,
+    /// No applicable link could be constructed safely.
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct MessageMention {
     pub id: String,
@@ -534,6 +545,9 @@ pub struct MessageSearchMatch {
     pub channel_name: String,
     pub ts: String,
     pub thread_ts: Option<String>,
+    pub permalink: Option<String>,
+    pub thread_root_permalink: Option<String>,
+    pub permalink_resolution: PermalinkResolution,
     pub author_id: Option<String>,
     /// Slack username or message-supplied author name when known.
     pub author_name: Option<String>,
@@ -555,7 +569,6 @@ pub struct MessageSearchMatch {
     pub attachments: Option<Vec<Value>>,
     pub reactions: Vec<Reaction>,
     pub files: Vec<FileReference>,
-    pub permalink: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -742,6 +755,9 @@ pub struct Message {
     pub channel_id: String,
     pub ts: String,
     pub thread_ts: Option<String>,
+    pub permalink: Option<String>,
+    pub thread_root_permalink: Option<String>,
+    pub permalink_resolution: PermalinkResolution,
     pub author_id: Option<String>,
     /// Slack username or message-supplied author name when known.
     pub author_name: Option<String>,

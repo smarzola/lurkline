@@ -1553,8 +1553,25 @@ fn print_message(message: Message, json: bool) -> Result<()> {
     if json {
         return print_json(&message);
     }
-    print_messages(&[message]);
+    print_messages(std::slice::from_ref(&message));
+    for line in format_message_link_lines(&message) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+fn format_message_link_lines(message: &Message) -> Vec<String> {
+    let mut lines = Vec::with_capacity(2);
+    if let Some(permalink) = &message.permalink {
+        lines.push(format!("link\t{}", escape_human(permalink)));
+    }
+    if let Some(thread_root_permalink) = &message.thread_root_permalink {
+        lines.push(format!(
+            "thread-root\t{}",
+            escape_human(thread_root_permalink)
+        ));
+    }
+    lines
 }
 
 fn print_messages(messages: &[Message]) {
@@ -1606,7 +1623,7 @@ fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
 }
 
 fn format_search_match(message: &crate::model::MessageSearchMatch) -> String {
-    format!(
+    let base = format!(
         "{}\t{}\t{}\t{}\t{}",
         escape_human(&message.ts),
         escape_human(&message.channel_id),
@@ -1618,7 +1635,11 @@ fn format_search_match(message: &crate::model::MessageSearchMatch) -> String {
             message.author_resolution,
         ),
         escape_human(&message.rendered_text)
-    )
+    );
+    match &message.permalink {
+        Some(permalink) => format!("{base}\t{}", escape_human(permalink)),
+        None => base,
+    }
 }
 
 fn format_author(
@@ -2223,6 +2244,9 @@ mod tests {
             channel_id: "C123".into(),
             ts: "100.000001".into(),
             thread_ts: None,
+            permalink: Some("https://example.slack.com/archives/C123/p100000001".into()),
+            thread_root_permalink: None,
+            permalink_resolution: crate::model::PermalinkResolution::Complete,
             author_id: Some("U123".into()),
             author_name: Some("alice".into()),
             author_display_name: Some("Alice Example".into()),
@@ -2246,6 +2270,27 @@ mod tests {
             format_message_line(&message),
             "100.000001\t@alice\thello @bob\\r\\u{1b}\treplies=2"
         );
+        assert_eq!(
+            format_message_link_lines(&message),
+            ["link\thttps://example.slack.com/archives/C123/p100000001"]
+        );
+
+        let mut reply = message.clone();
+        reply.permalink = Some("https://example.slack.com/reply\nunsafe".into());
+        reply.thread_root_permalink = Some("https://example.slack.com/root\tunsafe".into());
+        assert_eq!(
+            format_message_link_lines(&reply),
+            [
+                "link\thttps://example.slack.com/reply\\nunsafe",
+                "thread-root\thttps://example.slack.com/root\\tunsafe",
+            ]
+        );
+
+        let mut unavailable = message;
+        unavailable.permalink = None;
+        unavailable.thread_root_permalink = None;
+        unavailable.permalink_resolution = crate::model::PermalinkResolution::Unavailable;
+        assert!(format_message_link_lines(&unavailable).is_empty());
     }
 
     #[test]
@@ -2260,6 +2305,11 @@ mod tests {
                 channel_name: name.into(),
                 ts: "100.000001".into(),
                 thread_ts: None,
+                permalink: Some(format!(
+                    "https://example.slack.com/archives/{id}/p100000001"
+                )),
+                thread_root_permalink: None,
+                permalink_resolution: crate::model::PermalinkResolution::Complete,
                 author_id: Some("U456".into()),
                 author_name: None,
                 author_display_name: None,
@@ -2276,11 +2326,12 @@ mod tests {
                 attachments: None,
                 reactions: vec![],
                 files: vec![],
-                permalink: None,
             };
             assert_eq!(
                 format_search_match(&message),
-                format!("100.000001\t{id}\t{name}\tU456 [unresolved]\thello @carol\\r\\u{{1b}}")
+                format!(
+                    "100.000001\t{id}\t{name}\tU456 [unresolved]\thello @carol\\r\\u{{1b}}\thttps://example.slack.com/archives/{id}/p100000001"
+                )
             );
         }
     }
