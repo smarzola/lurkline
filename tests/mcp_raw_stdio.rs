@@ -136,6 +136,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_list_custom_emoji",
             "slack_list_drafts",
             "slack_list_unreads",
+            "slack_read_activity",
             "slack_read_channel",
             "slack_read_inbox",
             "slack_read_thread",
@@ -213,6 +214,45 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "unreads output schema omits {expected}"
         );
     }
+    let activity_tool = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "slack_read_activity")
+        .unwrap();
+    let activity_input_schema = serde_json::to_string(&activity_tool["inputSchema"]).unwrap();
+    let activity_output_schema = serde_json::to_string(&activity_tool["outputSchema"]).unwrap();
+    for expected in [
+        "since",
+        "after",
+        "before",
+        "include",
+        "exclude",
+        "order",
+        "conversation_limit",
+        "per_conversation_limit",
+        "limit",
+        "cursor",
+    ] {
+        assert!(
+            activity_input_schema.contains(expected),
+            "activity input schema omits {expected}"
+        );
+    }
+    for expected in [
+        "effective_after",
+        "effective_before",
+        "conversation_results",
+        "message_limit",
+        "selection_truncated",
+        "response_byte_limit_reached",
+        "next_cursor",
+    ] {
+        assert!(
+            activity_output_schema.contains(expected),
+            "activity output schema omits {expected}"
+        );
+    }
     let search_tool = tools["result"]["tools"]
         .as_array()
         .unwrap()
@@ -231,6 +271,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         "slack_get_message",
         "slack_search_messages",
         "slack_read_inbox",
+        "slack_read_activity",
         "slack_send_message",
     ] {
         let tool = tools["result"]["tools"]
@@ -329,6 +370,24 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     assert_eq!(
         after_nested["result"]["structuredContent"]["text"],
         "still alive"
+    );
+
+    let invalid_activity = call_tool(
+        &mut stdin,
+        &mut stdout,
+        25,
+        "slack_read_activity",
+        json!({
+            "since": "6h",
+            "after": "2026-07-30T00:00:00Z",
+            "before": "2026-07-30T06:00:00Z"
+        }),
+    )
+    .await;
+    assert_eq!(invalid_activity["result"]["isError"], true);
+    assert_eq!(
+        invalid_activity["result"]["structuredContent"]["error"]["code"],
+        "invalid_input"
     );
 
     send(

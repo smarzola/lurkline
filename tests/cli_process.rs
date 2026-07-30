@@ -77,6 +77,7 @@ fn version_and_help_expose_the_complete_cli_without_configuration() {
     assert!(root.contains("guarded rich-text authoring"));
     for command in [
         "auth",
+        "activity",
         "inbox",
         "conversations",
         "search",
@@ -119,6 +120,26 @@ fn version_and_help_expose_the_complete_cli_without_configuration() {
     assert!(inbox.contains("from 1 through 50"));
     assert!(inbox.contains("from 1 through 200"));
     assert!(inbox.contains("resolving message authors once per snapshot"));
+
+    let activity = stdout(&["activity", "--help"]);
+    for option in [
+        "--since",
+        "--after",
+        "--before",
+        "--include",
+        "--exclude",
+        "--oldest-first",
+        "--conversations",
+        "--per-conversation",
+        "--limit",
+        "--cursor",
+        "--json",
+    ] {
+        assert!(activity.contains(option), "activity help omitted {option}");
+    }
+    assert!(activity.contains("from 1 through 50"));
+    assert!(activity.contains("from 1 through 200"));
+    assert!(activity.contains("from 1 through 100"));
 
     let search = stdout(&["search", "messages", "--help"]);
     for option in [

@@ -8,7 +8,8 @@ OAuth flow.
 Use Lurkline to:
 
 - Discover channels, direct messages (DMs), and group DMs.
-- Search messages and read bounded unread, history, and thread snapshots.
+- Search messages and read bounded unread, recent-activity, history, and thread
+  snapshots.
 - Preserve Slack's raw message blocks and legacy attachments losslessly.
 - Inspect file metadata, custom emoji, and potentially partial reaction users.
 - Download private Slack files to explicit, non-existing local paths.
@@ -391,6 +392,55 @@ Human-readable inbox messages prefer `@username`, then profile display name,
 then an explicitly labeled raw-ID fallback. A complete directory miss, bounded
 partial scan, or auxiliary request failure remains visible in
 `author_resolution` without discarding otherwise useful inbox messages.
+
+## Read recent activity
+
+Read the last six hours across up to 10 joined channels, DMs, and group DMs:
+
+```sh
+lurkline activity --since 6h
+```
+
+Use an exact inclusive-lower, exclusive-upper interval and narrow it to one
+conversation:
+
+```sh
+lurkline activity \
+  --after '2026-07-30T08:00:00+02:00' \
+  --before '2026-07-30T12:00:00+02:00' \
+  --include '@alice' \
+  --json
+```
+
+`--since` accepts positive `s`, `m`, `h`, `d`, and `w` segments such as
+`30m` or `1d12h`, up to 365 days. Absolute bounds require RFC 3339 offsets.
+Output always reports effective bounds in UTC and uses `[after, before)`.
+
+The defaults sample the newest 20 messages from each of at most 10 selected
+conversations, then return 50 globally ordered items newest-first. Adjust them
+with `--per-conversation`, `--conversations`, and `--limit`; use
+`--oldest-first` to reverse that same bounded recent sample. Repeat
+`--include` or `--exclude` with exact IDs or names. Includes can opt in a
+visible unjoined channel; ambiguous, missing, or overlapping selectors fail
+with an actionable error.
+
+Activity uses one reply-inclusive, time-bounded history request per selected
+conversation. It never calls a write or mark-read endpoint. Structured output
+keeps the enriched message schema and reports conversation-level `complete`,
+`message_limit`, `inaccessible`, or `unavailable` status, along with selection
+and response-byte truncation.
+
+Continue only with the returned opaque cursor:
+
+```sh
+lurkline activity --cursor '<next-cursor>'
+```
+
+The cursor freezes the team, effective interval, selected conversation IDs,
+ordering, limits, and last emitted key. Messages newer than the frozen upper
+bound cannot shift later pages. If a message in the bounded Slack sample is
+edited, deleted, or becomes inaccessible, Lurkline rejects the cursor as stale
+instead of silently returning a gap or duplicate.
 
 ## Read messages and users
 
@@ -943,6 +993,7 @@ The following table maps common tasks to CLI commands and MCP tools:
 | Render Markdown locally | `lurkline message render` | `slack_render_markdown` |
 | List explicit unread state | `lurkline unreads` | `slack_list_unreads` |
 | Read an unread inbox snapshot | `lurkline inbox` | `slack_read_inbox` |
+| Read bounded recent activity | `lurkline activity` | `slack_read_activity` |
 | List or find conversations | `lurkline conversations` | `slack_list_conversations`, `slack_find_conversations` |
 | Search messages | `lurkline search messages` | `slack_search_messages` |
 | Read conversation history | `lurkline channel read` | `slack_read_channel` |
@@ -979,6 +1030,7 @@ The following table lists primary and auxiliary bounds:
 | Message search | One page of 100 | With `--in`: 20 conversation pages; exact names can also scan 20 user pages |
 | Unreads | Every explicit unread count in the snapshot | One scan of up to 20 conversation pages and, only for matched DMs, one shared scan of up to 20 user pages |
 | Inbox | 50 conversations; one history page of 200 each; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages and one shared scan of up to 20 user pages when DM naming or author resolution needs it |
+| Recent activity | 100 returned messages from one newest-200-message sample for each of up to 50 conversations; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages, one shared scan of up to 20 user pages, and exactly one reply-inclusive history request per selected conversation |
 | Channel history | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Thread replies | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Exact message | One message | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
