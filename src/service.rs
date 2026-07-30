@@ -5892,10 +5892,8 @@ fn activity_slack_bounds(after_nanos: i64, before_nanos: i64) -> Result<Option<(
 }
 
 fn ceil_activity_microseconds(nanos: i64) -> Result<i64> {
-    nanos
-        .checked_add(999)
-        .ok_or(Error::InvalidResponse { method: "activity" })?
-        .checked_div(1_000)
+    (nanos / 1_000)
+        .checked_add(i64::from(nanos % 1_000 != 0))
         .ok_or(Error::InvalidResponse { method: "activity" })
 }
 
@@ -14623,6 +14621,12 @@ mod tests {
             .unwrap(),
             Some(("100.000001".into(), "102.000000".into()))
         );
+        let maximum = parse_activity_rfc3339("before", "2262-04-11T23:47:16.854775807Z").unwrap();
+        assert_eq!(maximum, i64::MAX);
+        assert_eq!(
+            ceil_activity_microseconds(maximum).unwrap(),
+            i64::MAX / 1_000 + 1
+        );
         assert!(!timestamp_in_activity_interval(
             "100.000000",
             submicro,
@@ -14782,6 +14786,39 @@ mod tests {
                 limit: 1,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn activity_skips_history_when_the_interval_contains_no_slack_microsecond() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage::default()]));
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C001", "joined")],
+            ..RawConversationsPage::default()
+        }]));
+        let calls = Arc::clone(&api.activity_calls);
+        let report = service(api)
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40.000000001Z"),
+                before: Some("1970-01-01T00:01:40.000000999Z"),
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: Some(1),
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(report.items.is_empty());
+        assert_eq!(
+            report.conversation_results[0].status,
+            ActivityConversationStatus::Complete
+        );
+        assert!(!report.partial);
     }
 
     #[tokio::test]
