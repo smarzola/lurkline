@@ -3293,16 +3293,38 @@ fn normalize_search_matches(
             let permalink_route = raw.permalink.as_deref().and_then(|permalink| {
                 search_permalink_route(workspace_url, &raw.channel.id, &raw.ts, permalink)
             });
-            let thread_ts = raw.thread_ts.or(match permalink_route {
-                Some(SearchPermalinkRoute::Reply { thread_ts }) => Some(thread_ts),
-                Some(SearchPermalinkRoute::Root) | None => None,
-            });
-            let permalinks = message_permalinks(
-                workspace_url,
-                &raw.channel.id,
-                &raw.ts,
-                thread_ts.as_deref(),
-            );
+            let (thread_ts, permalinks) = match (raw.thread_ts, permalink_route) {
+                (Some(thread_ts), _) => {
+                    let permalinks = message_permalinks(
+                        workspace_url,
+                        &raw.channel.id,
+                        &raw.ts,
+                        Some(&thread_ts),
+                    );
+                    (Some(thread_ts), permalinks)
+                }
+                (None, Some(SearchPermalinkRoute::Reply { thread_ts })) => {
+                    let permalinks = message_permalinks(
+                        workspace_url,
+                        &raw.channel.id,
+                        &raw.ts,
+                        Some(&thread_ts),
+                    );
+                    (Some(thread_ts), permalinks)
+                }
+                (None, Some(SearchPermalinkRoute::Root)) => (
+                    None,
+                    message_permalinks(workspace_url, &raw.channel.id, &raw.ts, None),
+                ),
+                (None, None) => (
+                    None,
+                    MessagePermalinks {
+                        permalink: None,
+                        thread_root_permalink: None,
+                        resolution: PermalinkResolution::Unavailable,
+                    },
+                ),
+            };
             Ok(MessageSearchMatch {
                 channel_id: raw.channel.id,
                 channel_name,
@@ -10781,6 +10803,28 @@ mod tests {
             Some("https://example.slack.com/archives/C123/p101000002")
         );
         assert_eq!(root.thread_root_permalink, None);
+        assert_eq!(root.permalink_resolution, PermalinkResolution::Complete);
+
+        let missing = normalize_search_matches(
+            &workspace,
+            vec![RawMessageSearchMatch {
+                channel: RawMessageSearchChannel {
+                    id: "C123".into(),
+                    name: "general".into(),
+                },
+                ts: "101.000002".into(),
+                ..RawMessageSearchMatch::default()
+            }],
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(missing.thread_ts, None);
+        assert_eq!(missing.permalink, None);
+        assert_eq!(missing.thread_root_permalink, None);
+        assert_eq!(
+            missing.permalink_resolution,
+            PermalinkResolution::Unavailable
+        );
 
         let mismatch = normalize(
             Some("100.000001"),
@@ -10830,12 +10874,12 @@ mod tests {
             .unwrap()
             .remove(0);
             assert_eq!(message.thread_ts, None);
-            assert_eq!(
-                message.permalink.as_deref(),
-                Some("https://example.slack.com/archives/C123/p101000002")
-            );
+            assert_eq!(message.permalink, None);
             assert_eq!(message.thread_root_permalink, None);
-            assert_eq!(message.permalink_resolution, PermalinkResolution::Complete);
+            assert_eq!(
+                message.permalink_resolution,
+                PermalinkResolution::Unavailable
+            );
         }
     }
 

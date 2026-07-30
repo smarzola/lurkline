@@ -478,7 +478,9 @@ Slack-provided search URLs are not forwarded, preventing unexpected origins,
 tracking parameters, fragments, or ambiguous encodings from reaching output.
 When search omits a separate thread timestamp, a strictly validated Slack
 route may supply that missing root timestamp before Lurkline reconstructs both
-links locally.
+links locally. If neither structured thread metadata nor a valid route proves
+whether the match is a root or reply, link status is `unavailable` rather than
+guessing a root URL.
 The same behavior covers channels (`C…`), direct messages (`D…`), and group
 DMs (`G…`).
 

@@ -600,7 +600,9 @@ Design decisions:
   corroborating input, but output is always locally serialized from the
   validated workspace origin and identifiers. Missing, malformed, mismatched,
   tracked, or ambiguous auxiliary URLs do not fail or downgrade a fully
-  constructed result.
+  constructed result. When search supplies neither structured thread context
+  nor a valid route that proves root or reply, omit both unproven links and
+  report `unavailable` rather than guessing that the match is a root.
 - Human `message get` output shows the exact link and, for replies, its root.
   Search rows include the exact link because returning to a found result is a
   primary journey. Channel, thread, and inbox rows remain concise; their JSON
