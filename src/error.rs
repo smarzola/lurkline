@@ -65,12 +65,26 @@ pub enum Error {
     ConfirmationRequired { action: &'static str },
     #[error("Slack browser session is expired or invalid; copy fresh browser credentials")]
     Authentication,
+    #[error("Slack denied access to {resource}")]
+    Authorization { resource: &'static str },
+    #[error("{resource} is not supported")]
+    Unsupported { resource: &'static str },
     #[error("Slack method {method} failed: {code}")]
     SlackApi { method: &'static str, code: String },
     #[error("Slack method {method} returned HTTP {status}")]
     HttpStatus { method: &'static str, status: u16 },
+    #[error("Slack method {method} returned an unsafe redirect")]
+    UnsafeRedirect { method: &'static str },
+    #[error("Slack method {method} exceeded the {limit}-redirect limit")]
+    RedirectLimit { method: &'static str, limit: usize },
     #[error("Slack method {method} returned a response larger than {limit} bytes")]
     ResponseTooLarge { method: &'static str, limit: usize },
+    #[error("Slack file download did not return a validated file body")]
+    FileDownloadResponse,
+    #[error(
+        "Slack file download size did not match metadata: expected {expected} bytes, received {actual}"
+    )]
+    FileDownloadSizeMismatch { expected: u64, actual: u64 },
     #[error("Slack method {method} returned an invalid response")]
     InvalidResponse { method: &'static str },
     #[error("Slack method {method} timed out")]

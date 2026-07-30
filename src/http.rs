@@ -5,8 +5,8 @@ use futures_util::StreamExt;
 use reqwest::{
     Body, Client, StatusCode,
     header::{
-        ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue,
-        LOCATION, ORIGIN, REFERER,
+        ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE,
+        HeaderMap, HeaderValue, LOCATION, ORIGIN, REFERER,
     },
     multipart::Form,
     redirect::Policy,
@@ -716,6 +716,8 @@ impl SlackApi for SlackHttpClient {
     async fn download_private_file(
         &self,
         download_url: &str,
+        expected_size: u64,
+        expected_mimetype: Option<&str>,
         target: &mut BoundedDownload,
     ) -> Result<()> {
         const MAX_REDIRECTS: usize = 3;
@@ -751,46 +753,40 @@ impl SlackApi for SlackHttpClient {
 
             if response.status().is_redirection() {
                 if hop == MAX_REDIRECTS {
-                    return Err(Error::InvalidResponse {
+                    return Err(Error::RedirectLimit {
                         method: "files.download",
+                        limit: MAX_REDIRECTS,
                     });
                 }
                 let location = response
                     .headers()
                     .get(LOCATION)
                     .and_then(|value| value.to_str().ok())
-                    .ok_or(Error::InvalidResponse {
+                    .ok_or(Error::UnsafeRedirect {
                         method: "files.download",
                     })?;
-                url = url.join(location).map_err(|_| Error::InvalidResponse {
+                url = url.join(location).map_err(|_| Error::UnsafeRedirect {
                     method: "files.download",
                 })?;
-                validate_redirect_download_url(&url, allow_test_loopback)?;
+                validate_redirect_download_url(&url, allow_test_loopback).map_err(|_| {
+                    Error::UnsafeRedirect {
+                        method: "files.download",
+                    }
+                })?;
                 continue;
             }
-            if matches!(
-                response.status(),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            ) {
+            if response.status() == StatusCode::UNAUTHORIZED {
                 return Err(Error::Authentication);
+            }
+            if response.status() == StatusCode::FORBIDDEN {
+                return Err(Error::Authorization {
+                    resource: "the requested Slack file",
+                });
             }
             if !response.status().is_success() {
                 return Err(Error::HttpStatus {
                     method: "files.download",
                     status: response.status().as_u16(),
-                });
-            }
-            let content_type = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(';').next())
-                .map(str::trim);
-            if !content_type
-                .is_some_and(|value| value.eq_ignore_ascii_case("application/force-download"))
-            {
-                return Err(Error::InvalidResponse {
-                    method: "files.download",
                 });
             }
             if response
@@ -802,6 +798,15 @@ impl SlackApi for SlackHttpClient {
                     limit: crate::service::MAX_FILE_DOWNLOAD_BYTES as usize,
                 });
             }
+            if let Some(actual) = response.content_length()
+                && actual != expected_size
+            {
+                return Err(Error::FileDownloadSizeMismatch {
+                    expected: expected_size,
+                    actual,
+                });
+            }
+            validate_download_response_headers(response.headers(), expected_mimetype)?;
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|error| {
@@ -820,6 +825,39 @@ impl SlackApi for SlackHttpClient {
             return Ok(());
         }
         unreachable!("bounded redirect loop always returns")
+    }
+}
+
+fn validate_download_response_headers(
+    headers: &HeaderMap,
+    expected_mimetype: Option<&str>,
+) -> Result<()> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let attachment = headers
+        .get(CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("attachment"));
+    let generic_download = content_type.is_some_and(|value| {
+        value.eq_ignore_ascii_case("application/force-download")
+            || value.eq_ignore_ascii_case("application/octet-stream")
+            || value.eq_ignore_ascii_case("binary/octet-stream")
+    });
+    let metadata_match = expected_mimetype
+        .filter(|value| !value.is_empty())
+        .zip(content_type)
+        .is_some_and(|(expected, actual)| expected.eq_ignore_ascii_case(actual));
+
+    if attachment || generic_download || metadata_match {
+        Ok(())
+    } else {
+        Err(Error::FileDownloadResponse)
     }
 }
 
@@ -1029,8 +1067,11 @@ mod tests {
     #[derive(Clone)]
     struct DownloadCapture {
         requests: Arc<Mutex<Vec<(Uri, HeaderMap)>>>,
-        redirect: bool,
+        redirect_location: Option<&'static str>,
+        status: StatusCode,
         content_type: Option<&'static str>,
+        content_disposition: Option<&'static str>,
+        content_length: Option<u64>,
         body: &'static [u8],
     }
 
@@ -1044,24 +1085,53 @@ mod tests {
             .lock()
             .unwrap()
             .push((uri.clone(), headers));
-        if capture.redirect && uri.path() == "/download" {
+        if let Some(location) = capture.redirect_location
+            && uri.path() == "/download"
+        {
             return Response::builder()
                 .status(StatusCode::FOUND)
-                .header(LOCATION, "/bytes")
+                .header(LOCATION, location)
                 .body(Body::empty())
                 .unwrap();
         }
-        let mut response = Response::new(Body::from(capture.body));
+        let body = if capture.content_length.is_some() {
+            Body::from_stream(stream::pending::<std::result::Result<Bytes, Infallible>>())
+        } else {
+            Body::from(capture.body)
+        };
+        let mut response = Response::builder()
+            .status(capture.status)
+            .body(body)
+            .unwrap();
         if let Some(content_type) = capture.content_type {
             response
                 .headers_mut()
                 .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
         }
+        if let Some(content_disposition) = capture.content_disposition {
+            response.headers_mut().insert(
+                CONTENT_DISPOSITION,
+                HeaderValue::from_static(content_disposition),
+            );
+        }
+        if let Some(content_length) = capture.content_length {
+            response.headers_mut().insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&content_length.to_string()).unwrap(),
+            );
+        }
         response
     }
 
     async fn download_server(redirect: bool) -> (SlackHttpClient, DownloadCapture, Url) {
-        download_server_with_response(redirect, Some("application/force-download"), b"safe").await
+        download_server_with_options(
+            redirect.then_some("/bytes"),
+            StatusCode::OK,
+            Some("application/force-download"),
+            None,
+            b"safe",
+        )
+        .await
     }
 
     async fn download_server_with_response(
@@ -1069,10 +1139,49 @@ mod tests {
         content_type: Option<&'static str>,
         body: &'static [u8],
     ) -> (SlackHttpClient, DownloadCapture, Url) {
+        download_server_with_options(
+            redirect.then_some("/bytes"),
+            StatusCode::OK,
+            content_type,
+            None,
+            body,
+        )
+        .await
+    }
+
+    async fn download_server_with_options(
+        redirect_location: Option<&'static str>,
+        status: StatusCode,
+        content_type: Option<&'static str>,
+        content_disposition: Option<&'static str>,
+        body: &'static [u8],
+    ) -> (SlackHttpClient, DownloadCapture, Url) {
+        download_server_with_options_and_length(
+            redirect_location,
+            status,
+            content_type,
+            content_disposition,
+            None,
+            body,
+        )
+        .await
+    }
+
+    async fn download_server_with_options_and_length(
+        redirect_location: Option<&'static str>,
+        status: StatusCode,
+        content_type: Option<&'static str>,
+        content_disposition: Option<&'static str>,
+        content_length: Option<u64>,
+        body: &'static [u8],
+    ) -> (SlackHttpClient, DownloadCapture, Url) {
         let capture = DownloadCapture {
             requests: Arc::new(Mutex::new(Vec::new())),
-            redirect,
+            redirect_location,
+            status,
             content_type,
+            content_disposition,
+            content_length,
             body,
         };
         let app = Router::new()
@@ -1087,6 +1196,22 @@ mod tests {
         let base_url = Url::parse(&format!("http://{address}/")).unwrap();
         let config = Config::for_test(base_url.clone(), 64 * 1024);
         (SlackHttpClient::new(config).unwrap(), capture, base_url)
+    }
+
+    fn download_target(prefix: &str, limit: u64) -> (std::path::PathBuf, BoundedDownload) {
+        let directory = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "{prefix}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+        std::fs::create_dir(&directory).unwrap();
+        let root = crate::local_file::McpFileRoot::open(&directory).unwrap();
+        let target = root
+            .prepare_download(std::path::Path::new("output"), limit)
+            .unwrap();
+        (directory, target)
     }
 
     async fn upload_server(status: StatusCode, body: Vec<u8>) -> (SlackHttpClient, Capture, Url) {
@@ -1188,7 +1313,12 @@ mod tests {
                 .prepare_download(std::path::Path::new("output"), 10)
                 .unwrap();
             client
-                .download_private_file(base_url.join("download").unwrap().as_str(), &mut target)
+                .download_private_file(
+                    base_url.join("download").unwrap().as_str(),
+                    4,
+                    Some("application/force-download"),
+                    &mut target,
+                )
                 .await
                 .unwrap();
             target.commit().unwrap();
@@ -1214,6 +1344,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_download_accepts_hosted_image_and_document_bodies() {
+        for (content_type, expected_mimetype) in [
+            ("image/png", "image/png"),
+            ("application/pdf", "application/pdf"),
+            ("application/octet-stream", "image/png"),
+            ("binary/octet-stream", "application/pdf"),
+        ] {
+            let (client, _capture, base_url) =
+                download_server_with_response(false, Some(content_type), b"safe").await;
+            let (directory, mut target) = download_target("lurkline-http-download-hosted-media", 4);
+            client
+                .download_private_file(
+                    base_url.join("download").unwrap().as_str(),
+                    4,
+                    Some(expected_mimetype),
+                    &mut target,
+                )
+                .await
+                .unwrap();
+            target.commit().unwrap();
+            assert_eq!(std::fs::read(directory.join("output")).unwrap(), b"safe");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        let (client, _capture, base_url) = download_server_with_options(
+            None,
+            StatusCode::OK,
+            None,
+            Some("attachment; filename=\"synthetic.pdf\""),
+            b"safe",
+        )
+        .await;
+        let (directory, mut target) = download_target("lurkline-http-download-attachment", 4);
+        client
+            .download_private_file(
+                base_url.join("download").unwrap().as_str(),
+                4,
+                Some("application/pdf"),
+                &mut target,
+            )
+            .await
+            .unwrap();
+        target.commit().unwrap();
+        assert_eq!(std::fs::read(directory.join("output")).unwrap(), b"safe");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_download_distinguishes_access_and_http_failures() {
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::GONE,
+        ] {
+            let (client, _capture, base_url) =
+                download_server_with_options(None, status, Some("text/plain"), None, b"denied")
+                    .await;
+            let (directory, mut target) = download_target("lurkline-http-download-status", 16);
+            let error = client
+                .download_private_file(
+                    base_url.join("download").unwrap().as_str(),
+                    6,
+                    Some("text/plain"),
+                    &mut target,
+                )
+                .await
+                .unwrap_err();
+            match status {
+                StatusCode::UNAUTHORIZED => assert!(matches!(error, Error::Authentication)),
+                StatusCode::FORBIDDEN => {
+                    assert!(matches!(error, Error::Authorization { .. }))
+                }
+                StatusCode::GONE => assert!(matches!(
+                    error,
+                    Error::HttpStatus {
+                        method: "files.download",
+                        status: 410
+                    }
+                )),
+                _ => unreachable!(),
+            }
+            drop(target);
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+            std::fs::remove_dir(&directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn private_download_rejects_size_mismatch_and_unsafe_redirects() {
+        let (client, _capture, base_url) =
+            download_server_with_response(false, Some("image/png"), b"short").await;
+        let (directory, mut target) = download_target("lurkline-http-download-size", 10);
+        assert!(matches!(
+            client
+                .download_private_file(
+                    base_url.join("download").unwrap().as_str(),
+                    4,
+                    Some("image/png"),
+                    &mut target,
+                )
+                .await,
+            Err(Error::FileDownloadSizeMismatch {
+                expected: 4,
+                actual: 5
+            })
+        ));
+        drop(target);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(&directory).unwrap();
+
+        let (client, capture, base_url) = download_server_with_options(
+            Some("https://example.com/file"),
+            StatusCode::OK,
+            Some("image/png"),
+            None,
+            b"safe",
+        )
+        .await;
+        let (directory, mut target) = download_target("lurkline-http-download-redirect", 4);
+        assert!(matches!(
+            client
+                .download_private_file(
+                    base_url.join("download").unwrap().as_str(),
+                    4,
+                    Some("image/png"),
+                    &mut target,
+                )
+                .await,
+            Err(Error::UnsafeRedirect {
+                method: "files.download"
+            })
+        ));
+        assert_eq!(capture.requests.lock().unwrap().len(), 1);
+        drop(target);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(&directory).unwrap();
+
+        let (client, capture, base_url) = download_server_with_options(
+            Some("/download"),
+            StatusCode::OK,
+            Some("image/png"),
+            None,
+            b"safe",
+        )
+        .await;
+        let (directory, mut target) = download_target("lurkline-http-download-redirect-limit", 4);
+        assert!(matches!(
+            client
+                .download_private_file(
+                    base_url.join("download").unwrap().as_str(),
+                    4,
+                    Some("image/png"),
+                    &mut target,
+                )
+                .await,
+            Err(Error::RedirectLimit {
+                method: "files.download",
+                limit: 3
+            })
+        ));
+        assert_eq!(capture.requests.lock().unwrap().len(), 4);
+        drop(target);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_download_rejects_advertised_hard_limit_without_writing() {
+        let advertised = crate::service::MAX_FILE_DOWNLOAD_BYTES + 1;
+        let (client, _capture, base_url) = download_server_with_options_and_length(
+            None,
+            StatusCode::OK,
+            Some("application/octet-stream"),
+            None,
+            Some(advertised),
+            b"safe",
+        )
+        .await;
+        let (directory, mut target) = download_target("lurkline-http-download-hard-limit", 4);
+        let result = client
+            .download_private_file(
+                base_url.join("download").unwrap().as_str(),
+                advertised,
+                Some("application/octet-stream"),
+                &mut target,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+            Err(Error::ResponseTooLarge {
+                method: "files.download",
+                limit
+            }) if limit == crate::service::MAX_FILE_DOWNLOAD_BYTES as usize
+            ),
+            "{result:?}"
+        );
+        drop(target);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn private_download_rejects_unexpected_content_type_without_residue() {
         for content_type in [None, Some("text/html; charset=utf-8")] {
             let (client, _capture, base_url) =
@@ -1232,14 +1565,14 @@ mod tests {
                 .unwrap();
 
             let result = client
-                .download_private_file(base_url.join("download").unwrap().as_str(), &mut target)
+                .download_private_file(
+                    base_url.join("download").unwrap().as_str(),
+                    4,
+                    Some("image/png"),
+                    &mut target,
+                )
                 .await;
-            assert!(matches!(
-                result,
-                Err(Error::InvalidResponse {
-                    method: "files.download"
-                })
-            ));
+            assert!(matches!(result, Err(Error::FileDownloadResponse)));
             drop(target);
             assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
             std::fs::remove_dir(&directory).unwrap();

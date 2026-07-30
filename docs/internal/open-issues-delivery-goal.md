@@ -267,8 +267,28 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Not started. Milestone-start commit:
-`bb2024b6332986b02bc9381c935b670619e0b511`.
+Status: Implementation accepted on 2026-07-30; PR, merge, tag, and release
+delivery remain pending. The branch starts at
+`bb2024b6332986b02bc9381c935b670619e0b511` and targets `v0.9.1`.
+
+Focused HTTP, service, MCP, CLI-process, and raw-MCP verification passed. The
+full gate passed with 231 library tests, 12 CLI-process tests, 2 raw-MCP tests,
+and 1 package-metadata test, plus strict Clippy, formatting, locked release
+build, Rust 1.88 compatibility, credential scanning, diff checking, version
+readback, and deterministic macOS ARM64 package checksum/layout verification.
+
+The retained reviewer found missing hard-limit and generic-MIME branch
+coverage; the repair added both and the same reviewer cleared it. A fresh
+context-independent auditor found no blocking or high-severity issue. Its one
+documentation/coverage ambiguity around omitted legacy `mode` and
+`file_access` metadata was repaired, tested, and cleared on re-review.
+
+The authorized self-DM smoke test verified the profile, self identity, and
+bounded self-only conversation scope without exposing message content. Slack
+did not complete either synthetic file-share flow, so no live hosted-file
+download is claimed. Up to two private unshared synthetic file objects may
+remain because no safe artifact identifier was returned; no retry or unsafe
+cleanup was attempted.
 
 ## Milestone 2: Inbox Author Resolution (`v0.9.2`, #16)
 
