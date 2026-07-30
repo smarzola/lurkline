@@ -392,9 +392,9 @@ pub(crate) enum RawDraftRevision {
 pub(crate) struct RawUser {
     pub id: String,
     #[serde(default)]
-    pub name: String,
+    pub name: Option<String>,
     #[serde(default)]
-    pub real_name: String,
+    pub real_name: Option<String>,
     #[serde(default)]
     pub deleted: bool,
     #[serde(default)]
@@ -408,9 +408,9 @@ pub(crate) struct RawUser {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawUserProfile {
     #[serde(default)]
-    pub display_name: String,
+    pub display_name: Option<String>,
     #[serde(default)]
-    pub real_name: String,
+    pub real_name: Option<String>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -1029,9 +1029,12 @@ pub struct ThreadPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct User {
     pub id: String,
-    pub name: String,
-    pub display_name: String,
-    pub real_name: String,
+    /// Slack username; absent when Slack omitted it or supplied only whitespace.
+    pub name: Option<String>,
+    /// Profile display name; absent when Slack omitted it or supplied only whitespace.
+    pub display_name: Option<String>,
+    /// Profile real name fallback; absent when Slack omitted it or supplied only whitespace.
+    pub real_name: Option<String>,
     pub title: String,
     pub deleted: bool,
     pub is_bot: bool,
