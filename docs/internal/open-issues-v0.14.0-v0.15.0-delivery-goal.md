@@ -330,9 +330,10 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Started on 2026-07-30 from
+Status: Delivered on 2026-07-30 from
 `c645cc25772e1da647631d5a9863c2f9f7ff1a3b`, exact verified `v0.14.0`
-`origin/main`, on `feat/activity-scope-pagination`.
+`origin/main`, through `feat/activity-scope-pagination`, PR #29, and
+`v0.15.0`.
 
 Design decisions:
 
@@ -391,9 +392,27 @@ Checkpoint evidence (2026-07-30):
   immutable whole-scope snapshot. Commit
   `28ea804c76304313ad8d25b99629a8f4bd64e833` documents that limitation, and
   exact-head re-audit was clean.
-- This is the verified local release checkpoint required before publication.
-  PR, merge, tag, workflow, GitHub Release, asset verification, and issue
-  closure remain pending and are not implied by the checked milestone alone.
+- [PR #29](https://github.com/smarzola/lurkline/pull/29) passed CI run
+  `30572142199` at reviewed head
+  `75c0511e2437c07547766394da19b1d33ba110cc` and squash-merged to
+  `16846c58b9bcda42bc81517efe22e41d0ef72ede`, closing issue #26 as
+  completed. No GitHub issues remain open.
+- Annotated tag `v0.15.0` dereferences to that exact merged `main` commit.
+  Main CI `30572433043`, tag CI `30572480095`, and release workflow
+  `30572480373` all completed successfully.
+- Published GitHub Release `362651373` is neither draft nor prerelease and
+  contains exactly the three documented native archives plus their three
+  checksums. Independent downloads passed every checksum, exact versioned
+  `lurkline`/`README.md`/`LICENSE` layout and executable-mode check. Linux
+  assets match their advertised x86-64 and ARM64 architectures; the native
+  asset is a linker-signed ARM64 Mach-O and reports `lurkline 0.15.0`.
+  All verification artifacts were removed.
+- A fresh final integration audit independently verified both exact tag
+  targets, both merged PRs, both completed issues, all eight issue-specific
+  workflow runs, both six-asset releases, and the complete local gate. It
+  found no code, schema, security, privacy, compatibility, test, or release
+  defect; its only finding was the now-corrected stale pending-delivery text in
+  this goal.
 
 ## Final Verification
 
