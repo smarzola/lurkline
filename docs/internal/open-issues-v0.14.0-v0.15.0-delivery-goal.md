@@ -181,7 +181,7 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: Normalize nullable identities and release `v0.14.0` for #27.
+- [x] Milestone 1: Normalize nullable identities and release `v0.14.0` for #27.
 - [ ] Milestone 2: Traverse filtered activity scope and release `v0.15.0` for #26.
 
 ### Per-Issue Checkpoint And Delivery Protocol
@@ -236,8 +236,7 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Release candidate completed locally on 2026-07-30; PR, merge, and
-release delivery remain pending. Started from
+Status: Completed and independently verified on 2026-07-30. Started from
 `521d95ee1cfc53833afbd4cc8d97a2229094a71a`, exact `v0.13.0`
 `origin/main`, on `fix/nullable-user-identities`.
 
@@ -280,6 +279,20 @@ Local release-candidate evidence:
   including 8 genuine JSON-null display names and zero invalid identity field
   types. Only aggregate counts were emitted; no Slack write occurred, and the
   mode-0600 raw temporary file was removed with zero residue.
+- [PR #28](https://github.com/smarzola/lurkline/pull/28) passed CI run
+  `30567649318` at reviewed head
+  `eba7ebefef505c657b5802fcc5932a3c5b1137cd` and squash-merged to
+  `c645cc25772e1da647631d5a9863c2f9f7ff1a3b`, closing issue #27 as
+  completed.
+- Annotated tag `v0.14.0` dereferences to that exact merged `main` commit.
+  Main CI `30567894536`, tag CI `30567956512`, and release workflow
+  `30567956735` all completed successfully.
+- Published GitHub Release `362618362` is neither draft nor prerelease and
+  contains exactly the three documented native archives plus their three
+  checksums. Independent downloads passed every checksum, exact versioned
+  `lurkline`/`README.md`/`LICENSE` layout and executable-mode check. The native
+  asset is a linker-signed ARM64 Mach-O and reports `lurkline 0.14.0`; all
+  verification artifacts were removed.
 
 ## Milestone 2: Filtered Complete Activity Scope (`v0.15.0`, #26)
 
@@ -317,8 +330,29 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Not started. It must begin from the exact verified `v0.14.0`
-`origin/main`.
+Status: Started on 2026-07-30 from
+`c645cc25772e1da647631d5a9863c2f9f7ff1a3b`, exact verified `v0.14.0`
+`origin/main`, on `feat/activity-scope-pagination`.
+
+Design decisions:
+
+- Add a repeated typed kind selector covering channel, direct message, and
+  group direct message. Normalize and deduplicate it once, apply it before the
+  activity conversation cap, and make explicit selectors outside the allowed
+  kinds fail actionably.
+- Continue through conversation scope with the existing single opaque activity
+  cursor instead of adding a second pagination interface. Give the cursor
+  explicit message and scope phases, and expose which phase the next cursor
+  represents.
+- Reconstruct the complete bounded eligible scope on continuation and protect
+  it with a digest plus offset. Scope drift must fail stale before any history
+  read; the cursor must not embed an unbounded list of conversation IDs.
+- Keep each response to at most 50 conversations and one bounded,
+  reply-inclusive history request per selected conversation. Expose eligible
+  count, scope progress, remaining scope, and hard directory-scan truncation.
+- Preserve canonical ordering within each slice and document the canonical
+  timestamp/conversation-ID merge comparator for callers combining multiple
+  scope slices.
 
 ## Final Verification
 
