@@ -473,6 +473,11 @@ Message continuations also protect the current bounded message sample and last
 emitted key. Messages newer than the frozen upper bound cannot shift later
 message pages.
 
+After a cursor advances to another conversation-scope slice, Lurkline does not
+re-read or revalidate the completed slice. Slack does not provide an immutable
+whole-scope snapshot across calls, so later edits or deletions to already
+emitted messages cannot be detected.
+
 Each scope slice is globally ordered internally. To combine a complete
 multi-slice traversal, collect every `items` array and sort by canonical Slack
 timestamp, then conversation ID: ascending for `oldest_first`, or reverse that
