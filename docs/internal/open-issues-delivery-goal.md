@@ -205,7 +205,7 @@ The goal is complete only when:
 - [x] Milestone 1: Fix hosted file downloads and release `v0.9.1` for #17.
 - [x] Milestone 2: Resolve inbox authors and release `v0.9.2` for #16.
 - [x] Milestone 3: Name unread conversations and release `v0.10.0` for #18.
-- [ ] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
+- [x] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
 - [ ] Milestone 5: Expose canonical permalinks and release `v0.12.0` for #19.
 - [ ] Milestone 6: Deliver recent activity and release `v0.13.0` for #15.
 
@@ -539,6 +539,14 @@ Retained-review evidence:
   Clippy, release build, Rust 1.88 compatibility, credential scan, diff check,
   version readback, and deterministic package checksum/layout verification.
 
+PR #23 passed CI run `30544320018` and was squash-merged as
+`259f2456606b05ccb8e4019f10bd14a7c2737a04`, closing #14. Annotated tag
+`v0.11.0` dereferences to that exact commit. Release workflow `30544642743`,
+tag CI `30544642463`, and main CI `30544560097` all succeeded. GitHub Release
+`362438795` contained exactly six expected assets; every independently
+downloaded checksum and exact versioned `lurkline`, `README.md`, and `LICENSE`
+archive layout passed verification.
+
 ## Milestone 5: Canonical Message Permalinks (`v0.12.0`, #19)
 
 Acceptance criteria:
@@ -565,7 +573,36 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Not started.
+Status: Started on 2026-07-30 from
+`259f2456606b05ccb8e4019f10bd14a7c2737a04`, the exact `v0.11.0`
+`origin/main`.
+
+Design decisions:
+
+- Build canonical links locally from the already validated workspace origin,
+  conversation ID, and Slack timestamp. Slack documents the deterministic
+  root path and reply query format; avoiding `chat.getPermalink` calls keeps
+  channel, thread, inbox, and search reads at zero additional network
+  requests.
+- Every structured message and search match adds `permalink`,
+  `thread_root_permalink`, and a typed `complete`, `partial`, or `unavailable`
+  resolution state. A thread root does not duplicate itself in
+  `thread_root_permalink`; a reply exposes both its exact link and its root.
+- Normalize timestamp fractions to Slack's six-digit permalink form. Any
+  otherwise retained noncanonical timestamp degrades link fields rather than
+  discarding the message.
+- A Slack-provided search permalink is used only when it is a credential-free,
+  fragment-free URL on the configured workspace origin with the exact expected
+  message route and reply query. Missing or malformed auxiliary URLs fall back
+  to deterministic construction.
+- Human `message get` output shows the exact link and, for replies, its root.
+  Search rows include the exact link because returning to a found result is a
+  primary journey. Channel, thread, and inbox rows remain concise; their JSON
+  and MCP results still include both link fields.
+- The same pure builder covers public/private channels, direct messages, group
+  DMs, roots, replies, sent acknowledgements, and every public read path. It
+  does not expose the workspace origin anywhere except explicit requested
+  output.
 
 ## Milestone 6: Bounded Recent Activity (`v0.13.0`, #15)
 
