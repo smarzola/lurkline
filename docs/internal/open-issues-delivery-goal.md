@@ -206,7 +206,7 @@ The goal is complete only when:
 - [x] Milestone 2: Resolve inbox authors and release `v0.9.2` for #16.
 - [x] Milestone 3: Name unread conversations and release `v0.10.0` for #18.
 - [x] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
-- [ ] Milestone 5: Expose canonical permalinks and release `v0.12.0` for #19.
+- [x] Milestone 5: Expose canonical permalinks and release `v0.12.0` for #19.
 - [ ] Milestone 6: Deliver recent activity and release `v0.13.0` for #15.
 
 ### Per-Issue Checkpoint And Delivery Protocol
@@ -614,6 +614,41 @@ Design decisions:
   Slack calls. The validated Slack workspace origin remains distinct from API
   transport origins used by synthetic loopback tests, and is exposed only in
   explicitly requested output.
+
+Implementation and verification:
+
+- `Message` and `MessageSearchMatch` now expose an exact `permalink`, optional
+  `thread_root_permalink`, and typed `permalink_resolution`. One pure builder
+  covers C/D/G roots, replies, canonical-equivalent self roots, inbox,
+  channel/thread/exact reads, search, and sent acknowledgements with no added
+  Slack requests.
+- Link construction right-pads one-to-six-digit fractions, never truncates
+  longer fractions, uses URL serialization, and validates an independently
+  stored Slack workspace origin so synthetic loopback API transports cannot
+  leak into results.
+- Human exact-message output adds `link` and applicable `thread-root` lines;
+  search rows append the useful exact link. Shared channel, thread, and inbox
+  rows remain unchanged while JSON and MCP derive all fields from the same
+  typed models.
+- The retained reviewer found that Slack search may omit structured
+  `thread_ts`. Search now treats a supplied URL only as strictly validated
+  route evidence, derives missing reply context when safe, lets structured
+  metadata win conflicts, and always reconstructs output locally.
+- The fresh auditor then found that missing or rejected search route evidence
+  did not prove a root. Such matches now omit unproven links and report
+  `unavailable`; a validated root route is required for a complete root link.
+  The auditor's final re-review at `4579974bf8be5915dbc77abc386136b4062fb33f`
+  reported no blocking or actionable findings.
+- The final repository-wide gate passes 262 library tests, 12 CLI process
+  tests, 2 raw MCP tests, and 1 package metadata test, plus formatting, strict
+  Clippy, release build, Rust 1.88 compatibility, credential scan, diff check,
+  version readback, and deterministic package checksum/layout verification.
+  No live Slack smoke was needed because construction is pure and fully
+  covered by synthetic route fixtures.
+
+Status: Locally complete and publication-ready on 2026-07-30 at
+`4579974bf8be5915dbc77abc386136b4062fb33f`; PR, merge, tag, workflow, release,
+and published-asset evidence follow before Milestone 6 begins.
 
 ## Milestone 6: Bounded Recent Activity (`v0.13.0`, #15)
 
