@@ -506,6 +506,28 @@ pub enum ConversationSearchTruncationReason {
     ScanLimit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionResolution {
+    /// The selected message representation contains no user mentions.
+    NotNeeded,
+    /// Mentions were detected but this acknowledgement path does not perform enrichment.
+    NotAttempted,
+    /// Every detected mention has a safe rendered identity.
+    Complete,
+    /// At least one mention could not be rendered after a complete or bounded lookup.
+    Partial,
+    /// At least one mention remained unresolved after an interrupted or conflicting lookup.
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct MessageMention {
+    pub id: String,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct MessageSearchMatch {
     pub channel_id: String,
@@ -518,7 +540,13 @@ pub struct MessageSearchMatch {
     /// Slack profile display name, falling back to the profile's real name.
     pub author_display_name: Option<String>,
     pub author_resolution: AuthorResolution,
+    /// Canonical Slack-native message text.
     pub text: String,
+    /// Read-only human rendering. Outbound operations never use this value.
+    pub rendered_text: String,
+    pub mention_resolution: MentionResolution,
+    /// Unique user mentions in first-encounter order.
+    pub mentions: Vec<MessageMention>,
     /// Raw Slack Block Kit JSON. `None` means Slack omitted `blocks`; an empty
     /// vector means Slack explicitly returned an empty array.
     pub blocks: Option<Vec<Value>>,
@@ -720,7 +748,13 @@ pub struct Message {
     /// Slack profile display name, falling back to the profile's real name.
     pub author_display_name: Option<String>,
     pub author_resolution: AuthorResolution,
+    /// Canonical Slack-native message text.
     pub text: String,
+    /// Read-only human rendering. Outbound operations never use this value.
+    pub rendered_text: String,
+    pub mention_resolution: MentionResolution,
+    /// Unique user mentions in first-encounter order.
+    pub mentions: Vec<MessageMention>,
     /// Raw Slack Block Kit JSON. Unknown block and element fields are retained.
     pub blocks: Option<Vec<Value>>,
     /// Raw Slack legacy-attachment JSON. Unknown nested fields are retained.

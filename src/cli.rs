@@ -1577,7 +1577,7 @@ fn format_message_line(message: &Message) -> String {
             message.author_display_name.as_deref(),
             message.author_resolution,
         ),
-        escape_human(&message.text),
+        escape_human(&message.rendered_text),
         message.reply_count
     )
 }
@@ -1617,7 +1617,7 @@ fn format_search_match(message: &crate::model::MessageSearchMatch) -> String {
             message.author_display_name.as_deref(),
             message.author_resolution,
         ),
-        escape_human(&message.text)
+        escape_human(&message.rendered_text)
     )
 }
 
@@ -2227,7 +2227,14 @@ mod tests {
             author_name: Some("alice".into()),
             author_display_name: Some("Alice Example".into()),
             author_resolution: AuthorResolution::Directory,
-            text: "hello\r\x1b".into(),
+            text: "hello <@U456>\r\x1b".into(),
+            rendered_text: "hello @bob\r\x1b".into(),
+            mention_resolution: crate::model::MentionResolution::Complete,
+            mentions: vec![crate::model::MessageMention {
+                id: "U456".into(),
+                username: Some("bob".into()),
+                display_name: Some("Bob Example".into()),
+            }],
             blocks: None,
             attachments: None,
             reply_count: 2,
@@ -2237,7 +2244,7 @@ mod tests {
         };
         assert_eq!(
             format_message_line(&message),
-            "100.000001\t@alice\thello\\r\\u{1b}\treplies=2"
+            "100.000001\t@alice\thello @bob\\r\\u{1b}\treplies=2"
         );
     }
 
@@ -2257,7 +2264,14 @@ mod tests {
                 author_name: None,
                 author_display_name: None,
                 author_resolution: crate::model::AuthorResolution::Unresolved,
-                text: "hello\r\x1b".into(),
+                text: "hello <@U789>\r\x1b".into(),
+                rendered_text: "hello @carol\r\x1b".into(),
+                mention_resolution: crate::model::MentionResolution::Complete,
+                mentions: vec![crate::model::MessageMention {
+                    id: "U789".into(),
+                    username: Some("carol".into()),
+                    display_name: None,
+                }],
                 blocks: None,
                 attachments: None,
                 reactions: vec![],
@@ -2266,7 +2280,7 @@ mod tests {
             };
             assert_eq!(
                 format_search_match(&message),
-                format!("100.000001\t{id}\t{name}\tU456 [unresolved]\thello\\r\\u{{1b}}")
+                format!("100.000001\t{id}\t{name}\tU456 [unresolved]\thello @carol\\r\\u{{1b}}")
             );
         }
     }

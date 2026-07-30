@@ -480,9 +480,10 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Started on 2026-07-30 from
+Status: Implementation and retained-review checkpoint complete locally on
+2026-07-30 from
 `bb53551675740f676ab0d1c174a435689a16128e`, the exact `v0.10.0`
-`origin/main`.
+`origin/main`. Publication gates remain pending.
 
 Design decisions:
 
@@ -507,9 +508,36 @@ Design decisions:
   `rendered_text`. Send and reply requests still use only canonical outbound
   text and blocks; acknowledgement messages with mentions remain explicitly
   `not_attempted` unless a read operation enriches them.
-- A live smoke would leave an undeletable synthetic Slack message and adds
-  little confidence over deterministic block/text and exact outbound request
-  fixtures, so no live Slack operation is planned.
+- No synthetic message was created because Slack messages cannot be cleaned up.
+  An authorized read-only smoke against the `sfera` profile's `@smarzola`
+  self-DM inspected only aggregate structure: 20 messages all retained
+  canonical, rendered, and typed mention fields, with no message content,
+  names, or IDs emitted.
+
+Retained-review evidence:
+
+- The first checkpoint found that ordered rich-text lists ignored Slack's
+  zero-based `offset`, rendering a list starting at 3 as starting at 1.
+  The strict renderer now validates ordered-only unsigned offsets, uses checked
+  numbering, rejects malformed offset shapes, and covers 3/4 rendering.
+- The second checkpoint found that the public 256-mention and 40,000-byte
+  derived-render bounds were not documented. README now explains both bounds,
+  their `partial` state, and canonical-text fallback.
+- After both repairs, the retained reviewer reported no blocking or actionable
+  finding.
+- The fresh auditor then found that recognized rich-text nodes were accepted
+  in invalid parent/child positions and malformed style values could suppress
+  canonical mention fallback. The repair makes traversal context-aware:
+  `rich_text` contains only block containers, lists contain only sections, and
+  sections, quotes, and preformatted blocks contain only validated inline
+  elements. Malformed trees now fall back without changing raw blocks.
+- The auditor's re-review found one misleading node-bound fixture. It now
+  reaches the 4,096-node cap using grammar-valid section siblings. A final
+  re-review reported a clean verdict with no remaining finding.
+- The final repository-wide gate passes 255 library tests, 12 CLI process
+  tests, 2 raw MCP tests, and 1 package metadata test, plus formatting, strict
+  Clippy, release build, Rust 1.88 compatibility, credential scan, diff check,
+  version readback, and deterministic package checksum/layout verification.
 
 ## Milestone 5: Canonical Message Permalinks (`v0.12.0`, #19)
 
