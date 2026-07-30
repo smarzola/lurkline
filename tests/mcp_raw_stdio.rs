@@ -59,6 +59,32 @@ async fn call_tool(
     response_with_id(stdout, id).await
 }
 
+fn find_user_properties(value: &Value) -> Option<&serde_json::Map<String, Value>> {
+    match value {
+        Value::Object(object) => {
+            if let Some(properties) = object.get("properties").and_then(Value::as_object)
+                && ["id", "name", "display_name", "real_name", "title"]
+                    .iter()
+                    .all(|field| properties.contains_key(*field))
+            {
+                return Some(properties);
+            }
+            object.values().find_map(find_user_properties)
+        }
+        Value::Array(values) => values.iter().find_map(find_user_properties),
+        _ => None,
+    }
+}
+
+fn schema_allows_null(value: &Value) -> bool {
+    match value {
+        Value::String(value) => value == "null",
+        Value::Array(values) => values.iter().any(schema_allows_null),
+        Value::Object(object) => object.values().any(schema_allows_null),
+        _ => false,
+    }
+}
+
 #[tokio::test]
 async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lurkline"))
@@ -212,6 +238,20 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         assert!(
             unreads_output_schema.contains(expected),
             "unreads output schema omits {expected}"
+        );
+    }
+    let find_users_tool = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "slack_find_users")
+        .unwrap();
+    let user_properties =
+        find_user_properties(&find_users_tool["outputSchema"]).expect("public User schema");
+    for field in ["name", "display_name", "real_name"] {
+        assert!(
+            schema_allows_null(&user_properties[field]),
+            "public User.{field} schema must allow JSON null"
         );
     }
     let activity_tool = tools["result"]["tools"]

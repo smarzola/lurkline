@@ -474,6 +474,13 @@ lurkline message get platform 1712345678.000100
 lurkline users find alice --limit 20
 ```
 
+User JSON and MCP output use nullable `name`, `display_name`, and `real_name`
+fields. Omitted, JSON-null, empty, and whitespace-only Slack identity values
+normalize to JSON `null`; a genuine value equal to the string `"null"` remains
+the string `"null"`. Human user rows show `-` for an absent field. DM
+conversation output remains directly addressable by falling back to its stable
+user ID and reporting `name_is_fallback`.
+
 Message and search JSON preserve Slack's raw `blocks` and legacy
 `attachments` arrays alongside normalized fields. Unknown nested fields remain
 unchanged. For either field, `null` means Slack omitted it and `[]` means Slack

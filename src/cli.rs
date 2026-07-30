@@ -1744,11 +1744,11 @@ fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
     } else {
         for user in &report.users {
             println!(
-                "{}\t@{}\t{}\t{}",
+                "{}\t{}\t{}\t{}",
                 user.id,
-                escape_human(&user.name),
-                escape_human(&user.display_name),
-                escape_human(&user.real_name)
+                format_optional_username(user.name.as_deref()),
+                format_optional_user_field(user.display_name.as_deref()),
+                format_optional_user_field(user.real_name.as_deref())
             );
         }
     }
@@ -1756,6 +1756,16 @@ fn print_users(report: UserSearchReport, json: bool) -> Result<()> {
         println!("{notice}");
     }
     Ok(())
+}
+
+fn format_optional_username(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("@{}", escape_human(value)))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_optional_user_field(value: Option<&str>) -> String {
+    value.map(escape_human).unwrap_or_else(|| "-".to_owned())
 }
 
 fn format_search_match(message: &crate::model::MessageSearchMatch) -> String {
@@ -2338,9 +2348,9 @@ mod tests {
             users: (0..MAX_USERS)
                 .map(|index| crate::model::User {
                     id: format!("U{index}"),
-                    name: String::new(),
-                    display_name: String::new(),
-                    real_name: String::new(),
+                    name: None,
+                    display_name: None,
+                    real_name: None,
                     title: String::new(),
                     deleted: false,
                     is_bot: false,
@@ -2365,6 +2375,14 @@ mod tests {
             "plain\\r\\u{1b}\\n\\t\\u{8}text"
         );
         assert_eq!(escape_human("café 🚀"), "café 🚀");
+    }
+
+    #[test]
+    fn missing_user_identity_fields_have_explicit_human_placeholders() {
+        assert_eq!(format_optional_username(None), "-");
+        assert_eq!(format_optional_user_field(None), "-");
+        assert_eq!(format_optional_username(Some("null")), "@null");
+        assert_eq!(format_optional_user_field(Some("null")), "null");
     }
 
     #[test]

@@ -3435,7 +3435,8 @@ fn normalize_conversations(
                     )?;
                     let user = users.get(&user_id);
                     let loaded_name = user
-                        .map(|user| user.name.trim())
+                        .and_then(|user| user.name.as_deref())
+                        .map(str::trim)
                         .filter(|name| is_valid_conversation_name(name))
                         .map(str::to_owned);
                     let name_is_fallback = loaded_name.is_none();
@@ -3443,11 +3444,13 @@ fn normalize_conversations(
                     let display_name = user
                         .and_then(|user| {
                             [
-                                user.display_name.trim(),
-                                user.real_name.trim(),
-                                user.name.trim(),
+                                user.display_name.as_deref(),
+                                user.real_name.as_deref(),
+                                user.name.as_deref(),
                             ]
                             .into_iter()
+                            .flatten()
+                            .map(str::trim)
                             .find(|value| is_valid_conversation_name(value))
                         })
                         .unwrap_or(&user_id)
@@ -3613,9 +3616,11 @@ fn resolved_plain_conversation_name(value: &str) -> ResolvedUnreadName {
 }
 
 fn resolved_user_conversation_name(user: &User) -> ResolvedUnreadName {
-    let name = directory_author_label(&user.name);
-    let display_name = directory_author_label(&user.display_name)
-        .or_else(|| directory_author_label(&user.real_name))
+    let name = user.name.clone();
+    let display_name = user
+        .display_name
+        .clone()
+        .or_else(|| user.real_name.clone())
         .or_else(|| name.clone());
     if name.is_none() && display_name.is_none() {
         return unread_name_with_resolution(ConversationNameResolution::Unnamed);
@@ -5141,9 +5146,8 @@ fn enrich_mentions(
                     display_name: None,
                 };
             };
-            let username = directory_author_label(&user.name);
-            let display_name = directory_author_label(&user.display_name)
-                .or_else(|| directory_author_label(&user.real_name));
+            let username = user.name.clone();
+            let display_name = user.display_name.clone().or_else(|| user.real_name.clone());
             if let Some(label) = username.as_ref().or(display_name.as_ref()) {
                 labels.insert(id.clone(), label.clone());
             } else {
@@ -5300,20 +5304,14 @@ fn enrich_author(
         return;
     }
     if let Some(user) = directory.users.get(author_id) {
-        *author_name = directory_author_label(&user.name);
-        *author_display_name = directory_author_label(&user.display_name)
-            .or_else(|| directory_author_label(&user.real_name));
+        *author_name = user.name.clone();
+        *author_display_name = user.display_name.clone().or_else(|| user.real_name.clone());
         if author_name.is_some() || author_display_name.is_some() {
             *author_resolution = AuthorResolution::Directory;
             return;
         }
     }
     *author_resolution = missing_resolution;
-}
-
-fn directory_author_label(value: &str) -> Option<String> {
-    let value = value.trim();
-    is_valid_author_label(value).then(|| value.to_owned())
 }
 
 fn normalize_message_author_name(author_name: Option<String>) -> Option<String> {
@@ -5684,15 +5682,12 @@ fn normalize_user_directory_page(
 }
 
 fn normalize_user(raw: RawUser) -> User {
-    let real_name = if raw.profile.real_name.is_empty() {
-        raw.real_name
-    } else {
-        raw.profile.real_name
-    };
+    let real_name = normalize_optional_identity_label(raw.profile.real_name)
+        .or_else(|| normalize_optional_identity_label(raw.real_name));
     User {
         id: raw.id,
-        name: raw.name,
-        display_name: raw.profile.display_name,
+        name: normalize_optional_identity_label(raw.name),
+        display_name: normalize_optional_identity_label(raw.profile.display_name),
         real_name,
         title: raw.profile.title,
         deleted: raw.deleted,
@@ -5704,15 +5699,22 @@ fn normalize_user(raw: RawUser) -> User {
 
 fn user_matches(user: &RawUser, needle: &str) -> bool {
     [
-        user.id.as_str(),
-        user.name.as_str(),
-        user.real_name.as_str(),
-        user.profile.display_name.as_str(),
-        user.profile.real_name.as_str(),
-        user.profile.title.as_str(),
+        Some(user.id.as_str()),
+        user.name.as_deref(),
+        user.real_name.as_deref(),
+        user.profile.display_name.as_deref(),
+        user.profile.real_name.as_deref(),
+        Some(user.profile.title.as_str()),
     ]
     .iter()
+    .flatten()
     .any(|candidate| candidate.to_lowercase().contains(needle))
+}
+
+fn normalize_optional_identity_label(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    is_valid_author_label(value).then(|| value.to_owned())
 }
 
 fn validate_conversation_reference(reference: &str) -> Result<String> {
@@ -7667,11 +7669,11 @@ mod tests {
     fn raw_user(id: &str, name: &str, display_name: &str) -> RawUser {
         RawUser {
             id: id.into(),
-            name: name.into(),
-            real_name: "Fallback Name".into(),
+            name: Some(name.into()),
+            real_name: Some("Fallback Name".into()),
             profile: RawUserProfile {
-                display_name: display_name.into(),
-                real_name: "Profile Name".into(),
+                display_name: Some(display_name.into()),
+                real_name: Some("Profile Name".into()),
                 title: "Engineer".into(),
                 ..RawUserProfile::default()
             },
@@ -7687,6 +7689,197 @@ mod tests {
                 limit: USERS_PAGE_SIZE,
             }]
         );
+    }
+
+    #[test]
+    fn nullable_user_identity_normalization_preserves_a_literal_null_string() {
+        let overlong = "x".repeat(257);
+        for raw in [
+            json!({"id": "UOMITTED", "profile": {}}),
+            json!({
+                "id": "UNULL",
+                "name": null,
+                "real_name": null,
+                "profile": {
+                    "display_name": null,
+                    "real_name": null
+                }
+            }),
+            json!({
+                "id": "UEMPTY",
+                "name": "",
+                "real_name": " ",
+                "profile": {
+                    "display_name": "\t",
+                    "real_name": "\n"
+                }
+            }),
+            json!({
+                "id": "UCONTROL",
+                "name": "bad\nname",
+                "real_name": "bad\u{7}name",
+                "profile": {
+                    "display_name": "bad\tname",
+                    "real_name": "bad\u{1b}name"
+                }
+            }),
+            json!({
+                "id": "UOVERLONG",
+                "name": overlong,
+                "real_name": overlong,
+                "profile": {
+                    "display_name": overlong,
+                    "real_name": overlong
+                }
+            }),
+        ] {
+            let user = normalize_user(serde_json::from_value(raw).unwrap());
+            assert_eq!(user.name, None);
+            assert_eq!(user.display_name, None);
+            assert_eq!(user.real_name, None);
+            let json = serde_json::to_value(user).unwrap();
+            assert_eq!(json["name"], serde_json::Value::Null);
+            assert_eq!(json["display_name"], serde_json::Value::Null);
+            assert_eq!(json["real_name"], serde_json::Value::Null);
+        }
+
+        let user = normalize_user(
+            serde_json::from_value(json!({
+                "id": "ULITERAL",
+                "name": " null ",
+                "real_name": " Real Name ",
+                "profile": {
+                    "display_name": " null ",
+                    "real_name": " Profile Name "
+                }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(user.name.as_deref(), Some("null"));
+        assert_eq!(user.display_name.as_deref(), Some("null"));
+        assert_eq!(user.real_name.as_deref(), Some("Profile Name"));
+        let json = serde_json::to_value(user).unwrap();
+        assert_eq!(json["name"], "null");
+        assert_eq!(json["display_name"], "null");
+
+        let user = normalize_user(
+            serde_json::from_value(json!({
+                "id": "UTOPLEVEL",
+                "real_name": " Top Level Name ",
+                "profile": {
+                    "real_name": " "
+                }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(user.real_name.as_deref(), Some("Top Level Name"));
+    }
+
+    #[test]
+    fn nullable_directory_identities_flow_to_author_and_mention_json() {
+        let absent_display = normalize_user(RawUser {
+            id: "UABSENT".into(),
+            name: Some("alice".into()),
+            profile: RawUserProfile {
+                display_name: None,
+                real_name: None,
+                ..RawUserProfile::default()
+            },
+            ..RawUser::default()
+        });
+        let literal_null = normalize_user(RawUser {
+            id: "ULITERAL".into(),
+            name: Some("example".into()),
+            profile: RawUserProfile {
+                display_name: Some("null".into()),
+                real_name: None,
+                ..RawUserProfile::default()
+            },
+            ..RawUser::default()
+        });
+        let unsafe_user = normalize_user(RawUser {
+            id: "UUNSAFE".into(),
+            name: Some("bad\nname".into()),
+            real_name: Some("bad\u{7}name".into()),
+            profile: RawUserProfile {
+                display_name: Some("x".repeat(257)),
+                real_name: Some("bad\u{1b}name".into()),
+                ..RawUserProfile::default()
+            },
+            ..RawUser::default()
+        });
+        assert_eq!(unsafe_user.name, None);
+        assert_eq!(unsafe_user.display_name, None);
+        assert_eq!(unsafe_user.real_name, None);
+        let unsafe_json = serde_json::to_value(&unsafe_user).unwrap();
+        assert_eq!(unsafe_json["name"], serde_json::Value::Null);
+        assert_eq!(unsafe_json["display_name"], serde_json::Value::Null);
+        assert_eq!(unsafe_json["real_name"], serde_json::Value::Null);
+
+        let unread = resolved_user_conversation_name(&unsafe_user);
+        assert_eq!(unread.name, None);
+        assert_eq!(unread.display_name, None);
+        assert_eq!(unread.resolution, ConversationNameResolution::Unnamed);
+
+        let directory = AuthorDirectory::Loaded(UserDirectory {
+            users: HashMap::from([
+                ("UABSENT".into(), absent_display),
+                ("ULITERAL".into(), literal_null),
+                ("UUNSAFE".into(), unsafe_user),
+            ]),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        });
+
+        let mut author_name = None;
+        let mut author_display_name = None;
+        let mut author_resolution = AuthorResolution::NotAttempted;
+        enrich_author(
+            Some("UABSENT"),
+            &mut author_name,
+            &mut author_display_name,
+            &mut author_resolution,
+            &directory,
+        );
+        assert_eq!(author_name.as_deref(), Some("alice"));
+        assert_eq!(author_display_name, None);
+        assert_eq!(author_resolution, AuthorResolution::Directory);
+
+        let mut unsafe_author_name = None;
+        let mut unsafe_author_display_name = None;
+        let mut unsafe_author_resolution = AuthorResolution::NotAttempted;
+        enrich_author(
+            Some("UUNSAFE"),
+            &mut unsafe_author_name,
+            &mut unsafe_author_display_name,
+            &mut unsafe_author_resolution,
+            &directory,
+        );
+        assert_eq!(unsafe_author_name, None);
+        assert_eq!(unsafe_author_display_name, None);
+        assert_eq!(unsafe_author_resolution, AuthorResolution::Unresolved);
+
+        let text = "<@UABSENT> <@ULITERAL> <@UUNSAFE>";
+        let (mut rendered_text, mut mention_resolution, mut mentions) =
+            initial_mention_fields(text, None);
+        enrich_mentions(
+            text,
+            None,
+            &mut rendered_text,
+            &mut mention_resolution,
+            &mut mentions,
+            &directory,
+        );
+        assert_eq!(mention_resolution, MentionResolution::Partial);
+        assert_eq!(mentions[0].display_name, None);
+        assert_eq!(mentions[1].display_name.as_deref(), Some("null"));
+        assert_eq!(mentions[2].username, None);
+        assert_eq!(mentions[2].display_name, None);
+        let json = serde_json::to_value(mentions).unwrap();
+        assert_eq!(json[0]["display_name"], serde_json::Value::Null);
+        assert_eq!(json[1]["display_name"], "null");
+        assert_eq!(json[2]["username"], serde_json::Value::Null);
+        assert_eq!(json[2]["display_name"], serde_json::Value::Null);
     }
 
     fn raw_conversation(id: &str, name: &str) -> RawConversation {
@@ -9788,8 +9981,8 @@ mod tests {
             },
         }]));
         let mut display_only = raw_user("WBOB", "bad\nname", "Bob Example");
-        display_only.real_name.clear();
-        display_only.profile.real_name.clear();
+        display_only.real_name = None;
+        display_only.profile.real_name = None;
         api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
             members: vec![raw_user("WALI", "alice", "Alice Example"), display_only],
             response_metadata: RawResponseMetadata {
@@ -11997,8 +12190,8 @@ mod tests {
         );
 
         let mut display_only = raw_user("UBOB", "\n", "Bob Example");
-        display_only.real_name.clear();
-        display_only.profile.real_name.clear();
+        display_only.real_name = None;
+        display_only.profile.real_name = None;
         let directory = AuthorDirectory::Loaded(UserDirectory {
             users: HashMap::from([
                 (
@@ -12315,8 +12508,8 @@ mod tests {
         assert_eq!(resolution, MentionResolution::Partial);
 
         let mut unsafe_user = raw_user("UUNSAFE", "\n", "\t");
-        unsafe_user.real_name = "\r".into();
-        unsafe_user.profile.real_name = "\r".into();
+        unsafe_user.real_name = Some("\r".into());
+        unsafe_user.profile.real_name = Some("\r".into());
         let unsafe_directory = AuthorDirectory::Loaded(UserDirectory {
             users: HashMap::from([("UUNSAFE".into(), normalize_user(unsafe_user))]),
             conflicting_ids: HashSet::new(),
