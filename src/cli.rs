@@ -20,13 +20,13 @@ use crate::{
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     mcp,
     model::{
-        AuthorResolution, Conversation, ConversationKind, ConversationPage,
-        ConversationSearchReport, ConversationSearchTruncationReason, CustomEmojiKind,
-        CustomEmojiList, DoctorReport, Draft, DraftDeleteReport, DraftPage, DraftSendReport,
-        FileDownloadReport, FileDraftAssociation, FileDraftCreateReport, FileReference,
-        FileUploadReport, InboxReport, InboxTruncationReason, Message, MessagePage,
+        AuthorResolution, Conversation, ConversationKind, ConversationNameResolution,
+        ConversationPage, ConversationSearchReport, ConversationSearchTruncationReason,
+        CustomEmojiKind, CustomEmojiList, DoctorReport, Draft, DraftDeleteReport, DraftPage,
+        DraftSendReport, FileDownloadReport, FileDraftAssociation, FileDraftCreateReport,
+        FileReference, FileUploadReport, InboxReport, InboxTruncationReason, Message, MessagePage,
         MessageSearchPage, ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage,
-        UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        UnreadConversation, UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
     service::{
         DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES, FileDraftCreateRequest,
@@ -61,7 +61,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List conversations and thread counts Slack marks unread.
+    /// List named conversations and thread counts Slack marks unread.
     Unreads {
         /// Emit stable JSON.
         #[arg(long)]
@@ -1317,8 +1317,9 @@ fn print_unreads(report: UnreadReport, json: bool) -> Result<()> {
     for conversation in report.conversations {
         let kind = conversation_kind_label(conversation.kind);
         println!(
-            "{kind}\t{}\tmentions={}\tlast_read={}\tlatest={}",
+            "{kind}\t{}\t{}\tmentions={}\tlast_read={}\tlatest={}",
             conversation.id,
+            unread_conversation_label(&conversation),
             conversation.mention_count,
             escape_human(conversation.last_read.as_deref().unwrap_or("-")),
             escape_human(conversation.latest.as_deref().unwrap_or("-"))
@@ -1332,6 +1333,33 @@ fn print_unreads(report: UnreadReport, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn unread_conversation_label(conversation: &UnreadConversation) -> String {
+    if conversation.name_resolution == ConversationNameResolution::Resolved {
+        let label = match conversation.kind {
+            ConversationKind::Channel => {
+                conversation.name.as_deref().map(|name| format!("#{name}"))
+            }
+            ConversationKind::DirectMessage => conversation
+                .name
+                .as_deref()
+                .map(|name| format!("@{name}"))
+                .or_else(|| conversation.display_name.clone()),
+            ConversationKind::GroupDirectMessage => conversation.display_name.clone(),
+        };
+        if let Some(label) = label {
+            return escape_human(&label);
+        }
+    }
+    let state = match conversation.name_resolution {
+        ConversationNameResolution::Resolved => "unnamed",
+        ConversationNameResolution::Incomplete => "name incomplete",
+        ConversationNameResolution::Inaccessible => "name inaccessible",
+        ConversationNameResolution::Unnamed => "unnamed",
+        ConversationNameResolution::Unavailable => "name unavailable",
+    };
+    format!("[{state}]")
 }
 
 fn print_inbox(report: InboxReport, json: bool) -> Result<()> {
@@ -1659,7 +1687,7 @@ fn user_truncation_notice(report: &UserSearchReport) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::*;
 
@@ -1695,6 +1723,96 @@ mod tests {
                 json: true
             }
         ));
+    }
+
+    #[test]
+    fn unread_help_promises_named_conversations() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("List named conversations and thread counts Slack marks unread"));
+    }
+
+    #[test]
+    fn unread_human_labels_prefer_safe_names_and_explain_fallbacks() {
+        let conversation =
+            |kind, name: Option<&str>, display_name: Option<&str>, resolution| UnreadConversation {
+                id: "C123".into(),
+                kind,
+                name: name.map(str::to_owned),
+                display_name: display_name.map(str::to_owned),
+                name_resolution: resolution,
+                has_unreads: true,
+                mention_count: 1,
+                last_read: None,
+                latest: None,
+            };
+
+        assert_eq!(
+            unread_conversation_label(&conversation(
+                ConversationKind::Channel,
+                Some("general"),
+                Some("general"),
+                ConversationNameResolution::Resolved,
+            )),
+            "#general"
+        );
+        assert_eq!(
+            unread_conversation_label(&conversation(
+                ConversationKind::DirectMessage,
+                Some("alice"),
+                Some("Alice Example"),
+                ConversationNameResolution::Resolved,
+            )),
+            "@alice"
+        );
+        assert_eq!(
+            unread_conversation_label(&conversation(
+                ConversationKind::DirectMessage,
+                None,
+                Some("Alice Example"),
+                ConversationNameResolution::Resolved,
+            )),
+            "Alice Example"
+        );
+        assert_eq!(
+            unread_conversation_label(&conversation(
+                ConversationKind::GroupDirectMessage,
+                Some("alice, bob"),
+                Some("alice, bob"),
+                ConversationNameResolution::Resolved,
+            )),
+            "alice, bob"
+        );
+        assert_eq!(
+            unread_conversation_label(&conversation(
+                ConversationKind::Channel,
+                Some("bad\tname"),
+                Some("bad\tname"),
+                ConversationNameResolution::Resolved,
+            )),
+            "#bad\\tname"
+        );
+        for (resolution, expected) in [
+            (ConversationNameResolution::Incomplete, "[name incomplete]"),
+            (
+                ConversationNameResolution::Inaccessible,
+                "[name inaccessible]",
+            ),
+            (ConversationNameResolution::Unnamed, "[unnamed]"),
+            (
+                ConversationNameResolution::Unavailable,
+                "[name unavailable]",
+            ),
+        ] {
+            assert_eq!(
+                unread_conversation_label(&conversation(
+                    ConversationKind::Channel,
+                    None,
+                    None,
+                    resolution,
+                )),
+                expected
+            );
+        }
     }
 
     #[test]

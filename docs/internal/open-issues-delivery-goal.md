@@ -396,7 +396,8 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Started on 2026-07-30 from
+Status: Implementation accepted on 2026-07-30; PR, merge, tag, and release
+delivery remain pending. The branch started from
 `3954fdab4518d919794d799ac8c829e78fa05b29`, the exact `v0.9.2`
 `origin/main`.
 
@@ -410,7 +411,9 @@ Design decisions:
   `incomplete`, `inaccessible`, `unnamed`, or `unavailable`.
 - One bounded conversation-directory scan resolves all unread IDs. A single
   bounded user-directory scan is added only when matched DMs need participant
-  identity. Valid partial results survive later scan errors or bounds.
+  identity. Each target-aware scan stops once all requested identities are
+  accounted for; valid partial results survive errors or bounds reached before
+  that point.
 - Human output uses `#channel`, `@username`, display-name-only DM fallback,
   and a friendly participant list for Slack's internal MPDM name shape. It
   never presents an opaque internal MPDM token as a human label.
@@ -422,6 +425,25 @@ Design decisions:
   conversations outside the authorized `smarzola` self-DM. Synthetic CLI,
   JSON, MCP, partial-scan, malformed-response, and request-count coverage is
   required.
+
+Focused unread, inbox, CLI, and raw-MCP verification passed. The final full
+gate passed with 246 library tests, 12 CLI-process tests, 2 raw-MCP tests, and
+1 package-metadata test, plus formatting, strict Clippy, locked release build,
+Rust 1.88 compatibility, credential scanning, diff checking, version readback,
+and reproducible macOS ARM64 package checksum/layout verification. The first
+constrained full-test attempt could not bind 25 localhost HTTP fixtures and
+failed with `Operation not permitted`; the authorized out-of-sandbox rerun
+passed every test.
+
+The retained reviewer found that public DM resolution silently accepted
+duplicate user rows and scanned past already resolved target users. The repair
+added a target-aware conflict-detecting user scan with same-page,
+necessarily-scanned cross-page, early-completion, and partial-result coverage.
+A fresh auditor then found the inbox's reused generic directory still accepted
+duplicate user rows. The final repair removes and remembers those conflicts,
+marks affected DM names and message authors `unavailable`, and proves both
+outputs reuse one user scan. Both reviewers cleared the final diff with no
+finding at any severity. No live Slack operation was performed.
 
 ## Milestone 4: Fidelity-Preserving Mention Rendering (`v0.11.0`, #14)
 
