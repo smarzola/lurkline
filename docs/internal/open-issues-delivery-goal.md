@@ -117,7 +117,7 @@ Follow `AGENTS.md`.
   payloads, workspace messages, names, identifiers, URLs, or file contents.
   Use synthetic fixtures in code, tests, documentation, review packets, and
   commits.
-- Live smoke tests may use the already signed-in `sferait` profile only in
+- Live smoke tests may use the already signed-in `sfera` profile only in
   `smarzola`'s self-DM. Create the minimum uniquely labeled synthetic message
   or file needed for a test, never inspect or mutate unrelated content, keep
   credentials and live output ephemeral, remove only artifacts whose removal
@@ -207,7 +207,7 @@ The goal is complete only when:
 - [x] Milestone 3: Name unread conversations and release `v0.10.0` for #18.
 - [x] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
 - [x] Milestone 5: Expose canonical permalinks and release `v0.12.0` for #19.
-- [ ] Milestone 6: Deliver recent activity and release `v0.13.0` for #15.
+- [x] Milestone 6: Deliver recent activity and release `v0.13.0` for #15.
 
 ### Per-Issue Checkpoint And Delivery Protocol
 
@@ -756,6 +756,41 @@ Design decisions:
   already locked `base64` implementation. No persistence, cache, background
   task, Slack search dependency, per-result identity lookup, or new mutation is
   added.
+
+Status: Implementation accepted for publication on 2026-07-30. The branch
+started from `08a0f8f057855f2aa0c6dd19976f2ed78f5fbf3e`, the exact `v0.12.0`
+`origin/main`.
+
+Implementation and verification:
+
+- `lurkline activity` and `slack_read_activity` now share one typed bounded
+  snapshot operation with relative or exact-offset intervals, deterministic
+  conversation selection, exact `[after, before)` filtering, reply-inclusive
+  history, enriched flat results, explicit completeness, byte-aware pages, and
+  stale-snapshot continuation protection.
+- Conversation selection uses Slack's validated first-party `latest` metadata
+  before a deterministic ID fallback. Each selected conversation receives
+  exactly one bounded history request; no write or mark-read endpoint is used.
+- Activity cursors use a shared 8,192-character producer/consumer bound. A
+  maximal accepted 50-conversation cursor exceeds the generic 2,048-character
+  Slack cursor bound and now round-trips in regression coverage.
+- The retained reviewer found an exclusive-upper-bound rounding defect and
+  arbitrary capped selection, then a nanosecond-ceiling overflow edge. Both
+  repair rounds passed. The fresh auditor found the activity cursor
+  producer/consumer size mismatch; the repair and its README clarification
+  passed both reviewers at `118138c922bd74bdfde640d12a86067c6eff525a`
+  with no remaining blocking or actionable finding.
+- The full gate passed with 275 library tests, 12 CLI-process tests, 2 raw-MCP
+  tests, and 1 package-metadata test, plus formatting, strict locked Clippy,
+  release build, Rust 1.88 compatibility, credential scanning, diff checking,
+  version readback, and deterministic macOS ARM64 package checksum/layout
+  verification.
+- An authorized read-only smoke against the `sfera` profile's `smarzola`
+  self-DM returned 30 bounded activity items, including 3 replies, from exactly
+  one selected conversation. The conversation status was complete, the result
+  was neither partial nor paginated, every returned conversation ID matched the
+  authorized DM, no synthetic Slack content was created, and the mode-0600 raw
+  output was deleted immediately.
 
 ## Final Verification
 
