@@ -1,6 +1,6 @@
 use std::{env, fmt::Write as _, io::Read};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
@@ -20,14 +20,14 @@ use crate::{
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     mcp,
     model::{
-        ActivityConversationStatus, ActivityOrder, ActivityReport, AuthorResolution, Conversation,
-        ConversationKind, ConversationNameResolution, ConversationPage, ConversationSearchReport,
-        ConversationSearchTruncationReason, CustomEmojiKind, CustomEmojiList, DoctorReport, Draft,
-        DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
-        FileDraftCreateReport, FileReference, FileUploadReport, InboxReport, InboxTruncationReason,
-        Message, MessagePage, MessageSearchPage, ReactionMutationReport, RenderedMessage,
-        SentMessage, ThreadPage, UnreadConversation, UnreadReport, UserSearchReport,
-        UserSearchTruncationReason,
+        ActivityContinuationKind, ActivityConversationStatus, ActivityOrder, ActivityReport,
+        AuthorResolution, Conversation, ConversationKind, ConversationNameResolution,
+        ConversationPage, ConversationSearchReport, ConversationSearchTruncationReason,
+        CustomEmojiKind, CustomEmojiList, DoctorReport, Draft, DraftDeleteReport, DraftPage,
+        DraftSendReport, FileDownloadReport, FileDraftAssociation, FileDraftCreateReport,
+        FileReference, FileUploadReport, InboxReport, InboxTruncationReason, Message, MessagePage,
+        MessageSearchPage, ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage,
+        UnreadConversation, UnreadReport, UserSearchReport, UserSearchTruncationReason,
     },
     service::{
         ActivityRequest, DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES,
@@ -48,6 +48,23 @@ pub struct Cli {
     pub profile: Option<String>,
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ActivityKindArg {
+    Channel,
+    DirectMessage,
+    GroupDirectMessage,
+}
+
+impl From<ActivityKindArg> for ConversationKind {
+    fn from(value: ActivityKindArg) -> Self {
+        match value {
+            ActivityKindArg::Channel => Self::Channel,
+            ActivityKindArg::DirectMessage => Self::DirectMessage,
+            ActivityKindArg::GroupDirectMessage => Self::GroupDirectMessage,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,7 +98,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Read bounded recent activity across joined channels and direct conversations.
+    /// Read bounded recent activity across a filtered Slack conversation scope.
     Activity {
         /// Relative elapsed interval such as 6h or 1d12h.
         #[arg(long, conflicts_with_all = ["after", "before", "cursor"])]
@@ -98,10 +115,13 @@ pub enum Command {
         /// Exclude an exact conversation ID or name; repeatable.
         #[arg(long, conflicts_with = "cursor")]
         exclude: Vec<String>,
+        /// Restrict eligible conversations by kind before the cap; repeatable.
+        #[arg(long = "kind", value_enum, conflicts_with = "cursor")]
+        kinds: Vec<ActivityKindArg>,
         /// Return the bounded recent sample oldest-first.
         #[arg(long, conflicts_with = "cursor")]
         oldest_first: bool,
-        /// Maximum selected conversations, from 1 through 50.
+        /// Maximum conversations in this scope slice, from 1 through 50.
         #[arg(long = "conversations", conflicts_with = "cursor")]
         conversation_limit: Option<usize>,
         /// Maximum recent messages sampled per conversation, from 1 through 200.
@@ -641,6 +661,7 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
             before,
             include,
             exclude,
+            kinds,
             oldest_first,
             conversation_limit,
             per_conversation_limit,
@@ -649,6 +670,10 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
             json,
         } => {
             let order = oldest_first.then_some(ActivityOrder::OldestFirst);
+            let kinds = kinds
+                .into_iter()
+                .map(ConversationKind::from)
+                .collect::<Vec<_>>();
             print_activity(
                 service
                     .activity(ActivityRequest {
@@ -657,6 +682,7 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                         before: before.as_deref(),
                         include: &include,
                         exclude: &exclude,
+                        kinds: &kinds,
                         order,
                         conversation_limit,
                         per_conversation_limit,
@@ -1487,6 +1513,20 @@ fn print_activity(report: ActivityReport, json: bool) -> Result<()> {
             ActivityOrder::OldestFirst => "oldest-first",
         }
     );
+    println!(
+        "scope\tkinds={}\tscanned={}\teligible={}\toffset={}\tselected={}\tremaining={}",
+        report
+            .conversation_kinds
+            .iter()
+            .map(|kind| activity_kind_label(*kind))
+            .collect::<Vec<_>>()
+            .join(","),
+        report.scanned_conversations,
+        report.eligible_conversations,
+        report.scope_offset,
+        report.selected_conversations,
+        report.remaining_conversations
+    );
     if report.items.is_empty() {
         println!("No activity matched.");
     } else {
@@ -1524,15 +1564,28 @@ fn print_activity(report: ActivityReport, json: bool) -> Result<()> {
     }
     if report.selection_truncated {
         println!(
-            "partial\tconversation-scope\tscanned={}\tselected={}",
-            report.scanned_conversations, report.selected_conversations
+            "partial\tconversation-scope\toffset={}\tselected={}\teligible={}\tremaining={}",
+            report.scope_offset,
+            report.selected_conversations,
+            report.eligible_conversations,
+            report.remaining_conversations
+        );
+    }
+    if report.conversation_scan_truncated {
+        println!(
+            "partial\tconversation-scan-limit\tscanned={}",
+            report.scanned_conversations
         );
     }
     if report.response_byte_limit_reached {
         println!("partial\tresponse-byte-limit");
     }
-    if let Some(cursor) = report.next_cursor {
-        println!("more\t{}", escape_human(&cursor));
+    if let (Some(kind), Some(cursor)) = (report.continuation_kind, report.next_cursor) {
+        let kind = match kind {
+            ActivityContinuationKind::Messages => "messages",
+            ActivityContinuationKind::ConversationScope => "conversation-scope",
+        };
+        println!("more\t{kind}\t{}", escape_human(&cursor));
     }
     Ok(())
 }
@@ -1610,6 +1663,14 @@ fn conversation_kind_label(kind: ConversationKind) -> &'static str {
         ConversationKind::Channel => "channel",
         ConversationKind::DirectMessage => "dm",
         ConversationKind::GroupDirectMessage => "group-dm",
+    }
+}
+
+fn activity_kind_label(kind: ConversationKind) -> &'static str {
+    match kind {
+        ConversationKind::Channel => "channel",
+        ConversationKind::DirectMessage => "direct-message",
+        ConversationKind::GroupDirectMessage => "group-direct-message",
     }
 }
 
@@ -2024,6 +2085,10 @@ mod tests {
                 "6h",
                 "--include",
                 "@self",
+                "--kind",
+                "direct-message",
+                "--kind",
+                "group-direct-message",
                 "--oldest-first",
                 "--conversations",
                 "4",
@@ -2042,12 +2107,22 @@ mod tests {
                 per_conversation_limit: Some(8),
                 limit: Some(12),
                 json: true,
+                kinds,
                 ..
-            }
+            } if kinds == vec![
+                ActivityKindArg::DirectMessage,
+                ActivityKindArg::GroupDirectMessage,
+            ]
         ));
         assert!(
             Cli::try_parse_from(["lurkline", "activity", "--cursor", "next", "--limit", "12"])
                 .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "lurkline", "activity", "--cursor", "next", "--kind", "channel"
+            ])
+            .is_err()
         );
         assert!(matches!(
             Cli::try_parse_from([

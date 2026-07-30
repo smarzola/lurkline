@@ -181,8 +181,8 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: Normalize nullable identities and release `v0.14.0` for #27.
-- [ ] Milestone 2: Traverse filtered activity scope and release `v0.15.0` for #26.
+- [x] Milestone 1: Normalize nullable identities and release `v0.14.0` for #27.
+- [x] Milestone 2: Traverse filtered activity scope and release `v0.15.0` for #26.
 
 ### Per-Issue Checkpoint And Delivery Protocol
 
@@ -236,8 +236,7 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Release candidate completed locally on 2026-07-30; PR, merge, and
-release delivery remain pending. Started from
+Status: Completed and independently verified on 2026-07-30. Started from
 `521d95ee1cfc53833afbd4cc8d97a2229094a71a`, exact `v0.13.0`
 `origin/main`, on `fix/nullable-user-identities`.
 
@@ -280,6 +279,20 @@ Local release-candidate evidence:
   including 8 genuine JSON-null display names and zero invalid identity field
   types. Only aggregate counts were emitted; no Slack write occurred, and the
   mode-0600 raw temporary file was removed with zero residue.
+- [PR #28](https://github.com/smarzola/lurkline/pull/28) passed CI run
+  `30567649318` at reviewed head
+  `eba7ebefef505c657b5802fcc5932a3c5b1137cd` and squash-merged to
+  `c645cc25772e1da647631d5a9863c2f9f7ff1a3b`, closing issue #27 as
+  completed.
+- Annotated tag `v0.14.0` dereferences to that exact merged `main` commit.
+  Main CI `30567894536`, tag CI `30567956512`, and release workflow
+  `30567956735` all completed successfully.
+- Published GitHub Release `362618362` is neither draft nor prerelease and
+  contains exactly the three documented native archives plus their three
+  checksums. Independent downloads passed every checksum, exact versioned
+  `lurkline`/`README.md`/`LICENSE` layout and executable-mode check. The native
+  asset is a linker-signed ARM64 Mach-O and reports `lurkline 0.14.0`; all
+  verification artifacts were removed.
 
 ## Milestone 2: Filtered Complete Activity Scope (`v0.15.0`, #26)
 
@@ -317,8 +330,70 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Not started. It must begin from the exact verified `v0.14.0`
-`origin/main`.
+Status: Started on 2026-07-30 from
+`c645cc25772e1da647631d5a9863c2f9f7ff1a3b`, exact verified `v0.14.0`
+`origin/main`, on `feat/activity-scope-pagination`.
+
+Design decisions:
+
+- Add a repeated typed kind selector covering channel, direct message, and
+  group direct message. Normalize and deduplicate it once, apply it before the
+  activity conversation cap, and make explicit selectors outside the allowed
+  kinds fail actionably.
+- Continue through conversation scope with the existing single opaque activity
+  cursor instead of adding a second pagination interface. Give the cursor a
+  tagged message or scope phase, and expose which phase the next cursor
+  represents.
+- Reconstruct the complete bounded eligible scope on continuation and protect
+  it with a digest plus offset. Scope drift must fail stale before any history
+  read; the cursor must not embed an unbounded list of conversation IDs.
+- Order eligible scope by stable conversation ID and digest only ordered
+  ID/kind eligibility data. Do not let display-name changes or mutable Slack
+  `latest` metadata outside the frozen interval make a valid traversal stale.
+- Treat `--conversations` as a per-call slice bound, including for explicit
+  includes. Canonicalize kinds in enum order and resolved selector IDs in
+  sorted order before cursor creation.
+- Keep each response to at most 50 conversations and one bounded,
+  reply-inclusive history request per selected conversation. Expose eligible
+  count, scope progress, remaining scope, and hard directory-scan truncation.
+- Preserve canonical ordering within each slice and document the canonical
+  timestamp/conversation-ID merge comparator for callers combining multiple
+  scope slices.
+
+Checkpoint evidence (2026-07-30):
+
+- Implementation commit `314975aacb70d74b6848a987312ce128a2d1922f`
+  adds canonical typed kind filtering before selection, stable ID-ordered
+  per-call scope slices, tagged message/scope cursor phases, bounded scope
+  reconstruction and digest validation before history, explicit structured and
+  human progress, CLI/MCP parity, synthetic regressions, documentation, and
+  aligned `0.15.0` metadata.
+- The retained adversarial reviewer found one medium test-coverage gap around
+  byte-shortened message-to-scope handoff and large mixed-kind traversal. The
+  repair proves `messages` to `messages` to `conversation_scope` to completion
+  without overlap or omission, covers 60 mixed channel/DM/group-DM
+  conversations, and preserves the existing 55-channel traversal. Re-review
+  was clean.
+- Formatting, strict locked Clippy, all 284 library tests, 12 CLI-process
+  tests, 2 raw-MCP tests, the package-metadata test, locked release build,
+  Rust 1.88 compatibility, credential scan, and diff/status checks passed.
+- Two local macOS ARM64 packages were byte-identical. Checksum, exact
+  versioned archive layout, permissions, linker-signed ARM64 Mach-O shape, and
+  packaged binary readback as `lurkline 0.15.0` passed; all artifacts were
+  removed.
+- An authorized read-only `sfera` smoke traversed two disjoint one-conversation
+  channel slices from a 32-conversation eligible scope, advancing scope
+  offsets from 0 to 1 with complete directory discovery. Only aggregate shape
+  and progress were emitted; no Slack write occurred, and all mode-0600 raw
+  temporary files were removed with zero residue.
+- A fresh context-independent audit found one low documentation gap: completed
+  scope slices cannot be revalidated because Slack does not provide an
+  immutable whole-scope snapshot. Commit
+  `28ea804c76304313ad8d25b99629a8f4bd64e833` documents that limitation, and
+  exact-head re-audit was clean.
+- This is the verified local release checkpoint required before publication.
+  PR, merge, tag, workflow, GitHub Release, asset verification, and issue
+  closure remain pending and are not implied by the checked milestone alone.
 
 ## Final Verification
 

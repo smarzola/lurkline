@@ -268,6 +268,9 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         "before",
         "include",
         "exclude",
+        "kinds",
+        "direct_message",
+        "group_direct_message",
         "order",
         "conversation_limit",
         "per_conversation_limit",
@@ -282,10 +285,18 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     for expected in [
         "effective_after",
         "effective_before",
+        "conversation_kinds",
         "conversation_results",
+        "eligible_conversations",
+        "scope_offset",
+        "remaining_conversations",
+        "conversation_scan_truncated",
         "message_limit",
         "selection_truncated",
+        "scope_has_more",
         "response_byte_limit_reached",
+        "continuation_kind",
+        "conversation_scope",
         "next_cursor",
     ] {
         assert!(

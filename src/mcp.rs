@@ -14,11 +14,12 @@ use crate::{
     local_file::{McpFileRoot, validate_mcp_download_path, validate_mcp_upload_path},
     markdown::render_markdown,
     model::{
-        ActivityOrder, ActivityReport, ConversationPage, ConversationSearchReport, CustomEmojiList,
-        DoctorReport, Draft, DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport,
-        FileDraftCreateReport, FileReference, FileUploadReport, InboxReport, Message, MessagePage,
-        MessageSearchPage, ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage,
-        UnreadReport, UserSearchReport,
+        ActivityOrder, ActivityReport, ConversationKind, ConversationPage,
+        ConversationSearchReport, CustomEmojiList, DoctorReport, Draft, DraftDeleteReport,
+        DraftPage, DraftSendReport, FileDownloadReport, FileDraftCreateReport, FileReference,
+        FileUploadReport, InboxReport, Message, MessagePage, MessageSearchPage,
+        ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage, UnreadReport,
+        UserSearchReport,
     },
     service::{
         ActivityRequest, DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES,
@@ -74,9 +75,12 @@ struct ReadActivityRequest {
     /// Exact conversation IDs or names to exclude.
     #[serde(default)]
     exclude: Vec<String>,
+    /// Eligible conversation kinds; empty includes every supported kind.
+    #[serde(default)]
+    kinds: Vec<ConversationKind>,
     /// Global ordering; newest_first is the default.
     order: Option<ActivityOrder>,
-    /// Maximum selected conversations, from 1 through 50.
+    /// Maximum conversations in this scope slice, from 1 through 50.
     conversation_limit: Option<usize>,
     /// Maximum recent messages sampled per conversation, from 1 through 200.
     per_conversation_limit: Option<usize>,
@@ -837,6 +841,7 @@ impl McpServer {
                     before: request.before.as_deref(),
                     include: &request.include,
                     exclude: &request.exclude,
+                    kinds: &request.kinds,
                     order: request.order,
                     conversation_limit: request.conversation_limit,
                     per_conversation_limit: request.per_conversation_limit,
