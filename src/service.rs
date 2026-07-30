@@ -21,15 +21,15 @@ use crate::{
         DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport, DraftDestination, DraftPage,
         DraftSendReport, FileDownloadReport, FileDraftAssociation, FileDraftCreateReport,
         FileReference, FileShare, FileShareVisibility, FileUploadReport, InboxConversation,
-        InboxReport, InboxTruncationReason, Message, MessagePage, MessageSearchMatch,
-        MessageSearchPage, RawAuthTestResponse, RawConversation, RawConversationsPage, RawDraft,
-        RawDraftResponse, RawDraftRevision, RawDraftsPage, RawEmojiResponse, RawFile,
-        RawFileResponse, RawFileUploadAllocation, RawFileUploadCompletion, RawMessage,
-        RawMessagePage, RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList,
-        RawMutationResponse, RawPostMessageResponse, RawReaction, RawReactionItemResponse,
-        RawUnread, RawUser, RawUsersPage, Reaction, ReactionMutationReport, SentMessage,
-        ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
-        UserSearchTruncationReason,
+        InboxReport, InboxTruncationReason, MentionResolution, Message, MessageMention,
+        MessagePage, MessageSearchMatch, MessageSearchPage, RawAuthTestResponse, RawConversation,
+        RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision, RawDraftsPage,
+        RawEmojiResponse, RawFile, RawFileResponse, RawFileUploadAllocation,
+        RawFileUploadCompletion, RawMessage, RawMessagePage, RawMessageSearchMatch,
+        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
+        RawReaction, RawReactionItemResponse, RawUnread, RawUser, RawUsersPage, Reaction,
+        ReactionMutationReport, SentMessage, ThreadPage, UnreadConversation, UnreadReport,
+        UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
     },
 };
 
@@ -62,6 +62,9 @@ const MAX_FILE_SHARE_SCAN_PAGES: usize = 10;
 const MAX_REACTIONS_PER_MESSAGE: usize = 100;
 const MAX_REACTION_USERS: usize = 1_000;
 const MAX_CUSTOM_EMOJI: usize = 10_000;
+const MAX_MESSAGE_MENTIONS: usize = 256;
+const MAX_RICH_TEXT_RENDER_NODES: usize = 4_096;
+const MAX_RICH_TEXT_RENDER_DEPTH: usize = 64;
 
 pub(crate) struct FileDraftCreateRequest<'a> {
     pub(crate) conversation: &'a str,
@@ -438,6 +441,41 @@ struct UnreadUserDirectory {
     users: HashMap<String, User>,
     conflicting_ids: HashSet<String>,
     completion: DirectoryCompletion,
+}
+
+struct MentionSelection {
+    ids: Vec<String>,
+    truncated: bool,
+    source: MentionSource,
+}
+
+enum MentionSource {
+    Canonical,
+    RichText,
+}
+
+#[derive(Clone, Copy)]
+enum RichTextNodeContext {
+    Root,
+    BlockElement,
+    ListItem,
+    Inline,
+}
+
+struct RichTextMentionRender<'a> {
+    output: String,
+    labels: Option<&'a HashMap<String, String>>,
+    ids: Vec<String>,
+    seen_ids: HashSet<String>,
+    mentions_truncated: bool,
+    render_limited: bool,
+    nodes: usize,
+}
+
+struct RichTextMentionOutput {
+    rendered_text: Option<String>,
+    ids: Vec<String>,
+    mentions_truncated: bool,
 }
 
 struct LoadedInboxConversations {
@@ -1897,12 +1935,12 @@ impl SlackService {
             let mut messages = self
                 .read_channel_by_id(&unread.id, None, message_limit)
                 .await?;
-            if messages.messages.iter().any(message_author_needs_directory) {
+            if messages.messages.iter().any(message_needs_directory) {
                 if loaded.author_directory.is_none() {
                     loaded.author_directory = Some(self.author_directory(None).await);
                 }
                 if let Some(directory) = &loaded.author_directory {
-                    enrich_message_authors_from_directory(&mut messages.messages, directory);
+                    enrich_messages_from_directory(&mut messages.messages, directory);
                 }
             }
             report.conversations.push(InboxConversation {
@@ -2147,7 +2185,7 @@ impl SlackService {
             });
         }
         let mut matches = normalize_search_matches(raw.messages.matches)?;
-        self.enrich_search_authors(&mut matches, user_directory)
+        self.enrich_search_messages(&mut matches, user_directory)
             .await;
         Ok(MessageSearchPage {
             query: applied_query,
@@ -2168,7 +2206,7 @@ impl SlackService {
         validate_cursor(cursor)?;
         let (channel, user_directory) = self.resolve_conversation_for_message_read(channel).await?;
         let mut page = self.read_channel_by_id(&channel, cursor, limit).await?;
-        self.enrich_message_authors(&mut page.messages, user_directory)
+        self.enrich_messages(&mut page.messages, user_directory)
             .await;
         Ok(page)
     }
@@ -2216,8 +2254,7 @@ impl SlackService {
         reject_repeated_cursor("conversations.replies", cursor, next_cursor.as_deref())?;
         let mut messages =
             normalize_messages(&channel, raw.messages, limit, "conversations.replies")?;
-        self.enrich_message_authors(&mut messages, user_directory)
-            .await;
+        self.enrich_messages(&mut messages, user_directory).await;
         Ok(ThreadPage {
             channel_id: channel.clone(),
             thread_ts: thread_ts.to_owned(),
@@ -2231,7 +2268,7 @@ impl SlackService {
         validate_timestamp("message_ts", message_ts)?;
         let (channel, user_directory) = self.resolve_conversation_for_message_read(channel).await?;
         let mut message = self.get_message_by_id(&channel, message_ts).await?;
-        self.enrich_message_authors(std::slice::from_mut(&mut message), user_directory)
+        self.enrich_messages(std::slice::from_mut(&mut message), user_directory)
             .await;
         Ok(message)
     }
@@ -2723,39 +2760,28 @@ impl SlackService {
         })
     }
 
-    async fn enrich_message_authors(
+    async fn enrich_messages(
         &self,
         messages: &mut [Message],
         user_directory: Option<UserDirectory>,
     ) {
-        if !messages.iter().any(message_author_needs_directory) {
+        if !messages.iter().any(message_needs_directory) {
             return;
         }
         let directory = self.author_directory(user_directory).await;
-        enrich_message_authors_from_directory(messages, &directory);
+        enrich_messages_from_directory(messages, &directory);
     }
 
-    async fn enrich_search_authors(
+    async fn enrich_search_messages(
         &self,
         messages: &mut [MessageSearchMatch],
         user_directory: Option<UserDirectory>,
     ) {
-        if !messages.iter().any(search_author_needs_directory) {
+        if !messages.iter().any(search_message_needs_directory) {
             return;
         }
         let directory = self.author_directory(user_directory).await;
-        for message in messages
-            .iter_mut()
-            .filter(|message| search_author_needs_directory(message))
-        {
-            enrich_author(
-                message.author_id.as_deref(),
-                &mut message.author_name,
-                &mut message.author_display_name,
-                &mut message.author_resolution,
-                &directory,
-            );
-        }
+        enrich_search_messages_from_directory(messages, &directory);
     }
 
     async fn author_directory(&self, user_directory: Option<UserDirectory>) -> AuthorDirectory {
@@ -3222,6 +3248,8 @@ fn normalize_search_matches(
             }
             let author_name = normalize_message_author_name(raw.username);
             let author_resolution = initial_author_resolution(&author_id, &author_name);
+            let (rendered_text, mention_resolution, mentions) =
+                initial_mention_fields(&raw.text, raw.blocks.as_deref());
             let permalink = raw.permalink.filter(|value| !value.is_empty());
             if permalink
                 .as_deref()
@@ -3241,6 +3269,9 @@ fn normalize_search_matches(
                 author_display_name: None,
                 author_resolution,
                 text: raw.text,
+                rendered_text,
+                mention_resolution,
+                mentions,
                 blocks: raw.blocks,
                 attachments: normalize_attachments(raw.attachments, "search.messages")?,
                 reactions: normalize_reactions(raw.reactions, "search.messages")?,
@@ -4004,8 +4035,600 @@ fn normalize_custom_emoji(name: String, value: String) -> Result<CustomEmoji> {
     })
 }
 
+fn initial_mention_fields(
+    text: &str,
+    blocks: Option<&[serde_json::Value]>,
+) -> (String, MentionResolution, Vec<MessageMention>) {
+    let selection = select_message_mentions(text, blocks);
+    let resolution = if selection.ids.is_empty() && !selection.truncated {
+        MentionResolution::NotNeeded
+    } else {
+        MentionResolution::NotAttempted
+    };
+    let mentions = selection
+        .ids
+        .into_iter()
+        .map(|id| MessageMention {
+            id,
+            username: None,
+            display_name: None,
+        })
+        .collect();
+    (text.to_owned(), resolution, mentions)
+}
+
+fn select_message_mentions(text: &str, blocks: Option<&[serde_json::Value]>) -> MentionSelection {
+    if let Some(blocks) = blocks
+        && let Some(rendered) = render_rich_text_mentions(blocks, None)
+    {
+        return MentionSelection {
+            ids: rendered.ids,
+            truncated: rendered.mentions_truncated,
+            source: MentionSource::RichText,
+        };
+    }
+    let (ids, truncated) = scan_canonical_mentions(text);
+    MentionSelection {
+        ids,
+        truncated,
+        source: MentionSource::Canonical,
+    }
+}
+
+fn scan_canonical_mentions(text: &str) -> (Vec<String>, bool) {
+    if text.len() > MAX_MARKDOWN_BYTES {
+        return (Vec::new(), true);
+    }
+    let mut ids = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut truncated = false;
+    let mut index = 0;
+    while index < text.len() {
+        if text.as_bytes()[index] == b'`' {
+            let run = backtick_run(text, index);
+            if let Some(close) = matching_backtick_run(text, index + run, run) {
+                index = close + run;
+                continue;
+            }
+            index += run;
+            continue;
+        }
+        if text[index..].starts_with("<@")
+            && let Some(relative_end) = text[index + 2..].find('>')
+        {
+            let end = index + 2 + relative_end;
+            let id = &text[index + 2..end];
+            if is_valid_user_id(id) {
+                record_mention_id(&mut ids, &mut seen_ids, id, &mut truncated);
+                index = end + 1;
+                continue;
+            }
+        }
+        index += text[index..]
+            .chars()
+            .next()
+            .expect("index stays on a character boundary")
+            .len_utf8();
+    }
+    (ids, truncated)
+}
+
+fn backtick_run(text: &str, start: usize) -> usize {
+    text.as_bytes()[start..]
+        .iter()
+        .take_while(|byte| **byte == b'`')
+        .count()
+}
+
+fn matching_backtick_run(text: &str, mut index: usize, wanted: usize) -> Option<usize> {
+    while index < text.len() {
+        if text.as_bytes()[index] == b'`' {
+            let run = backtick_run(text, index);
+            if run == wanted {
+                return Some(index);
+            }
+            index += run;
+        } else {
+            index += text[index..]
+                .chars()
+                .next()
+                .expect("index stays on a character boundary")
+                .len_utf8();
+        }
+    }
+    None
+}
+
+fn record_mention_id(
+    ids: &mut Vec<String>,
+    seen_ids: &mut HashSet<String>,
+    id: &str,
+    truncated: &mut bool,
+) {
+    if !seen_ids.insert(id.to_owned()) {
+        return;
+    }
+    if ids.len() == MAX_MESSAGE_MENTIONS {
+        *truncated = true;
+    } else {
+        ids.push(id.to_owned());
+    }
+}
+
+fn render_canonical_mentions(text: &str, labels: &HashMap<String, String>) -> Option<String> {
+    if text.len() > MAX_MARKDOWN_BYTES {
+        return None;
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        if text.as_bytes()[index] == b'`' {
+            let run = backtick_run(text, index);
+            if let Some(close) = matching_backtick_run(text, index + run, run) {
+                if !push_bounded(&mut output, &text[index..close + run]) {
+                    return None;
+                }
+                index = close + run;
+                continue;
+            }
+            if !push_bounded(&mut output, &text[index..index + run]) {
+                return None;
+            }
+            index += run;
+            continue;
+        }
+        if text[index..].starts_with("<@")
+            && let Some(relative_end) = text[index + 2..].find('>')
+        {
+            let end = index + 2 + relative_end;
+            let id = &text[index + 2..end];
+            if is_valid_user_id(id) {
+                let rendered = labels
+                    .get(id)
+                    .map(|label| format!("@{label}"))
+                    .unwrap_or_else(|| text[index..=end].to_owned());
+                if !push_bounded(&mut output, &rendered) {
+                    return None;
+                }
+                index = end + 1;
+                continue;
+            }
+        }
+        let character = text[index..]
+            .chars()
+            .next()
+            .expect("index stays on a character boundary");
+        if !push_bounded(&mut output, &text[index..index + character.len_utf8()]) {
+            return None;
+        }
+        index += character.len_utf8();
+    }
+    Some(output)
+}
+
+fn render_rich_text_mentions(
+    blocks: &[serde_json::Value],
+    labels: Option<&HashMap<String, String>>,
+) -> Option<RichTextMentionOutput> {
+    if !is_rich_text_blocks(blocks) {
+        return None;
+    }
+    let mut render = RichTextMentionRender {
+        output: String::new(),
+        labels,
+        ids: Vec::new(),
+        seen_ids: HashSet::new(),
+        mentions_truncated: false,
+        render_limited: false,
+        nodes: 0,
+    };
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            render.push("\n");
+        }
+        if !append_strict_rich_text_node(block, &mut render, 0, false, RichTextNodeContext::Root) {
+            return None;
+        }
+    }
+    Some(RichTextMentionOutput {
+        rendered_text: (!render.render_limited).then_some(render.output),
+        ids: render.ids,
+        mentions_truncated: render.mentions_truncated,
+    })
+}
+
+impl RichTextMentionRender<'_> {
+    fn push(&mut self, value: &str) {
+        if self.render_limited {
+            return;
+        }
+        if self.output.len().saturating_add(value.len()) > MAX_MARKDOWN_BYTES {
+            self.render_limited = true;
+            self.output.clear();
+        } else {
+            self.output.push_str(value);
+        }
+    }
+
+    fn record(&mut self, id: &str) {
+        record_mention_id(
+            &mut self.ids,
+            &mut self.seen_ids,
+            id,
+            &mut self.mentions_truncated,
+        );
+    }
+}
+
+fn append_strict_rich_text_node(
+    node: &serde_json::Value,
+    render: &mut RichTextMentionRender<'_>,
+    depth: usize,
+    in_code: bool,
+    context: RichTextNodeContext,
+) -> bool {
+    if depth > MAX_RICH_TEXT_RENDER_DEPTH || render.nodes == MAX_RICH_TEXT_RENDER_NODES {
+        return false;
+    }
+    render.nodes += 1;
+    let Some(kind) = node.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let valid_placement = match context {
+        RichTextNodeContext::Root => kind == "rich_text",
+        RichTextNodeContext::BlockElement => matches!(
+            kind,
+            "rich_text_section" | "rich_text_list" | "rich_text_quote" | "rich_text_preformatted"
+        ),
+        RichTextNodeContext::ListItem => kind == "rich_text_section",
+        RichTextNodeContext::Inline => matches!(
+            kind,
+            "text"
+                | "link"
+                | "emoji"
+                | "user"
+                | "channel"
+                | "usergroup"
+                | "broadcast"
+                | "date"
+                | "color"
+        ),
+    };
+    if !valid_placement {
+        return false;
+    }
+    let style_is_code = if matches!(context, RichTextNodeContext::Inline) {
+        let Some(style_is_code) = strict_inline_code_style(node) else {
+            return false;
+        };
+        style_is_code
+    } else {
+        false
+    };
+    let in_code = in_code || style_is_code;
+    match kind {
+        "text" => {
+            let Some(text) = node.get("text").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            render.push(text);
+            true
+        }
+        "link" => {
+            let Some(text) = node
+                .get("text")
+                .or_else(|| node.get("url"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            render.push(text);
+            true
+        }
+        "emoji" => {
+            let Some(name) = node.get("name").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            render.push(&format!(":{name}:"));
+            true
+        }
+        "user" => {
+            let Some(id) = node.get("user_id").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            if !is_valid_user_id(id) {
+                return false;
+            }
+            if !in_code {
+                render.record(id);
+            }
+            let value = if in_code {
+                format!("<@{id}>")
+            } else {
+                render
+                    .labels
+                    .and_then(|labels| labels.get(id))
+                    .map(|label| format!("@{label}"))
+                    .unwrap_or_else(|| format!("<@{id}>"))
+            };
+            render.push(&value);
+            true
+        }
+        "channel" => {
+            let Some(id) = node
+                .get("channel_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| is_valid_any_conversation_id(id))
+            else {
+                return false;
+            };
+            render.push(&format!("<#{id}>"));
+            true
+        }
+        "usergroup" => {
+            let Some(id) = node
+                .get("usergroup_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| {
+                    !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
+                })
+            else {
+                return false;
+            };
+            render.push(&format!("<!subteam^{id}>"));
+            true
+        }
+        "broadcast" => {
+            let Some(range) = node
+                .get("range")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| is_valid_author_label(value))
+            else {
+                return false;
+            };
+            render.push(&format!("@{range}"));
+            true
+        }
+        "date" => {
+            let Some(text) = node
+                .get("fallback")
+                .or_else(|| node.get("timestamp"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            render.push(text);
+            true
+        }
+        "color" => {
+            let Some(value) = node.get("value").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            render.push(value);
+            true
+        }
+        "rich_text_list" => {
+            let Some(elements) = node.get("elements").and_then(serde_json::Value::as_array) else {
+                return false;
+            };
+            let Some(style) = node.get("style").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            if !matches!(style, "ordered" | "bullet") {
+                return false;
+            }
+            let offset = match (style, node.get("offset")) {
+                ("ordered", Some(offset)) => {
+                    let Some(offset) = offset.as_u64() else {
+                        return false;
+                    };
+                    offset
+                }
+                ("ordered", None) | ("bullet", None) => 0,
+                ("bullet", Some(_)) => return false,
+                _ => unreachable!("validated rich-text list style"),
+            };
+            let indent = match node.get("indent") {
+                Some(indent) => {
+                    let Some(indent) = indent.as_u64().filter(|indent| *indent <= 8) else {
+                        return false;
+                    };
+                    indent as usize
+                }
+                None => 0,
+            };
+            for (index, element) in elements.iter().enumerate() {
+                if index > 0 {
+                    render.push("\n");
+                }
+                render.push(&"  ".repeat(indent));
+                if style == "ordered" {
+                    let Some(number) = offset
+                        .checked_add(index as u64)
+                        .and_then(|value| value.checked_add(1))
+                    else {
+                        return false;
+                    };
+                    render.push(&format!("{number}. "));
+                } else {
+                    render.push("- ");
+                }
+                if !append_strict_rich_text_node(
+                    element,
+                    render,
+                    depth + 1,
+                    in_code,
+                    RichTextNodeContext::ListItem,
+                ) {
+                    return false;
+                }
+            }
+            true
+        }
+        "rich_text" => append_strict_rich_text_children(
+            node,
+            render,
+            depth,
+            in_code,
+            "\n",
+            RichTextNodeContext::BlockElement,
+        ),
+        "rich_text_section" | "rich_text_quote" => append_strict_rich_text_children(
+            node,
+            render,
+            depth,
+            in_code,
+            "",
+            RichTextNodeContext::Inline,
+        ),
+        "rich_text_preformatted" => append_strict_rich_text_children(
+            node,
+            render,
+            depth,
+            true,
+            "",
+            RichTextNodeContext::Inline,
+        ),
+        _ => false,
+    }
+}
+
+fn strict_inline_code_style(node: &serde_json::Value) -> Option<bool> {
+    let Some(style) = node.get("style") else {
+        return Some(false);
+    };
+    let style = style.as_object()?;
+    if style.values().any(|value| !value.is_boolean()) {
+        return None;
+    }
+    Some(
+        style
+            .get("code")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    )
+}
+
+fn append_strict_rich_text_children(
+    node: &serde_json::Value,
+    render: &mut RichTextMentionRender<'_>,
+    depth: usize,
+    in_code: bool,
+    separator: &str,
+    child_context: RichTextNodeContext,
+) -> bool {
+    let Some(elements) = node.get("elements").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    for (index, element) in elements.iter().enumerate() {
+        if index > 0 && !separator.is_empty() {
+            render.push(separator);
+        }
+        if !append_strict_rich_text_node(element, render, depth + 1, in_code, child_context) {
+            return false;
+        }
+    }
+    true
+}
+
+fn enrich_mentions(
+    text: &str,
+    blocks: Option<&[serde_json::Value]>,
+    rendered_text: &mut String,
+    mention_resolution: &mut MentionResolution,
+    mentions: &mut Vec<MessageMention>,
+    directory: &AuthorDirectory,
+) {
+    let selection = select_message_mentions(text, blocks);
+    if selection.ids.is_empty() && !selection.truncated {
+        *rendered_text = text.to_owned();
+        *mention_resolution = MentionResolution::NotNeeded;
+        mentions.clear();
+        return;
+    }
+
+    let (users, interrupted) = match directory {
+        AuthorDirectory::Loaded(directory) => (directory, false),
+        AuthorDirectory::Interrupted(directory) => (directory, true),
+    };
+    let mut labels = HashMap::new();
+    let mut partial = selection.truncated;
+    let mut unavailable = false;
+    *mentions = selection
+        .ids
+        .iter()
+        .map(|id| {
+            if users.conflicting_ids.contains(id) {
+                unavailable = true;
+                return MessageMention {
+                    id: id.clone(),
+                    username: None,
+                    display_name: None,
+                };
+            }
+            let Some(user) = users.users.get(id) else {
+                if interrupted {
+                    unavailable = true;
+                } else {
+                    partial = true;
+                }
+                return MessageMention {
+                    id: id.clone(),
+                    username: None,
+                    display_name: None,
+                };
+            };
+            let username = directory_author_label(&user.name);
+            let display_name = directory_author_label(&user.display_name)
+                .or_else(|| directory_author_label(&user.real_name));
+            if let Some(label) = username.as_ref().or(display_name.as_ref()) {
+                labels.insert(id.clone(), label.clone());
+            } else {
+                partial = true;
+            }
+            MessageMention {
+                id: id.clone(),
+                username,
+                display_name,
+            }
+        })
+        .collect();
+
+    let rendered = if selection.truncated {
+        None
+    } else {
+        match selection.source {
+            MentionSource::Canonical => render_canonical_mentions(text, &labels),
+            MentionSource::RichText => blocks
+                .and_then(|blocks| render_rich_text_mentions(blocks, Some(&labels)))
+                .and_then(|rendered| rendered.rendered_text),
+        }
+    };
+    if let Some(rendered) = rendered {
+        *rendered_text = rendered;
+    } else {
+        *rendered_text = text.to_owned();
+        partial = true;
+    }
+    *mention_resolution = if unavailable {
+        MentionResolution::Unavailable
+    } else if partial {
+        MentionResolution::Partial
+    } else {
+        MentionResolution::Complete
+    };
+}
+
 fn message_author_needs_directory(message: &Message) -> bool {
     message.author_resolution == AuthorResolution::NotAttempted
+}
+
+fn message_mentions_need_directory(message: &Message) -> bool {
+    message.mention_resolution == MentionResolution::NotAttempted
+}
+
+fn message_needs_directory(message: &Message) -> bool {
+    message_author_needs_directory(message) || message_mentions_need_directory(message)
 }
 
 fn author_directory_users(directory: &AuthorDirectory) -> &HashMap<String, User> {
@@ -4024,23 +4647,67 @@ fn author_directory_conflicts(directory: &AuthorDirectory, user_id: &str) -> boo
     }
 }
 
-fn enrich_message_authors_from_directory(messages: &mut [Message], directory: &AuthorDirectory) {
-    for message in messages
-        .iter_mut()
-        .filter(|message| message_author_needs_directory(message))
-    {
-        enrich_author(
-            message.author_id.as_deref(),
-            &mut message.author_name,
-            &mut message.author_display_name,
-            &mut message.author_resolution,
-            directory,
-        );
+fn enrich_messages_from_directory(messages: &mut [Message], directory: &AuthorDirectory) {
+    for message in messages {
+        if message_author_needs_directory(message) {
+            enrich_author(
+                message.author_id.as_deref(),
+                &mut message.author_name,
+                &mut message.author_display_name,
+                &mut message.author_resolution,
+                directory,
+            );
+        }
+        if message_mentions_need_directory(message) {
+            enrich_mentions(
+                &message.text,
+                message.blocks.as_deref(),
+                &mut message.rendered_text,
+                &mut message.mention_resolution,
+                &mut message.mentions,
+                directory,
+            );
+        }
     }
 }
 
 fn search_author_needs_directory(message: &MessageSearchMatch) -> bool {
     message.author_resolution == AuthorResolution::NotAttempted
+}
+
+fn search_mentions_need_directory(message: &MessageSearchMatch) -> bool {
+    message.mention_resolution == MentionResolution::NotAttempted
+}
+
+fn search_message_needs_directory(message: &MessageSearchMatch) -> bool {
+    search_author_needs_directory(message) || search_mentions_need_directory(message)
+}
+
+fn enrich_search_messages_from_directory(
+    messages: &mut [MessageSearchMatch],
+    directory: &AuthorDirectory,
+) {
+    for message in messages {
+        if search_author_needs_directory(message) {
+            enrich_author(
+                message.author_id.as_deref(),
+                &mut message.author_name,
+                &mut message.author_display_name,
+                &mut message.author_resolution,
+                directory,
+            );
+        }
+        if search_mentions_need_directory(message) {
+            enrich_mentions(
+                &message.text,
+                message.blocks.as_deref(),
+                &mut message.rendered_text,
+                &mut message.mention_resolution,
+                &mut message.mentions,
+                directory,
+            );
+        }
+    }
 }
 
 fn enrich_author(
@@ -4124,6 +4791,8 @@ fn normalize_message(channel: &str, message: RawMessage, method: &'static str) -
     }
     let author_name = normalize_message_author_name(message.username);
     let author_resolution = initial_author_resolution(&author_id, &author_name);
+    let (rendered_text, mention_resolution, mentions) =
+        initial_mention_fields(&message.text, message.blocks.as_deref());
     Ok(Message {
         channel_id: channel.to_owned(),
         ts: message.ts,
@@ -4133,6 +4802,9 @@ fn normalize_message(channel: &str, message: RawMessage, method: &'static str) -
         author_display_name: None,
         author_resolution,
         text: message.text,
+        rendered_text,
+        mention_resolution,
+        mentions,
         blocks: message.blocks,
         attachments: normalize_attachments(message.attachments, method)?,
         reply_count: message.reply_count,
@@ -7467,7 +8139,7 @@ mod tests {
         let service = service(api);
 
         let root = service
-            .send_message("C123", None, false, "**root**", true)
+            .send_message("C123", None, false, "root <@U456>", true)
             .await
             .unwrap();
         let reply = service
@@ -7476,6 +8148,13 @@ mod tests {
             .unwrap();
         assert_eq!(root.message.channel_id, "C123");
         assert_eq!(root.message.thread_ts, None);
+        assert_eq!(root.message.text, "root <@U456>");
+        assert_eq!(root.message.rendered_text, "root <@U456>");
+        assert_eq!(
+            root.message.mention_resolution,
+            MentionResolution::NotNeeded
+        );
+        assert!(root.message.mentions.is_empty());
         assert_eq!(reply.message.thread_ts.as_deref(), Some("6000.000001"));
         assert_ne!(root.client_msg_id, reply.client_msg_id);
         for id in [&root.client_msg_id, &reply.client_msg_id] {
@@ -7505,7 +8184,7 @@ mod tests {
         assert_eq!(calls[0].channel, "C123");
         assert_eq!(calls[0].thread_ts, None);
         assert!(!calls[0].broadcast);
-        assert_eq!(calls[0].text, "root");
+        assert_eq!(calls[0].text, "root <@U456>");
         assert_eq!(calls[0].blocks[0]["type"], "rich_text");
         assert_eq!(calls[1].thread_ts.as_deref(), Some("6000.000001"));
         assert!(calls[1].broadcast);
@@ -8317,7 +8996,7 @@ mod tests {
             ],
             ..RawUsersPage::default()
         }]));
-        api.history.messages = vec![raw_message("100.000001", "recent")];
+        api.history.messages = vec![raw_message("100.000001", "recent <@WALI>")];
         let count_calls = api.count_calls.clone();
         let conversation_calls = api.conversation_calls.clone();
         let history_calls = api.history_calls.clone();
@@ -8377,6 +9056,8 @@ mod tests {
             message.author_name.as_deref() == Some("carol")
                 && message.author_display_name.as_deref() == Some("Carol Example")
                 && message.author_resolution == AuthorResolution::Directory
+                && message.rendered_text == "recent @alice"
+                && message.mention_resolution == MentionResolution::Complete
         }));
         assert_eq!(*count_calls.lock().unwrap(), 1);
         assert_eq!(conversation_calls.lock().unwrap().len(), 1);
@@ -8420,7 +9101,7 @@ mod tests {
             ],
             ..RawUsersPage::default()
         }]));
-        let mut message = raw_message("100.000001", "synthetic");
+        let mut message = raw_message("100.000001", "synthetic <@WCONFLICT>");
         message.user = Some("WCONFLICT".into());
         api.history.messages = vec![message];
         let user_calls = api.user_calls.clone();
@@ -8440,6 +9121,14 @@ mod tests {
         assert_eq!(
             entry.messages.messages[0].author_resolution,
             AuthorResolution::Unavailable
+        );
+        assert_eq!(
+            entry.messages.messages[0].rendered_text,
+            "synthetic <@WCONFLICT>"
+        );
+        assert_eq!(
+            entry.messages.messages[0].mention_resolution,
+            MentionResolution::Unavailable
         );
     }
 
@@ -9699,6 +10388,520 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(search.matches[0].blocks, Some(unknown_blocks));
+    }
+
+    #[test]
+    fn canonical_mentions_are_unique_ordered_and_never_resolve_inside_code() {
+        let text = concat!(
+            "é <@UALICE> and <@UBOB> and <@UALICE> ",
+            "`inline <@UCODE1>` ``paired <@UCODE2>`` ```fenced <@UCODE3>``` ",
+            "<@bad-id> <@UALICE|alice> unmatched ` then <@UAFTER>"
+        );
+
+        let (ids, truncated) = scan_canonical_mentions(text);
+        assert_eq!(ids, ["UALICE", "UBOB", "UAFTER"]);
+        assert!(!truncated);
+
+        let rendered = render_canonical_mentions(
+            text,
+            &HashMap::from([
+                ("UALICE".into(), "alice".into()),
+                ("UBOB".into(), "Bob Example".into()),
+                ("UCODE1".into(), "must-not-render".into()),
+                ("UCODE2".into(), "must-not-render".into()),
+                ("UCODE3".into(), "must-not-render".into()),
+                ("UAFTER".into(), "after".into()),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            concat!(
+                "é @alice and @Bob Example and @alice ",
+                "`inline <@UCODE1>` ``paired <@UCODE2>`` ```fenced <@UCODE3>``` ",
+                "<@bad-id> <@UALICE|alice> unmatched ` then @after"
+            )
+        );
+    }
+
+    #[test]
+    fn strict_rich_text_mentions_render_names_and_keep_literal_code_untouched() {
+        let blocks = vec![json!({
+            "type": "rich_text",
+            "elements": [
+                {
+                    "type": "rich_text_section",
+                    "elements": [
+                        {"type": "text", "text": "Hello "},
+                        {"type": "user", "user_id": "UALICE"},
+                        {"type": "text", "text": " and <@ULITERAL> "},
+                        {
+                            "type": "user",
+                            "user_id": "USTYLED",
+                            "style": {"code": true}
+                        }
+                    ]
+                },
+                {
+                    "type": "rich_text_preformatted",
+                    "elements": [{"type": "user", "user_id": "UCODE"}]
+                },
+                {
+                    "type": "rich_text_quote",
+                    "elements": [{"type": "user", "user_id": "UBOB"}]
+                }
+            ]
+        })];
+        let canonical = "canonical <@UCANON>";
+        let (mut rendered_text, mut resolution, mut mentions) =
+            initial_mention_fields(canonical, Some(&blocks));
+        assert_eq!(resolution, MentionResolution::NotAttempted);
+        assert_eq!(
+            mentions
+                .iter()
+                .map(|mention| mention.id.as_str())
+                .collect::<Vec<_>>(),
+            ["UALICE", "UBOB"]
+        );
+
+        let mut display_only = raw_user("UBOB", "\n", "Bob Example");
+        display_only.real_name.clear();
+        display_only.profile.real_name.clear();
+        let directory = AuthorDirectory::Loaded(UserDirectory {
+            users: HashMap::from([
+                (
+                    "UALICE".into(),
+                    normalize_user(raw_user("UALICE", "alice", "Alice Example")),
+                ),
+                ("UBOB".into(), normalize_user(display_only)),
+            ]),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        });
+        enrich_mentions(
+            canonical,
+            Some(&blocks),
+            &mut rendered_text,
+            &mut resolution,
+            &mut mentions,
+            &directory,
+        );
+
+        assert_eq!(
+            rendered_text,
+            "Hello @alice and <@ULITERAL> <@USTYLED>\n<@UCODE>\n@Bob Example"
+        );
+        assert_eq!(resolution, MentionResolution::Complete);
+        assert_eq!(
+            mentions,
+            [
+                MessageMention {
+                    id: "UALICE".into(),
+                    username: Some("alice".into()),
+                    display_name: Some("Alice Example".into()),
+                },
+                MessageMention {
+                    id: "UBOB".into(),
+                    username: None,
+                    display_name: Some("Bob Example".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_rich_text_falls_back_to_canonical_mentions_without_losing_blocks() {
+        let blocks = vec![json!({
+            "type": "rich_text",
+            "elements": [{
+                "type": "future_rich_text_node",
+                "user_id": "UNOTTRUSTED"
+            }]
+        })];
+        let canonical = "Fallback <@UALICE>";
+        let (mut rendered_text, mut resolution, mut mentions) =
+            initial_mention_fields(canonical, Some(&blocks));
+        let directory = AuthorDirectory::Loaded(UserDirectory {
+            users: HashMap::from([(
+                "UALICE".into(),
+                normalize_user(raw_user("UALICE", "alice", "Alice Example")),
+            )]),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        });
+
+        enrich_mentions(
+            canonical,
+            Some(&blocks),
+            &mut rendered_text,
+            &mut resolution,
+            &mut mentions,
+            &directory,
+        );
+
+        assert_eq!(rendered_text, "Fallback @alice");
+        assert_eq!(resolution, MentionResolution::Complete);
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].id, "UALICE");
+        assert_eq!(blocks[0]["elements"][0]["type"], "future_rich_text_node");
+    }
+
+    #[test]
+    fn malformed_rich_text_placement_and_styles_fall_back_to_canonical_mentions() {
+        let malformed_blocks = [
+            vec![json!({
+                "type": "rich_text",
+                "elements": [{"type": "user", "user_id": "UWRONG"}]
+            })],
+            vec![json!({
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_list",
+                    "style": "bullet",
+                    "elements": [{"type": "user", "user_id": "UWRONG"}]
+                }]
+            })],
+            vec![json!({
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [{
+                        "type": "rich_text_section",
+                        "elements": [{"type": "user", "user_id": "UWRONG"}]
+                    }]
+                }]
+            })],
+            vec![json!({
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [{
+                        "type": "user",
+                        "user_id": "UWRONG",
+                        "style": {"code": "true"}
+                    }]
+                }]
+            })],
+        ];
+        let directory = AuthorDirectory::Loaded(UserDirectory {
+            users: HashMap::from([(
+                "UALICE".into(),
+                normalize_user(raw_user("UALICE", "alice", "Alice Example")),
+            )]),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        });
+        let canonical = "Hi <@UALICE>";
+
+        for blocks in malformed_blocks {
+            assert!(render_rich_text_mentions(&blocks, None).is_none());
+            let original = blocks.clone();
+            let (mut rendered, mut resolution, mut mentions) =
+                initial_mention_fields(canonical, Some(&blocks));
+            assert_eq!(resolution, MentionResolution::NotAttempted);
+            assert_eq!(mentions[0].id, "UALICE");
+
+            enrich_mentions(
+                canonical,
+                Some(&blocks),
+                &mut rendered,
+                &mut resolution,
+                &mut mentions,
+                &directory,
+            );
+
+            assert_eq!(rendered, "Hi @alice");
+            assert_eq!(resolution, MentionResolution::Complete);
+            assert_eq!(blocks, original);
+        }
+    }
+
+    #[test]
+    fn rich_text_rendering_is_bounded_by_nodes_and_bytes() {
+        let oversized_output = vec![json!({
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [
+                    {"type": "text", "text": "x".repeat(MAX_MARKDOWN_BYTES)},
+                    {"type": "user", "user_id": "UALICE"}
+                ]
+            }]
+        })];
+        let selection = render_rich_text_mentions(&oversized_output, None).unwrap();
+        assert_eq!(selection.ids, ["UALICE"]);
+        assert_eq!(selection.rendered_text, None);
+
+        let too_many_nodes = vec![json!({
+            "type": "rich_text",
+            "elements": (0..MAX_RICH_TEXT_RENDER_NODES)
+                .map(|_| json!({
+                    "type": "rich_text_section",
+                    "elements": []
+                }))
+                .collect::<Vec<_>>()
+        })];
+        assert!(render_rich_text_mentions(&too_many_nodes, None).is_none());
+
+        let canonical = "Fallback <@UALICE>";
+        let (rendered, resolution, mentions) =
+            initial_mention_fields(canonical, Some(&too_many_nodes));
+        assert_eq!(rendered, canonical);
+        assert_eq!(resolution, MentionResolution::NotAttempted);
+        assert_eq!(mentions[0].id, "UALICE");
+    }
+
+    #[test]
+    fn ordered_rich_text_mentions_honor_validated_list_offsets() {
+        let blocks = vec![json!({
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_list",
+                "style": "ordered",
+                "offset": 2,
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [{"type": "user", "user_id": "UALICE"}]
+                    },
+                    {
+                        "type": "rich_text_section",
+                        "elements": [{"type": "text", "text": "done"}]
+                    }
+                ]
+            }]
+        })];
+        let labels = HashMap::from([("UALICE".into(), "alice".into())]);
+        let rendered = render_rich_text_mentions(&blocks, Some(&labels)).unwrap();
+        assert_eq!(
+            rendered.rendered_text.as_deref(),
+            Some("3. @alice\n4. done")
+        );
+        assert_eq!(rendered.ids, ["UALICE"]);
+
+        for invalid in [
+            json!({
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_list",
+                    "style": "bullet",
+                    "offset": 2,
+                    "elements": []
+                }]
+            }),
+            json!({
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_list",
+                    "style": "ordered",
+                    "offset": -1,
+                    "elements": []
+                }]
+            }),
+        ] {
+            assert!(render_rich_text_mentions(&[invalid], None).is_none());
+        }
+    }
+
+    #[test]
+    fn mention_resolution_reports_partial_unavailable_conflict_and_bounds() {
+        let complete_directory = AuthorDirectory::Loaded(UserDirectory {
+            users: HashMap::from([(
+                "UALICE".into(),
+                normalize_user(raw_user("UALICE", "alice", "Alice Example")),
+            )]),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        });
+        let text = "<@UALICE> and <@UMISSING>";
+        let (mut rendered, mut resolution, mut mentions) = initial_mention_fields(text, None);
+        enrich_mentions(
+            text,
+            None,
+            &mut rendered,
+            &mut resolution,
+            &mut mentions,
+            &complete_directory,
+        );
+        assert_eq!(rendered, "@alice and <@UMISSING>");
+        assert_eq!(resolution, MentionResolution::Partial);
+
+        let interrupted_directory = AuthorDirectory::Interrupted(UserDirectory {
+            users: HashMap::from([(
+                "UALICE".into(),
+                normalize_user(raw_user("UALICE", "alice", "Alice Example")),
+            )]),
+            conflicting_ids: HashSet::new(),
+            complete: false,
+        });
+        let (mut rendered, mut resolution, mut mentions) = initial_mention_fields(text, None);
+        enrich_mentions(
+            text,
+            None,
+            &mut rendered,
+            &mut resolution,
+            &mut mentions,
+            &interrupted_directory,
+        );
+        assert_eq!(rendered, "@alice and <@UMISSING>");
+        assert_eq!(resolution, MentionResolution::Unavailable);
+
+        let conflict_directory = AuthorDirectory::Loaded(UserDirectory {
+            users: HashMap::new(),
+            conflicting_ids: HashSet::from(["UALICE".into()]),
+            complete: true,
+        });
+        let (mut rendered, mut resolution, mut mentions) =
+            initial_mention_fields("<@UALICE>", None);
+        enrich_mentions(
+            "<@UALICE>",
+            None,
+            &mut rendered,
+            &mut resolution,
+            &mut mentions,
+            &conflict_directory,
+        );
+        assert_eq!(rendered, "<@UALICE>");
+        assert_eq!(resolution, MentionResolution::Unavailable);
+
+        let bounded = (0..=MAX_MESSAGE_MENTIONS)
+            .map(|index| format!("<@U{index}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (mut rendered, mut resolution, mut mentions) = initial_mention_fields(&bounded, None);
+        assert_eq!(mentions.len(), MAX_MESSAGE_MENTIONS);
+        enrich_mentions(
+            &bounded,
+            None,
+            &mut rendered,
+            &mut resolution,
+            &mut mentions,
+            &complete_directory,
+        );
+        assert_eq!(rendered, bounded);
+        assert_eq!(mentions.len(), MAX_MESSAGE_MENTIONS);
+        assert_eq!(resolution, MentionResolution::Partial);
+
+        let mut unsafe_user = raw_user("UUNSAFE", "\n", "\t");
+        unsafe_user.real_name = "\r".into();
+        unsafe_user.profile.real_name = "\r".into();
+        let unsafe_directory = AuthorDirectory::Loaded(UserDirectory {
+            users: HashMap::from([("UUNSAFE".into(), normalize_user(unsafe_user))]),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        });
+        let (mut rendered, mut resolution, mut mentions) =
+            initial_mention_fields("<@UUNSAFE>", None);
+        enrich_mentions(
+            "<@UUNSAFE>",
+            None,
+            &mut rendered,
+            &mut resolution,
+            &mut mentions,
+            &unsafe_directory,
+        );
+        assert_eq!(rendered, "<@UUNSAFE>");
+        assert_eq!(resolution, MentionResolution::Partial);
+        assert_eq!(mentions[0].username, None);
+        assert_eq!(mentions[0].display_name, None);
+    }
+
+    #[tokio::test]
+    async fn message_authors_and_mentions_share_one_directory_scan() {
+        let mut first = raw_message("100.000001", "Hi <@U456> and <@U789>");
+        first.attachments = Some(vec![json!({"future": {"keep": true}})]);
+        let mut second = raw_message("100.000002", "Again <@U456>");
+        second.user = Some("U456".into());
+        let original_attachments = first.attachments.clone();
+        let mut api = fake_api();
+        api.history.messages = vec![first, second];
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![
+                raw_user("U123", "alice", "Alice Example"),
+                raw_user("U456", "bob", "Bob Example"),
+                raw_user("U789", "carol", "Carol Example"),
+            ],
+            ..RawUsersPage::default()
+        }]));
+        let user_calls = api.user_calls.clone();
+
+        let page = service(api).read_channel("C123", None, 2).await.unwrap();
+
+        assert_single_user_directory_call(&user_calls);
+        assert_eq!(page.messages[0].text, "Hi <@U456> and <@U789>");
+        assert_eq!(page.messages[0].rendered_text, "Hi @bob and @carol");
+        assert_eq!(
+            page.messages[0].mention_resolution,
+            MentionResolution::Complete
+        );
+        assert_eq!(
+            page.messages[0]
+                .mentions
+                .iter()
+                .map(|mention| mention.id.as_str())
+                .collect::<Vec<_>>(),
+            ["U456", "U789"]
+        );
+        assert_eq!(page.messages[0].attachments, original_attachments);
+        assert_eq!(page.messages[0].author_name.as_deref(), Some("alice"));
+        assert_eq!(page.messages[1].author_name.as_deref(), Some("bob"));
+        assert_eq!(page.messages[1].rendered_text, "Again @bob");
+    }
+
+    #[tokio::test]
+    async fn message_search_uses_the_same_typed_mention_resolution() {
+        let blocks = vec![json!({
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [
+                    {"type": "text", "text": "Found "},
+                    {"type": "user", "user_id": "U456"}
+                ]
+            }]
+        })];
+        let mut api = fake_api();
+        api.search = RawMessageSearchResponse {
+            messages: RawMessageSearchMatches {
+                matches: vec![RawMessageSearchMatch {
+                    channel: RawMessageSearchChannel {
+                        id: "C123".into(),
+                        name: "general".into(),
+                    },
+                    ts: "100.000001".into(),
+                    user: Some("U123".into()),
+                    text: "Found <@U456>".into(),
+                    blocks: Some(blocks.clone()),
+                    ..RawMessageSearchMatch::default()
+                }],
+                total: 1,
+                ..RawMessageSearchMatches::default()
+            },
+            ..RawMessageSearchResponse::default()
+        };
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![
+                raw_user("U123", "alice", "Alice Example"),
+                raw_user("U456", "bob", "Bob Example"),
+            ],
+            ..RawUsersPage::default()
+        }]));
+        let user_calls = api.user_calls.clone();
+
+        let page = service(api)
+            .search_messages("Found", None, None, None, None, 1)
+            .await
+            .unwrap();
+
+        assert_single_user_directory_call(&user_calls);
+        assert_eq!(page.matches[0].text, "Found <@U456>");
+        assert_eq!(page.matches[0].rendered_text, "Found @bob");
+        assert_eq!(
+            page.matches[0].mention_resolution,
+            MentionResolution::Complete
+        );
+        assert_eq!(page.matches[0].mentions[0].id, "U456");
+        assert_eq!(page.matches[0].blocks, Some(blocks));
     }
 
     #[tokio::test]
@@ -11282,7 +12485,7 @@ mod tests {
     #[tokio::test]
     async fn auxiliary_author_failure_preserves_an_addressable_message() {
         let mut api = fake_api();
-        let mut message = raw_message("100.000001", "still readable");
+        let mut message = raw_message("100.000001", "still readable <@U456>");
         message.username = Some("unsafe\nname".into());
         api.history.messages = vec![message];
         api.user_list_error = true;
@@ -11291,7 +12494,12 @@ mod tests {
         let page = service(api).read_channel("C123", None, 1).await.unwrap();
 
         assert_single_user_directory_call(&user_calls);
-        assert_eq!(page.messages[0].text, "still readable");
+        assert_eq!(page.messages[0].text, "still readable <@U456>");
+        assert_eq!(page.messages[0].rendered_text, "still readable <@U456>");
+        assert_eq!(
+            page.messages[0].mention_resolution,
+            MentionResolution::Unavailable
+        );
         assert_eq!(page.messages[0].author_id.as_deref(), Some("U123"));
         assert_eq!(
             page.messages[0].author_resolution,
@@ -11581,12 +12789,16 @@ mod tests {
             RawPostMessageResponse {
                 channel: "C123".into(),
                 ts: "100.000001".into(),
-                message: raw_message("100.000001", "sent"),
+                message: raw_message("100.000001", "sent <@U456>"),
             },
         )
         .unwrap();
         let sent_json = serde_json::to_value(sent).unwrap();
         assert_eq!(sent_json["message"]["author_resolution"], "not_attempted");
+        assert_eq!(sent_json["message"]["text"], "sent <@U456>");
+        assert_eq!(sent_json["message"]["rendered_text"], "sent <@U456>");
+        assert_eq!(sent_json["message"]["mention_resolution"], "not_attempted");
+        assert_eq!(sent_json["message"]["mentions"][0]["id"], "U456");
     }
 
     #[tokio::test]
@@ -11612,55 +12824,60 @@ mod tests {
             .unwrap();
         assert_eq!(message.text, "target");
         assert_single_user_directory_call(&user_calls);
+        let mut expected = serde_json::json!({
+            "channel_id": "C123",
+            "ts": "100.000002",
+            "thread_ts": null,
+            "author_id": "U123",
+            "author_name": "alice",
+            "author_display_name": "Alice Example",
+            "author_resolution": "directory",
+            "text": "target",
+            "blocks": null,
+            "attachments": null,
+            "reply_count": 0,
+            "latest_reply": null,
+            "reactions": [{
+                "name": "eyes",
+                "count": 2,
+                "user_ids": [],
+                "user_ids_complete": false
+            }],
+            "files": [{
+                "id": "F123",
+                "name": "note.txt",
+                "title": null,
+                "alt_text": null,
+                "mimetype": "text/plain",
+                "filetype": null,
+                "pretty_type": null,
+                "mode": null,
+                "file_access": null,
+                "uploader_id": null,
+                "size": 12,
+                "created": null,
+                "timestamp": null,
+                "editable": null,
+                "is_external": null,
+                "is_public": null,
+                "public_url_shared": null,
+                "private_url": null,
+                "download_url": "https://files.slack.com/note.txt",
+                "permalink": null,
+                "channel_ids": null,
+                "group_ids": null,
+                "im_ids": null,
+                "shares": null,
+                "shares_complete": false
+            }]
+        });
+        let expected = expected.as_object_mut().unwrap();
+        expected.insert("rendered_text".into(), json!("target"));
+        expected.insert("mention_resolution".into(), json!("not_needed"));
+        expected.insert("mentions".into(), json!([]));
         assert_eq!(
             serde_json::to_value(message).unwrap(),
-            serde_json::json!({
-                "channel_id": "C123",
-                "ts": "100.000002",
-                "thread_ts": null,
-                "author_id": "U123",
-                "author_name": "alice",
-                "author_display_name": "Alice Example",
-                "author_resolution": "directory",
-                "text": "target",
-                "blocks": null,
-                "attachments": null,
-                "reply_count": 0,
-                "latest_reply": null,
-                "reactions": [{
-                    "name": "eyes",
-                    "count": 2,
-                    "user_ids": [],
-                    "user_ids_complete": false
-                }],
-                "files": [{
-                    "id": "F123",
-                    "name": "note.txt",
-                    "title": null,
-                    "alt_text": null,
-                    "mimetype": "text/plain",
-                    "filetype": null,
-                    "pretty_type": null,
-                    "mode": null,
-                    "file_access": null,
-                    "uploader_id": null,
-                    "size": 12,
-                    "created": null,
-                    "timestamp": null,
-                    "editable": null,
-                    "is_external": null,
-                    "is_public": null,
-                    "public_url_shared": null,
-                    "private_url": null,
-                    "download_url": "https://files.slack.com/note.txt",
-                    "permalink": null,
-                    "channel_ids": null,
-                    "group_ids": null,
-                    "im_ids": null,
-                    "shares": null,
-                    "shares_complete": false
-                }]
-            })
+            serde_json::Value::Object(expected.clone())
         );
     }
 

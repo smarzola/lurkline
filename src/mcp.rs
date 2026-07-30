@@ -1342,6 +1342,31 @@ mod tests {
             ])
         );
         assert!(tools.tools.iter().all(|tool| tool.output_schema.is_some()));
+        let read_channel_schema = serde_json::to_value(
+            tools
+                .tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == "slack_read_channel")
+                .and_then(|tool| tool.output_schema.as_ref())
+                .expect("read-channel output schema"),
+        )
+        .expect("schema is serializable")
+        .to_string();
+        for required in [
+            "rendered_text",
+            "mention_resolution",
+            "mentions",
+            "not_needed",
+            "not_attempted",
+            "complete",
+            "partial",
+            "unavailable",
+        ] {
+            assert!(
+                read_channel_schema.contains(required),
+                "read-channel output schema should contain {required}"
+            );
+        }
         for tool in &tools.tools {
             let annotations = tool.annotations.as_ref().expect("tool annotations");
             let is_write = matches!(

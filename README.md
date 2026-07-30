@@ -447,6 +447,18 @@ user-directory scan for each targeted read or inbox snapshot and reuses a scan
 required to resolve a conversation name; it never looks up each message
 separately.
 
+Human message bodies also render Slack user mentions as `@username`, falling
+back to a safe profile display name. Inline and fenced code remain literal.
+JSON and MCP keep canonical Slack `text`, raw blocks, and attachments unchanged,
+and add `rendered_text`, ordered unique `mentions`, and `mention_resolution`.
+That status is `not_needed`, `not_attempted`, `complete`, `partial`, or
+`unavailable`; unresolved tokens remain in their original `<@USER_ID>` form.
+Resolution records at most 256 unique mentions and bounds derived rendering to
+40,000 UTF-8 bytes. Reaching either bound reports `partial` and keeps canonical
+Slack text as the safe fallback.
+Sent-message acknowledgements are `not_attempted`, and send/reply operations
+never use the derived rendering.
+
 Reaction `user_ids` can be shorter than `count`; check `user_ids_complete`
 before treating that list as exhaustive. Slack guarantees that the
 authenticated user remains present when that user reacted. Nullable or omitted
