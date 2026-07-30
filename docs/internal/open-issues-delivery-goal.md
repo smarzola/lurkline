@@ -586,23 +586,32 @@ Design decisions:
   requests.
 - Every structured message and search match adds `permalink`,
   `thread_root_permalink`, and a typed `complete`, `partial`, or `unavailable`
-  resolution state. A thread root does not duplicate itself in
-  `thread_root_permalink`; a reply exposes both its exact link and its root.
+  resolution state describing output completeness rather than trust in an
+  auxiliary Slack field. A root is complete with its exact link and does not
+  duplicate itself in `thread_root_permalink`; a reply is complete only with
+  both its exact link and its root. One applicable link is partial and no
+  applicable links is unavailable.
 - Normalize timestamp fractions to Slack's six-digit permalink form. Any
-  otherwise retained noncanonical timestamp degrades link fields rather than
-  discarding the message.
-- A Slack-provided search permalink is used only when it is a credential-free,
-  fragment-free URL on the configured workspace origin with the exact expected
-  message route and reply query. Missing or malformed auxiliary URLs fall back
-  to deterministic construction.
+  otherwise retained fraction longer than six digits degrades only the
+  affected link rather than being truncated or discarding the message.
+  Canonical-equivalent timestamps such as `100.1` and `100.100000` identify a
+  self-threaded root, not a reply.
+- Never emit Slack's raw search permalink. It may be validated as
+  corroborating input, but output is always locally serialized from the
+  validated workspace origin and identifiers. Missing, malformed, mismatched,
+  tracked, or ambiguous auxiliary URLs do not fail or downgrade a fully
+  constructed result.
 - Human `message get` output shows the exact link and, for replies, its root.
   Search rows include the exact link because returning to a found result is a
   primary journey. Channel, thread, and inbox rows remain concise; their JSON
-  and MCP results still include both link fields.
+  and MCP results still include both link fields. Unavailable human links are
+  omitted; structured status remains authoritative.
 - The same pure builder covers public/private channels, direct messages, group
   DMs, roots, replies, sent acknowledgements, and every public read path. It
-  does not expose the workspace origin anywhere except explicit requested
-  output.
+  uses URL serialization, performs no numeric timestamp parsing, and adds no
+  Slack calls. The validated Slack workspace origin remains distinct from API
+  transport origins used by synthetic loopback tests, and is exposed only in
+  explicitly requested output.
 
 ## Milestone 6: Bounded Recent Activity (`v0.13.0`, #15)
 
