@@ -397,6 +397,11 @@ struct UserDirectory {
     complete: bool,
 }
 
+struct LoadedInboxConversations {
+    conversations: HashMap<String, Conversation>,
+    author_directory: Option<AuthorDirectory>,
+}
+
 struct ResolvedNamedConversation {
     conversation: Conversation,
     user_directory: UserDirectory,
@@ -1789,7 +1794,7 @@ impl SlackService {
             .iter()
             .map(|unread| unread.id.clone())
             .collect::<HashSet<_>>();
-        let directory = self.load_conversations_by_id(&selected_ids).await?;
+        let mut loaded = self.load_conversations_by_id(&selected_ids).await?;
         let mut report = InboxReport {
             team_id: self.team_id.clone(),
             conversations: Vec::with_capacity(selected.len()),
@@ -1807,7 +1812,8 @@ impl SlackService {
         }
         let mut byte_limited = false;
         for unread in selected {
-            let conversation = directory
+            let conversation = loaded
+                .conversations
                 .get(&unread.id)
                 .cloned()
                 .unwrap_or_else(|| fallback_conversation(&unread));
@@ -1816,9 +1822,17 @@ impl SlackService {
                     method: "conversations.list",
                 });
             }
-            let messages = self
+            let mut messages = self
                 .read_channel_by_id(&unread.id, None, message_limit)
                 .await?;
+            if messages.messages.iter().any(message_author_needs_directory) {
+                if loaded.author_directory.is_none() {
+                    loaded.author_directory = Some(self.author_directory(None).await);
+                }
+                if let Some(directory) = &loaded.author_directory {
+                    enrich_message_authors_from_directory(&mut messages.messages, directory);
+                }
+            }
             report.conversations.push(InboxConversation {
                 conversation,
                 unread,
@@ -2403,9 +2417,12 @@ impl SlackService {
     async fn load_conversations_by_id(
         &self,
         ids: &HashSet<String>,
-    ) -> Result<HashMap<String, Conversation>> {
+    ) -> Result<LoadedInboxConversations> {
         if ids.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(LoadedInboxConversations {
+                conversations: HashMap::new(),
+                author_directory: None,
+            });
         }
 
         let mut matched = Vec::new();
@@ -2454,15 +2471,23 @@ impl SlackService {
             }
         }
 
-        let users = if matched.iter().any(|conversation| conversation.is_im) {
-            self.load_user_directory().await?.users
+        let author_directory = if matched.iter().any(|conversation| conversation.is_im) {
+            Some(self.author_directory(None).await)
         } else {
-            HashMap::new()
+            None
         };
-        Ok(normalize_conversations(matched, &users)?
-            .into_iter()
-            .map(|conversation| (conversation.id.clone(), conversation))
-            .collect())
+        let empty_users = HashMap::new();
+        let users = author_directory
+            .as_ref()
+            .map(author_directory_users)
+            .unwrap_or(&empty_users);
+        Ok(LoadedInboxConversations {
+            conversations: normalize_conversations(matched, users)?
+                .into_iter()
+                .map(|conversation| (conversation.id.clone(), conversation))
+                .collect(),
+            author_directory,
+        })
     }
 
     async fn enrich_message_authors(
@@ -2474,18 +2499,7 @@ impl SlackService {
             return;
         }
         let directory = self.author_directory(user_directory).await;
-        for message in messages
-            .iter_mut()
-            .filter(|message| message_author_needs_directory(message))
-        {
-            enrich_author(
-                message.author_id.as_deref(),
-                &mut message.author_name,
-                &mut message.author_display_name,
-                &mut message.author_resolution,
-                &directory,
-            );
-        }
+        enrich_message_authors_from_directory(messages, &directory);
     }
 
     async fn enrich_search_authors(
@@ -3522,6 +3536,29 @@ fn normalize_custom_emoji(name: String, value: String) -> Result<CustomEmoji> {
 
 fn message_author_needs_directory(message: &Message) -> bool {
     message.author_resolution == AuthorResolution::NotAttempted
+}
+
+fn author_directory_users(directory: &AuthorDirectory) -> &HashMap<String, User> {
+    match directory {
+        AuthorDirectory::Loaded(directory) | AuthorDirectory::Interrupted(directory) => {
+            &directory.users
+        }
+    }
+}
+
+fn enrich_message_authors_from_directory(messages: &mut [Message], directory: &AuthorDirectory) {
+    for message in messages
+        .iter_mut()
+        .filter(|message| message_author_needs_directory(message))
+    {
+        enrich_author(
+            message.author_id.as_deref(),
+            &mut message.author_name,
+            &mut message.author_display_name,
+            &mut message.author_resolution,
+            directory,
+        );
+    }
 }
 
 fn search_author_needs_directory(message: &MessageSearchMatch) -> bool {
@@ -7345,11 +7382,15 @@ mod tests {
             ..RawConversationsPage::default()
         }]));
         api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
-            members: vec![raw_user("WALI", "alice", "Alice Example")],
+            members: vec![
+                raw_user("WALI", "alice", "Alice Example"),
+                raw_user("U123", "carol", "Carol Example"),
+            ],
             ..RawUsersPage::default()
         }]));
         api.history.messages = vec![raw_message("100.000001", "recent")];
         let history_calls = api.history_calls.clone();
+        let user_calls = api.user_calls.clone();
 
         let report = service(api).inbox(2, 7).await.unwrap();
 
@@ -7376,6 +7417,13 @@ mod tests {
         assert!(report.conversations[0].conversation.metadata_is_complete);
         assert_eq!(report.conversations[1].conversation.name, "general");
         assert_eq!(report.conversations[0].messages.messages.len(), 1);
+        assert!(report.conversations.iter().all(|entry| {
+            let message = &entry.messages.messages[0];
+            message.author_name.as_deref() == Some("carol")
+                && message.author_display_name.as_deref() == Some("Carol Example")
+                && message.author_resolution == AuthorResolution::Directory
+        }));
+        assert_single_user_directory_call(&user_calls);
         assert!(report.threads.has_unreads);
         assert_eq!(report.threads.mention_count, 2);
         assert_eq!(
@@ -7393,6 +7441,188 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn inbox_resolves_complete_misses_without_losing_json_identity_metadata() {
+        let mut api = fake_api();
+        api.counts.channels = vec![entry("CGENERAL", true, 1)];
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("CGENERAL", "general")],
+            ..RawConversationsPage::default()
+        }]));
+        api.history.messages = vec![raw_message("100.000001", "unknown author")];
+        let user_calls = api.user_calls.clone();
+
+        let report = service(api).inbox(1, 1).await.unwrap();
+
+        assert_single_user_directory_call(&user_calls);
+        let message = &report.conversations[0].messages.messages[0];
+        assert_eq!(message.author_id.as_deref(), Some("U123"));
+        assert_eq!(message.author_name, None);
+        assert_eq!(message.author_display_name, None);
+        assert_eq!(message.author_resolution, AuthorResolution::Unresolved);
+        let json = serde_json::to_value(message).unwrap();
+        assert_eq!(json["author_id"], "U123");
+        assert_eq!(json["author_name"], serde_json::Value::Null);
+        assert_eq!(json["author_display_name"], serde_json::Value::Null);
+        assert_eq!(json["author_resolution"], "unresolved");
+    }
+
+    #[tokio::test]
+    async fn inbox_reuses_valid_users_when_the_shared_directory_is_interrupted() {
+        let mut api = fake_api();
+        api.counts.ims = vec![entry("DALI", true, 3)];
+        api.counts.channels = vec![entry("CGENERAL", true, 1)];
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                RawConversation {
+                    id: "DALI".into(),
+                    is_im: true,
+                    user: Some("WALI".into()),
+                    ..RawConversation::default()
+                },
+                raw_conversation("CGENERAL", "general"),
+            ],
+            ..RawConversationsPage::default()
+        }]));
+        let known = raw_message("100.000001", "known");
+        let mut unavailable = raw_message("100.000002", "unavailable");
+        unavailable.user = Some("U999".into());
+        api.history.messages = vec![known, unavailable];
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![
+                raw_user("WALI", "alice", "Alice Example"),
+                raw_user("U123", "carol", "Carol Example"),
+            ],
+            response_metadata: RawResponseMetadata {
+                next_cursor: "users-2".into(),
+            },
+        }]));
+        api.user_list_error_after = Some(1);
+        let user_calls = api.user_calls.clone();
+
+        let report = service(api).inbox(2, 2).await.unwrap();
+
+        assert_eq!(
+            user_calls.lock().unwrap().as_slice(),
+            &[
+                UserCall {
+                    cursor: None,
+                    limit: USERS_PAGE_SIZE,
+                },
+                UserCall {
+                    cursor: Some("users-2".into()),
+                    limit: USERS_PAGE_SIZE,
+                },
+            ]
+        );
+        assert_eq!(
+            report
+                .conversations
+                .iter()
+                .map(|entry| entry.conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["DALI", "CGENERAL"]
+        );
+        assert_eq!(report.conversations[0].conversation.name, "alice");
+        assert_eq!(
+            report.conversations[0].conversation.display_name,
+            "Alice Example"
+        );
+        for entry in &report.conversations {
+            let messages = &entry.messages.messages;
+            assert_eq!(messages[0].author_name.as_deref(), Some("carol"));
+            assert_eq!(
+                messages[0].author_display_name.as_deref(),
+                Some("Carol Example")
+            );
+            assert_eq!(messages[0].author_resolution, AuthorResolution::Directory);
+            assert_eq!(messages[1].author_name, None);
+            assert_eq!(messages[1].author_resolution, AuthorResolution::Unavailable);
+        }
+    }
+
+    #[tokio::test]
+    async fn inbox_marks_unscanned_authors_incomplete_at_the_shared_directory_bound() {
+        let mut api = fake_api();
+        api.counts.channels = vec![entry("CGENERAL", true, 1)];
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("CGENERAL", "general")],
+            ..RawConversationsPage::default()
+        }]));
+        let known = raw_message("100.000001", "known");
+        let mut incomplete = raw_message("100.000002", "incomplete");
+        incomplete.user = Some("U999".into());
+        api.history.messages = vec![known, incomplete];
+        api.user_pages = Mutex::new(
+            (0..MAX_USER_PAGES)
+                .map(|page| RawUsersPage {
+                    members: if page == 0 {
+                        vec![raw_user("U123", "alice", "Alice Example")]
+                    } else {
+                        vec![]
+                    },
+                    response_metadata: RawResponseMetadata {
+                        next_cursor: format!("users-{}", page + 1),
+                    },
+                })
+                .collect(),
+        );
+        let user_calls = api.user_calls.clone();
+
+        let report = service(api).inbox(1, 2).await.unwrap();
+
+        assert_eq!(user_calls.lock().unwrap().len(), MAX_USER_PAGES);
+        let messages = &report.conversations[0].messages.messages;
+        assert_eq!(messages[0].author_name.as_deref(), Some("alice"));
+        assert_eq!(messages[0].author_resolution, AuthorResolution::Directory);
+        assert_eq!(messages[1].author_name, None);
+        assert_eq!(messages[1].author_resolution, AuthorResolution::Incomplete);
+    }
+
+    #[tokio::test]
+    async fn inbox_skips_the_shared_directory_for_supplied_and_authorless_messages() {
+        let mut api = fake_api();
+        api.counts.channels = vec![entry("CGENERAL", true, 2), entry("CRANDOM", true, 1)];
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                raw_conversation("CGENERAL", "general"),
+                raw_conversation("CRANDOM", "random"),
+            ],
+            ..RawConversationsPage::default()
+        }]));
+        let mut supplied = raw_message("100.000001", "bot");
+        supplied.user = None;
+        supplied.bot_id = Some("B123".into());
+        supplied.username = Some("build-bot".into());
+        let authorless = RawMessage {
+            ts: "100.000002".into(),
+            text: "system event".into(),
+            ..RawMessage::default()
+        };
+        api.history.messages = vec![supplied, authorless];
+        let user_calls = api.user_calls.clone();
+
+        let report = service(api).inbox(2, 2).await.unwrap();
+
+        assert!(user_calls.lock().unwrap().is_empty());
+        assert_eq!(report.conversations.len(), 2);
+        for entry in report.conversations {
+            assert_eq!(
+                entry.messages.messages[0].author_resolution,
+                AuthorResolution::Provided
+            );
+            assert_eq!(
+                entry.messages.messages[0].author_name.as_deref(),
+                Some("build-bot")
+            );
+            assert_eq!(
+                entry.messages.messages[1].author_resolution,
+                AuthorResolution::Unknown
+            );
+            assert_eq!(entry.messages.messages[1].author_id, None);
+        }
     }
 
     #[tokio::test]
@@ -7474,10 +7704,20 @@ mod tests {
                 "100.000001",
                 "a bounded synthetic message whose serialized size is intentionally nontrivial",
             )];
+            api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+                members: vec![raw_user("U123", "alice", "Alice Example")],
+                ..RawUsersPage::default()
+            }]));
             api
         };
 
-        let full_report = service(make_api()).inbox(3, 1).await.unwrap();
+        let full_api = make_api();
+        let full_user_calls = full_api.user_calls.clone();
+        let full_report = service(full_api).inbox(3, 1).await.unwrap();
+        assert_single_user_directory_call(&full_user_calls);
+        assert!(full_report.conversations.iter().all(|entry| {
+            entry.messages.messages[0].author_resolution == AuthorResolution::Directory
+        }));
         let mut one_conversation_report = full_report.clone();
         one_conversation_report.conversations.truncate(1);
         one_conversation_report.has_more_conversations = true;
@@ -10333,24 +10573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unenriched_inbox_and_sent_messages_report_not_attempted() {
-        let mut inbox_api = fake_api();
-        inbox_api.counts.channels = vec![entry("C123", true, 1)];
-        inbox_api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
-            channels: vec![raw_conversation("C123", "general")],
-            ..RawConversationsPage::default()
-        }]));
-        inbox_api.history.messages = vec![raw_message("100.000001", "inbox")];
-        let user_calls = inbox_api.user_calls.clone();
-
-        let inbox = service(inbox_api).inbox(1, 1).await.unwrap();
-        assert!(user_calls.lock().unwrap().is_empty());
-        let inbox_json = serde_json::to_value(&inbox).unwrap();
-        assert_eq!(
-            inbox_json["conversations"][0]["messages"]["messages"][0]["author_resolution"],
-            "not_attempted"
-        );
-
+    async fn unenriched_sent_messages_report_not_attempted() {
         let sent = normalize_sent_message(
             "C123",
             None,

@@ -324,7 +324,8 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Started on 2026-07-30 from
+Status: Implementation accepted on 2026-07-30; PR, merge, tag, and release
+delivery remain pending. The branch started from
 `46b8125f64b2a02284376282c3e7d38128d28c2a`, the exact `v0.9.1`
 `origin/main`.
 
@@ -348,6 +349,19 @@ Design decisions:
 - Live `inbox` smoke testing is out of scope because it aggregates unread
   conversations and the authorization is limited to the `smarzola` self-DM.
   Synthetic multi-conversation CLI/MCP/service coverage is required instead.
+
+Focused inbox, CLI, and raw-MCP verification passed. The full gate passed with
+235 library tests, 12 CLI-process tests, 2 raw-MCP tests, and 1
+package-metadata test, plus strict Clippy, formatting, locked release build,
+Rust 1.88 compatibility, credential scanning, diff checking, version readback,
+and reproducible macOS ARM64 package checksum/layout verification.
+
+The retained reviewer found that partial-directory reuse was only tested with
+one conversation. The repair extended it across a DM and channel with the
+exact two-call cursor sequence, retained name resolution, consistent
+`unavailable` misses, and no retry; the same reviewer cleared the repair. A
+fresh context-independent auditor found no issue at any severity and cleared
+Milestone 2 for publication. No live Slack operation was performed.
 
 ## Milestone 3: Named Unread Conversations (`v0.10.0`, #18)
 
