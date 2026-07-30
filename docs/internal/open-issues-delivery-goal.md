@@ -202,7 +202,7 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: Fix hosted file downloads and release `v0.9.1` for #17.
+- [x] Milestone 1: Fix hosted file downloads and release `v0.9.1` for #17.
 - [ ] Milestone 2: Resolve inbox authors and release `v0.9.2` for #16.
 - [ ] Milestone 3: Name unread conversations and release `v0.10.0` for #18.
 - [ ] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
@@ -267,9 +267,8 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Implementation accepted on 2026-07-30; PR, merge, tag, and release
-delivery remain pending. The branch starts at
-`bb2024b6332986b02bc9381c935b670619e0b511` and targets `v0.9.1`.
+Status: Delivered on 2026-07-30. The branch started at
+`bb2024b6332986b02bc9381c935b670619e0b511` and targeted `v0.9.1`.
 
 Focused HTTP, service, MCP, CLI-process, and raw-MCP verification passed. The
 full gate passed with 231 library tests, 12 CLI-process tests, 2 raw-MCP tests,
@@ -289,6 +288,14 @@ did not complete either synthetic file-share flow, so no live hosted-file
 download is claimed. Up to two private unshared synthetic file objects may
 remain because no safe artifact identifier was returned; no retry or unsafe
 cleanup was attempted.
+
+PR #20 passed CI run `30533915577` and was squash-merged as
+`46b8125f64b2a02284376282c3e7d38128d28c2a`, closing #17. Annotated tag
+`v0.9.1` dereferences to that exact commit. Release workflow `30534320425`,
+tag CI `30534320264`, and main CI `30534278984` all succeeded. The published
+release contained exactly three platform archives and three checksum files;
+all checksums and the exact versioned `lurkline`, `README.md`, and `LICENSE`
+archive layouts passed independent download verification.
 
 ## Milestone 2: Inbox Author Resolution (`v0.9.2`, #16)
 
@@ -317,7 +324,30 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Not started.
+Status: Started on 2026-07-30 from
+`46b8125f64b2a02284376282c3e7d38128d28c2a`, the exact `v0.9.1`
+`origin/main`.
+
+Design decisions:
+
+- Author resolution is the default inbox experience; no opt-in flag is added
+  for behavior that targeted message reads already provide.
+- One lazily loaded bounded directory is shared across selected conversation
+  naming and every returned message. A DM can trigger it before history;
+  otherwise the first unresolved message triggers it. It is never loaded per
+  message or per conversation.
+- Valid identities collected before a bounded scan interruption remain usable.
+  Complete misses, scan-limit misses, and request failures use the existing
+  `unresolved`, `incomplete`, and `unavailable` states without discarding
+  inbox messages.
+- Username, display-name, raw-ID, supplied-name, bot, and authorless precedence
+  remains identical to channel/thread/search output.
+- Each enriched conversation entry must pass the existing complete-report byte
+  bound before it is retained, so readable names cannot silently exceed the
+  response limit.
+- Live `inbox` smoke testing is out of scope because it aggregates unread
+  conversations and the authorization is limited to the `smarzola` self-DM.
+  Synthetic multi-conversation CLI/MCP/service coverage is required instead.
 
 ## Milestone 3: Named Unread Conversations (`v0.10.0`, #18)
 
