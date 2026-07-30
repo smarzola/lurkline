@@ -50,6 +50,7 @@ const DEFAULT_ACTIVITY_MESSAGES: usize = 50;
 const DEFAULT_ACTIVITY_PER_CONVERSATION: usize = 20;
 const MAX_ACTIVITY_DURATION_SECONDS: i64 = 365 * 24 * 60 * 60;
 const MAX_ACTIVITY_SELECTORS: usize = 50;
+const MAX_ACTIVITY_CURSOR_LENGTH: usize = 8_192;
 const ACTIVITY_CURSOR_VERSION: u8 = 1;
 const ACTIVITY_CURSOR_PREFIX: &str = "activity-v1";
 const ACTIVITY_CURSOR_DOMAIN: &[u8] = b"lurkline-activity-cursor-v1\0";
@@ -6012,15 +6013,24 @@ fn encode_activity_cursor(cursor: &ActivityCursor) -> Result<String> {
     let mut checked = Vec::with_capacity(ACTIVITY_CURSOR_DOMAIN.len() + payload.len());
     checked.extend_from_slice(ACTIVITY_CURSOR_DOMAIN);
     checked.extend_from_slice(&payload);
-    Ok(format!(
+    let encoded = format!(
         "{ACTIVITY_CURSOR_PREFIX}.{}.{}",
         URL_SAFE_NO_PAD.encode(payload),
         sha256_hex(&checked)
-    ))
+    );
+    if encoded.len() > MAX_ACTIVITY_CURSOR_LENGTH {
+        return Err(Error::Output);
+    }
+    Ok(encoded)
 }
 
 fn decode_activity_cursor(value: &str) -> Result<ActivityCursor> {
-    validate_cursor(Some(value))?;
+    if value.trim().is_empty()
+        || value.len() > MAX_ACTIVITY_CURSOR_LENGTH
+        || value.chars().any(char::is_control)
+    {
+        return Err(invalid_activity_cursor());
+    }
     let mut parts = value.split('.');
     let prefix = parts.next();
     let payload = parts.next();
@@ -14911,6 +14921,39 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn activity_cursor_round_trips_the_maximum_valid_domain() {
+        let conversation_ids = (0..MAX_ACTIVITY_CONVERSATIONS)
+            .map(|index| format!("C{index:02}{}", "A".repeat(61)))
+            .collect::<Vec<_>>();
+        let team_id = format!("T{}", "A".repeat(63));
+        let cursor = ActivityCursor {
+            version: ACTIVITY_CURSOR_VERSION,
+            team_id: team_id.clone(),
+            after_nanos: 0,
+            before_nanos: i64::MAX,
+            order: ActivityOrder::OldestFirst,
+            conversation_ids: conversation_ids.clone(),
+            conversation_limit: MAX_ACTIVITY_CONVERSATIONS,
+            per_conversation_limit: MAX_ACTIVITY_PER_CONVERSATION,
+            limit: MAX_ACTIVITY_MESSAGES,
+            scanned_conversations: usize::MAX,
+            selection_truncated: true,
+            last_key: ActivityKey {
+                ts: format!("{}.{}", "9".repeat(15), "9".repeat(16)),
+                conversation_id: conversation_ids[0].clone(),
+            },
+            snapshot_digest: "a".repeat(64),
+        };
+
+        let encoded = encode_activity_cursor(&cursor).unwrap();
+        assert!(encoded.len() > 2_048);
+        assert!(encoded.len() <= MAX_ACTIVITY_CURSOR_LENGTH);
+        let decoded = decode_activity_cursor(&encoded).unwrap();
+        assert_eq!(decoded, cursor);
+        validate_activity_cursor(&decoded, &team_id).unwrap();
     }
 
     #[tokio::test]
