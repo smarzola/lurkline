@@ -203,7 +203,7 @@ The goal is complete only when:
 ## Milestones
 
 - [x] Milestone 1: Fix hosted file downloads and release `v0.9.1` for #17.
-- [ ] Milestone 2: Resolve inbox authors and release `v0.9.2` for #16.
+- [x] Milestone 2: Resolve inbox authors and release `v0.9.2` for #16.
 - [ ] Milestone 3: Name unread conversations and release `v0.10.0` for #18.
 - [ ] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
 - [ ] Milestone 5: Expose canonical permalinks and release `v0.12.0` for #19.
@@ -324,8 +324,7 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Implementation accepted on 2026-07-30; PR, merge, tag, and release
-delivery remain pending. The branch started from
+Status: Delivered on 2026-07-30. The branch started from
 `46b8125f64b2a02284376282c3e7d38128d28c2a`, the exact `v0.9.1`
 `origin/main`.
 
@@ -363,6 +362,15 @@ exact two-call cursor sequence, retained name resolution, consistent
 fresh context-independent auditor found no issue at any severity and cleared
 Milestone 2 for publication. No live Slack operation was performed.
 
+PR #21 passed CI run `30536209570` and was squash-merged as
+`3954fdab4518d919794d799ac8c829e78fa05b29`, closing #16. Annotated tag
+`v0.9.2` dereferences to that exact commit. Release workflow `30536434982`
+initially hit a transient macOS raw-MCP EOF teardown timeout after the tests
+had otherwise passed. A targeted unchanged-source retry succeeded as attempt
+2; tag CI `30536434689` and main CI `30536402074` also succeeded. The release
+contained exactly six expected assets, and every checksum and exact versioned
+archive layout passed independent download verification.
+
 ## Milestone 3: Named Unread Conversations (`v0.10.0`, #18)
 
 Acceptance criteria:
@@ -388,7 +396,32 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Not started.
+Status: Started on 2026-07-30 from
+`3954fdab4518d919794d799ac8c829e78fa05b29`, the exact `v0.9.2`
+`origin/main`.
+
+Design decisions:
+
+- `client.counts` remains the sole source of unread truth. A separate internal
+  unread-count snapshot keeps inbox behavior from performing duplicate name
+  discovery when public `unreads` adds enrichment.
+- Public unread entries retain `id` and `kind`, add optional `name` and
+  `display_name`, and expose a typed resolution state: `resolved`,
+  `incomplete`, `inaccessible`, `unnamed`, or `unavailable`.
+- One bounded conversation-directory scan resolves all unread IDs. A single
+  bounded user-directory scan is added only when matched DMs need participant
+  identity. Valid partial results survive later scan errors or bounds.
+- Human output uses `#channel`, `@username`, display-name-only DM fallback,
+  and a friendly participant list for Slack's internal MPDM name shape. It
+  never presents an opaque internal MPDM token as a human label.
+- Missing metadata never hides an unread entry. Complete misses are
+  `inaccessible`, bounded misses are `incomplete`, unsafe or absent labels are
+  `unnamed`, and interrupted discovery is `unavailable`; each renders an
+  explicit labeled fallback beside the stable ID.
+- Live `unreads` smoke testing is out of scope because it can enumerate
+  conversations outside the authorized `smarzola` self-DM. Synthetic CLI,
+  JSON, MCP, partial-scan, malformed-response, and request-count coverage is
+  required.
 
 ## Milestone 4: Fidelity-Preserving Mention Rendering (`v0.11.0`, #14)
 
