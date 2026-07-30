@@ -1048,9 +1048,11 @@ The following table lists primary and auxiliary bounds:
 | Message reactions | 100 reaction names; 1,000 returned users each | User list can be partial |
 | User find | 100 | 20 user pages of 200 |
 
-Opaque cursors are limited to 2,048 non-control characters. Repeated response
-cursors fail instead of creating pagination loops. Result JSON reports
-continuation or scan truncation when the operation supports it.
+Slack-provided opaque cursors are limited to 2,048 non-control characters.
+Locally issued activity continuation cursors are limited to 8,192 so the
+maximum 50-conversation snapshot can round-trip. Repeated response cursors fail
+instead of creating pagination loops. Result JSON reports continuation or scan
+truncation when the operation supports it.
 
 ### Configure request controls
 
