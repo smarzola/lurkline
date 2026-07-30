@@ -325,7 +325,8 @@ or exact name before it applies the conversation filter. Dates must be valid
 `YYYY-MM-DD` values, and `--after` can't be later than `--before`.
 
 The reported total is Slack's workspace match count. Only a returned cursor
-indicates another page.
+indicates another page. Human search rows end with the canonical Slack
+permalink when it can be constructed safely.
 
 ## List unreads
 
@@ -458,6 +459,30 @@ Resolution records at most 256 unique mentions and bounds derived rendering to
 Slack text as the safe fallback.
 Sent-message acknowledgements are `not_attempted`, and send/reply operations
 never use the derived rendering.
+
+Every structured message and search match also includes `permalink`,
+`thread_root_permalink`, and `permalink_resolution`. A root message is
+`complete` when its exact link is available and leaves
+`thread_root_permalink` null because it is not applicable. A reply is
+`complete` only when both its exact link and root link are available; one
+applicable link is `partial`, and none is `unavailable`. Exact-message human
+output prints `link` and, for replies, `thread-root` lines. Ordinary channel,
+thread, and inbox rows stay concise.
+
+Lurkline constructs these links locally from the validated Slack workspace
+origin, conversation ID, and timestamp, so lists never make one permalink
+request per message. Timestamp fractions are right-padded to Slack's canonical
+six digits and are never truncated. A noncanonical timestamp or missing
+metadata degrades only the affected links; the message remains available.
+Slack-provided search URLs are not forwarded, preventing unexpected origins,
+tracking parameters, fragments, or ambiguous encodings from reaching output.
+When search omits a separate thread timestamp, a strictly validated Slack
+route may supply that missing root timestamp before Lurkline reconstructs both
+links locally. If neither structured thread metadata nor a valid route proves
+whether the match is a root or reply, link status is `unavailable` rather than
+guessing a root URL.
+The same behavior covers channels (`C…`), direct messages (`D…`), and group
+DMs (`G…`).
 
 Reaction `user_ids` can be shorter than `count`; check `user_ids_complete`
 before treating that list as exhaustive. Slack guarantees that the

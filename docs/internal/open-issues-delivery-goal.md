@@ -205,8 +205,8 @@ The goal is complete only when:
 - [x] Milestone 1: Fix hosted file downloads and release `v0.9.1` for #17.
 - [x] Milestone 2: Resolve inbox authors and release `v0.9.2` for #16.
 - [x] Milestone 3: Name unread conversations and release `v0.10.0` for #18.
-- [ ] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
-- [ ] Milestone 5: Expose canonical permalinks and release `v0.12.0` for #19.
+- [x] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
+- [x] Milestone 5: Expose canonical permalinks and release `v0.12.0` for #19.
 - [ ] Milestone 6: Deliver recent activity and release `v0.13.0` for #15.
 
 ### Per-Issue Checkpoint And Delivery Protocol
@@ -539,6 +539,14 @@ Retained-review evidence:
   Clippy, release build, Rust 1.88 compatibility, credential scan, diff check,
   version readback, and deterministic package checksum/layout verification.
 
+PR #23 passed CI run `30544320018` and was squash-merged as
+`259f2456606b05ccb8e4019f10bd14a7c2737a04`, closing #14. Annotated tag
+`v0.11.0` dereferences to that exact commit. Release workflow `30544642743`,
+tag CI `30544642463`, and main CI `30544560097` all succeeded. GitHub Release
+`362438795` contained exactly six expected assets; every independently
+downloaded checksum and exact versioned `lurkline`, `README.md`, and `LICENSE`
+archive layout passed verification.
+
 ## Milestone 5: Canonical Message Permalinks (`v0.12.0`, #19)
 
 Acceptance criteria:
@@ -565,7 +573,82 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Not started.
+Status: Started on 2026-07-30 from
+`259f2456606b05ccb8e4019f10bd14a7c2737a04`, the exact `v0.11.0`
+`origin/main`.
+
+Design decisions:
+
+- Build canonical links locally from the already validated workspace origin,
+  conversation ID, and Slack timestamp. Slack documents the deterministic
+  root path and reply query format; avoiding `chat.getPermalink` calls keeps
+  channel, thread, inbox, and search reads at zero additional network
+  requests.
+- Every structured message and search match adds `permalink`,
+  `thread_root_permalink`, and a typed `complete`, `partial`, or `unavailable`
+  resolution state describing output completeness rather than trust in an
+  auxiliary Slack field. A root is complete with its exact link and does not
+  duplicate itself in `thread_root_permalink`; a reply is complete only with
+  both its exact link and its root. One applicable link is partial and no
+  applicable links is unavailable.
+- Normalize timestamp fractions to Slack's six-digit permalink form. Any
+  otherwise retained fraction longer than six digits degrades only the
+  affected link rather than being truncated or discarding the message.
+  Canonical-equivalent timestamps such as `100.1` and `100.100000` identify a
+  self-threaded root, not a reply.
+- Never emit Slack's raw search permalink. It may be validated as
+  corroborating input, but output is always locally serialized from the
+  validated workspace origin and identifiers. Missing, malformed, mismatched,
+  tracked, or ambiguous auxiliary URLs do not fail or downgrade a fully
+  constructed result. When search supplies neither structured thread context
+  nor a valid route that proves root or reply, omit both unproven links and
+  report `unavailable` rather than guessing that the match is a root.
+- Human `message get` output shows the exact link and, for replies, its root.
+  Search rows include the exact link because returning to a found result is a
+  primary journey. Channel, thread, and inbox rows remain concise; their JSON
+  and MCP results still include both link fields. Unavailable human links are
+  omitted; structured status remains authoritative.
+- The same pure builder covers public/private channels, direct messages, group
+  DMs, roots, replies, sent acknowledgements, and every public read path. It
+  uses URL serialization, performs no numeric timestamp parsing, and adds no
+  Slack calls. The validated Slack workspace origin remains distinct from API
+  transport origins used by synthetic loopback tests, and is exposed only in
+  explicitly requested output.
+
+Implementation and verification:
+
+- `Message` and `MessageSearchMatch` now expose an exact `permalink`, optional
+  `thread_root_permalink`, and typed `permalink_resolution`. One pure builder
+  covers C/D/G roots, replies, canonical-equivalent self roots, inbox,
+  channel/thread/exact reads, search, and sent acknowledgements with no added
+  Slack requests.
+- Link construction right-pads one-to-six-digit fractions, never truncates
+  longer fractions, uses URL serialization, and validates an independently
+  stored Slack workspace origin so synthetic loopback API transports cannot
+  leak into results.
+- Human exact-message output adds `link` and applicable `thread-root` lines;
+  search rows append the useful exact link. Shared channel, thread, and inbox
+  rows remain unchanged while JSON and MCP derive all fields from the same
+  typed models.
+- The retained reviewer found that Slack search may omit structured
+  `thread_ts`. Search now treats a supplied URL only as strictly validated
+  route evidence, derives missing reply context when safe, lets structured
+  metadata win conflicts, and always reconstructs output locally.
+- The fresh auditor then found that missing or rejected search route evidence
+  did not prove a root. Such matches now omit unproven links and report
+  `unavailable`; a validated root route is required for a complete root link.
+  The auditor's final re-review at `4579974bf8be5915dbc77abc386136b4062fb33f`
+  reported no blocking or actionable findings.
+- The final repository-wide gate passes 262 library tests, 12 CLI process
+  tests, 2 raw MCP tests, and 1 package metadata test, plus formatting, strict
+  Clippy, release build, Rust 1.88 compatibility, credential scan, diff check,
+  version readback, and deterministic package checksum/layout verification.
+  No live Slack smoke was needed because construction is pure and fully
+  covered by synthetic route fixtures.
+
+Status: Locally complete and publication-ready on 2026-07-30 at
+`4579974bf8be5915dbc77abc386136b4062fb33f`; PR, merge, tag, workflow, release,
+and published-asset evidence follow before Milestone 6 begins.
 
 ## Milestone 6: Bounded Recent Activity (`v0.13.0`, #15)
 

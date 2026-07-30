@@ -22,14 +22,15 @@ use crate::{
         DraftSendReport, FileDownloadReport, FileDraftAssociation, FileDraftCreateReport,
         FileReference, FileShare, FileShareVisibility, FileUploadReport, InboxConversation,
         InboxReport, InboxTruncationReason, MentionResolution, Message, MessageMention,
-        MessagePage, MessageSearchMatch, MessageSearchPage, RawAuthTestResponse, RawConversation,
-        RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision, RawDraftsPage,
-        RawEmojiResponse, RawFile, RawFileResponse, RawFileUploadAllocation,
-        RawFileUploadCompletion, RawMessage, RawMessagePage, RawMessageSearchMatch,
-        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
-        RawReaction, RawReactionItemResponse, RawUnread, RawUser, RawUsersPage, Reaction,
-        ReactionMutationReport, SentMessage, ThreadPage, UnreadConversation, UnreadReport,
-        UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
+        MessagePage, MessageSearchMatch, MessageSearchPage, PermalinkResolution,
+        RawAuthTestResponse, RawConversation, RawConversationsPage, RawDraft, RawDraftResponse,
+        RawDraftRevision, RawDraftsPage, RawEmojiResponse, RawFile, RawFileResponse,
+        RawFileUploadAllocation, RawFileUploadCompletion, RawMessage, RawMessagePage,
+        RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList, RawMutationResponse,
+        RawPostMessageResponse, RawReaction, RawReactionItemResponse, RawUnread, RawUser,
+        RawUsersPage, Reaction, ReactionMutationReport, SentMessage, ThreadPage,
+        UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
+        UserSearchTruncationReason,
     },
 };
 
@@ -312,7 +313,7 @@ pub(crate) trait SlackApi: Send + Sync {
 pub(crate) struct SlackService {
     api: Arc<dyn SlackApi>,
     team_id: String,
-    workspace_url: String,
+    workspace_url: url::Url,
     inbox_byte_limit: usize,
     now_millis: fn() -> Result<String>,
     upload_reconciliation_delays_ms: &'static [u64],
@@ -478,6 +479,17 @@ struct RichTextMentionOutput {
     mentions_truncated: bool,
 }
 
+struct MessagePermalinks {
+    permalink: Option<String>,
+    thread_root_permalink: Option<String>,
+    resolution: PermalinkResolution,
+}
+
+enum SearchPermalinkRoute {
+    Root,
+    Reply { thread_ts: String },
+}
+
 struct LoadedInboxConversations {
     conversations: HashMap<String, Conversation>,
     author_directory: Option<AuthorDirectory>,
@@ -507,7 +519,7 @@ impl SlackService {
         Self {
             api: Arc::new(api),
             team_id: config.team_id.clone(),
-            workspace_url: config.base_url.origin().ascii_serialization(),
+            workspace_url: config.workspace_url.clone(),
             inbox_byte_limit: config.max_response_bytes,
             now_millis: system_unix_milliseconds,
             upload_reconciliation_delays_ms: UPLOAD_RECONCILIATION_DELAYS_MS,
@@ -520,7 +532,7 @@ impl SlackService {
         Ok(DoctorReport {
             authenticated: true,
             team_id: self.team_id.clone(),
-            workspace_url: self.workspace_url.clone(),
+            workspace_url: self.workspace_url.origin().ascii_serialization(),
         })
     }
 
@@ -791,8 +803,14 @@ impl SlackService {
             } else {
                 "conversations.history"
             };
-            let messages =
-                normalize_messages(channel_id, raw.messages, MAX_MESSAGES, method).ok()?;
+            let messages = normalize_messages(
+                &self.workspace_url,
+                channel_id,
+                raw.messages,
+                MAX_MESSAGES,
+                method,
+            )
+            .ok()?;
             for message in messages {
                 let exact_route =
                     is_exact_file_route(&message.ts, message.thread_ts.as_deref(), thread_ts);
@@ -1177,7 +1195,8 @@ impl SlackService {
                 method: "reactions.get",
             });
         }
-        let normalized = normalize_message(channel_id, message, "reactions.get")?;
+        let normalized =
+            normalize_message(&self.workspace_url, channel_id, message, "reactions.get")?;
         Ok(normalized
             .reactions
             .iter()
@@ -1726,8 +1745,14 @@ impl SlackService {
             .chat_post_message(&request)
             .await
             .map_err(|error| classify_publication_error(&client_msg_id, error))?;
-        normalize_sent_message(channel_id, thread_ts, client_msg_id.clone(), response)
-            .map_err(|_| Error::PublicationUncertain { client_msg_id })
+        normalize_sent_message(
+            &self.workspace_url,
+            channel_id,
+            thread_ts,
+            client_msg_id.clone(),
+            response,
+        )
+        .map_err(|_| Error::PublicationUncertain { client_msg_id })
     }
 
     async fn share_file_draft(&self, request: &FileShareRequest<'_>) -> Result<SentMessage> {
@@ -2184,7 +2209,7 @@ impl SlackService {
                 method: "search.messages",
             });
         }
-        let mut matches = normalize_search_matches(raw.messages.matches)?;
+        let mut matches = normalize_search_matches(&self.workspace_url, raw.messages.matches)?;
         self.enrich_search_messages(&mut matches, user_directory)
             .await;
         Ok(MessageSearchPage {
@@ -2227,7 +2252,13 @@ impl SlackService {
         reject_repeated_cursor("conversations.history", cursor, next_cursor.as_deref())?;
         Ok(MessagePage {
             channel_id: channel.to_owned(),
-            messages: normalize_messages(channel, raw.messages, limit, "conversations.history")?,
+            messages: normalize_messages(
+                &self.workspace_url,
+                channel,
+                raw.messages,
+                limit,
+                "conversations.history",
+            )?,
             has_more: raw.has_more || next_cursor.is_some() || locally_truncated,
             next_cursor,
         })
@@ -2252,8 +2283,13 @@ impl SlackService {
         let next_cursor =
             response_cursor("conversations.replies", raw.response_metadata.next_cursor)?;
         reject_repeated_cursor("conversations.replies", cursor, next_cursor.as_deref())?;
-        let mut messages =
-            normalize_messages(&channel, raw.messages, limit, "conversations.replies")?;
+        let mut messages = normalize_messages(
+            &self.workspace_url,
+            &channel,
+            raw.messages,
+            limit,
+            "conversations.replies",
+        )?;
         self.enrich_messages(&mut messages, user_directory).await;
         Ok(ThreadPage {
             channel_id: channel.clone(),
@@ -2295,9 +2331,10 @@ impl SlackService {
                 resource: "Slack message",
             });
         };
-        let first = normalize_message(channel, first, "messages.list")?;
+        let first = normalize_message(&self.workspace_url, channel, first, "messages.list")?;
         for duplicate in matches {
-            if normalize_message(channel, duplicate, "messages.list")? != first {
+            if normalize_message(&self.workspace_url, channel, duplicate, "messages.list")? != first
+            {
                 return Err(Error::InvalidResponse {
                     method: "messages.list",
                 });
@@ -3212,6 +3249,7 @@ fn conversation_matches_exactly(conversation: &Conversation, needle: &str) -> bo
 }
 
 fn normalize_search_matches(
+    workspace_url: &url::Url,
     matches: Vec<RawMessageSearchMatch>,
 ) -> Result<Vec<MessageSearchMatch>> {
     matches
@@ -3250,20 +3288,51 @@ fn normalize_search_matches(
             let author_resolution = initial_author_resolution(&author_id, &author_name);
             let (rendered_text, mention_resolution, mentions) =
                 initial_mention_fields(&raw.text, raw.blocks.as_deref());
-            let permalink = raw.permalink.filter(|value| !value.is_empty());
-            if permalink
-                .as_deref()
-                .is_some_and(|value| value.len() > 8192 || value.chars().any(char::is_control))
-            {
-                return Err(Error::InvalidResponse {
-                    method: "search.messages",
-                });
-            }
+            // Search does not guarantee a separate thread timestamp. Treat its URL only as
+            // corroborating route metadata, then always emit a locally reconstructed URL.
+            let permalink_route = raw.permalink.as_deref().and_then(|permalink| {
+                search_permalink_route(workspace_url, &raw.channel.id, &raw.ts, permalink)
+            });
+            let (thread_ts, permalinks) = match (raw.thread_ts, permalink_route) {
+                (Some(thread_ts), _) => {
+                    let permalinks = message_permalinks(
+                        workspace_url,
+                        &raw.channel.id,
+                        &raw.ts,
+                        Some(&thread_ts),
+                    );
+                    (Some(thread_ts), permalinks)
+                }
+                (None, Some(SearchPermalinkRoute::Reply { thread_ts })) => {
+                    let permalinks = message_permalinks(
+                        workspace_url,
+                        &raw.channel.id,
+                        &raw.ts,
+                        Some(&thread_ts),
+                    );
+                    (Some(thread_ts), permalinks)
+                }
+                (None, Some(SearchPermalinkRoute::Root)) => (
+                    None,
+                    message_permalinks(workspace_url, &raw.channel.id, &raw.ts, None),
+                ),
+                (None, None) => (
+                    None,
+                    MessagePermalinks {
+                        permalink: None,
+                        thread_root_permalink: None,
+                        resolution: PermalinkResolution::Unavailable,
+                    },
+                ),
+            };
             Ok(MessageSearchMatch {
                 channel_id: raw.channel.id,
                 channel_name,
                 ts: raw.ts,
-                thread_ts: raw.thread_ts,
+                thread_ts,
+                permalink: permalinks.permalink,
+                thread_root_permalink: permalinks.thread_root_permalink,
+                permalink_resolution: permalinks.resolution,
                 author_id,
                 author_name,
                 author_display_name: None,
@@ -3276,7 +3345,6 @@ fn normalize_search_matches(
                 attachments: normalize_attachments(raw.attachments, "search.messages")?,
                 reactions: normalize_reactions(raw.reactions, "search.messages")?,
                 files: normalize_files(raw.files, "search.messages")?,
-                permalink,
             })
         })
         .collect()
@@ -3309,6 +3377,7 @@ fn append_unreads(
 }
 
 fn normalize_messages(
+    workspace_url: &url::Url,
     channel: &str,
     messages: Vec<RawMessage>,
     limit: usize,
@@ -3323,7 +3392,7 @@ fn normalize_messages(
     messages
         .into_iter()
         .take(limit)
-        .map(|message| normalize_message(channel, message, method))
+        .map(|message| normalize_message(workspace_url, channel, message, method))
         .collect::<Result<Vec<_>>>()
 }
 
@@ -3544,6 +3613,7 @@ fn is_exact_published_file(
 }
 
 fn normalize_sent_message(
+    workspace_url: &url::Url,
     channel_id: &str,
     thread_ts: Option<&str>,
     client_msg_id: String,
@@ -3560,7 +3630,12 @@ fn normalize_sent_message(
     }
     Ok(SentMessage {
         client_msg_id,
-        message: normalize_message(channel_id, response.message, "chat.postMessage")?,
+        message: normalize_message(
+            workspace_url,
+            channel_id,
+            response.message,
+            "chat.postMessage",
+        )?,
     })
 }
 
@@ -4778,7 +4853,161 @@ fn initial_author_resolution(
     }
 }
 
-fn normalize_message(channel: &str, message: RawMessage, method: &'static str) -> Result<Message> {
+fn canonical_permalink_timestamp(timestamp: &str) -> Option<String> {
+    if !is_valid_timestamp(timestamp) {
+        return None;
+    }
+    let (seconds, fraction) = timestamp.split_once('.')?;
+    if fraction.len() > 6 {
+        return None;
+    }
+    let mut canonical = String::with_capacity(seconds.len() + 7);
+    canonical.push_str(seconds);
+    canonical.push('.');
+    canonical.push_str(fraction);
+    canonical.extend(std::iter::repeat_n('0', 6 - fraction.len()));
+    Some(canonical)
+}
+
+fn canonical_permalink(
+    workspace_url: &url::Url,
+    channel_id: &str,
+    message_ts: &str,
+    thread_ts: Option<&str>,
+) -> Option<String> {
+    if !crate::config::is_valid_workspace_origin(workspace_url)
+        || !is_valid_any_conversation_id(channel_id)
+    {
+        return None;
+    }
+    let message_ts = canonical_permalink_timestamp(message_ts)?;
+    let mut permalink = workspace_url.clone();
+    let path_timestamp = message_ts.replace('.', "");
+    permalink
+        .path_segments_mut()
+        .ok()?
+        .clear()
+        .push("archives")
+        .push(channel_id)
+        .push(&format!("p{path_timestamp}"));
+    permalink.set_query(None);
+    permalink.set_fragment(None);
+    if let Some(thread_ts) = thread_ts {
+        let thread_ts = canonical_permalink_timestamp(thread_ts)?;
+        permalink
+            .query_pairs_mut()
+            .append_pair("thread_ts", &thread_ts)
+            .append_pair("cid", channel_id);
+    }
+    Some(permalink.into())
+}
+
+fn search_permalink_route(
+    workspace_url: &url::Url,
+    channel_id: &str,
+    message_ts: &str,
+    candidate: &str,
+) -> Option<SearchPermalinkRoute> {
+    if candidate.is_empty()
+        || candidate.len() > 8_192
+        || candidate.chars().any(char::is_control)
+        || !crate::config::is_valid_workspace_origin(workspace_url)
+        || !is_valid_any_conversation_id(channel_id)
+    {
+        return None;
+    }
+    let message_ts = canonical_permalink_timestamp(message_ts)?;
+    let candidate = url::Url::parse(candidate).ok()?;
+    if candidate.origin() != workspace_url.origin()
+        || !candidate.username().is_empty()
+        || candidate.password().is_some()
+        || candidate.fragment().is_some()
+    {
+        return None;
+    }
+    let expected_path = format!("/archives/{channel_id}/p{}", message_ts.replace('.', ""));
+    if candidate.path() != expected_path {
+        return None;
+    }
+    let Some(query) = candidate.query() else {
+        return Some(SearchPermalinkRoute::Root);
+    };
+    if query.is_empty() {
+        return None;
+    }
+    let mut thread_ts = None;
+    let mut cid_matches = false;
+    for (name, value) in candidate.query_pairs() {
+        match name.as_ref() {
+            "thread_ts" if thread_ts.is_none() => {
+                thread_ts = canonical_permalink_timestamp(&value);
+                thread_ts.as_ref()?;
+            }
+            "cid" if !cid_matches && value == channel_id => cid_matches = true,
+            _ => return None,
+        }
+    }
+    let thread_ts = thread_ts?;
+    if !cid_matches || thread_ts == message_ts {
+        return None;
+    }
+    Some(SearchPermalinkRoute::Reply { thread_ts })
+}
+
+fn permalink_resolution(
+    permalink: &Option<String>,
+    thread_root_permalink: &Option<String>,
+    thread_root_applicable: bool,
+) -> PermalinkResolution {
+    match (
+        permalink.is_some(),
+        !thread_root_applicable || thread_root_permalink.is_some(),
+        thread_root_permalink.is_some(),
+    ) {
+        (true, true, _) => PermalinkResolution::Complete,
+        (true, false, _) | (false, _, true) => PermalinkResolution::Partial,
+        (false, _, false) => PermalinkResolution::Unavailable,
+    }
+}
+
+fn message_permalinks(
+    workspace_url: &url::Url,
+    channel_id: &str,
+    message_ts: &str,
+    thread_ts: Option<&str>,
+) -> MessagePermalinks {
+    let canonical_message_ts = canonical_permalink_timestamp(message_ts);
+    let canonical_thread_ts = thread_ts.and_then(canonical_permalink_timestamp);
+    let is_self_threaded_root = thread_ts.is_some_and(|thread_ts| {
+        thread_ts == message_ts
+            || canonical_message_ts
+                .as_deref()
+                .zip(canonical_thread_ts.as_deref())
+                .is_some_and(|(message, thread)| message == thread)
+    });
+    let thread_root_ts = if thread_ts.is_some() && !is_self_threaded_root {
+        thread_ts
+    } else {
+        None
+    };
+    let permalink = canonical_permalink(workspace_url, channel_id, message_ts, thread_root_ts);
+    let thread_root_permalink =
+        thread_root_ts.and_then(|root| canonical_permalink(workspace_url, channel_id, root, None));
+    let resolution =
+        permalink_resolution(&permalink, &thread_root_permalink, thread_root_ts.is_some());
+    MessagePermalinks {
+        permalink,
+        thread_root_permalink,
+        resolution,
+    }
+}
+
+fn normalize_message(
+    workspace_url: &url::Url,
+    channel: &str,
+    message: RawMessage,
+    method: &'static str,
+) -> Result<Message> {
     let author_id = message
         .user
         .or(message.bot_id)
@@ -4793,10 +5022,19 @@ fn normalize_message(channel: &str, message: RawMessage, method: &'static str) -
     let author_resolution = initial_author_resolution(&author_id, &author_name);
     let (rendered_text, mention_resolution, mentions) =
         initial_mention_fields(&message.text, message.blocks.as_deref());
+    let permalinks = message_permalinks(
+        workspace_url,
+        channel,
+        &message.ts,
+        message.thread_ts.as_deref(),
+    );
     Ok(Message {
         channel_id: channel.to_owned(),
         ts: message.ts,
         thread_ts: message.thread_ts,
+        permalink: permalinks.permalink,
+        thread_root_permalink: permalinks.thread_root_permalink,
+        permalink_resolution: permalinks.resolution,
         author_id,
         author_name,
         author_display_name: None,
@@ -9407,6 +9645,15 @@ mod tests {
         assert!(full_report.conversations.iter().all(|entry| {
             entry.messages.messages[0].author_resolution == AuthorResolution::Directory
         }));
+        assert!(full_report.conversations.iter().all(|entry| {
+            entry.messages.messages[0]
+                .permalink
+                .as_deref()
+                .is_some_and(|link| {
+                    link.starts_with("https://example.slack.com/archives/")
+                        && !link.contains("127.0.0.1")
+                })
+        }));
         let mut one_conversation_report = full_report.clone();
         one_conversation_report.conversations.truncate(1);
         one_conversation_report.has_more_conversations = true;
@@ -10323,6 +10570,14 @@ mod tests {
         let page = service.read_channel("C123", None, 1).await.unwrap();
         assert_eq!(page.messages.len(), 1);
         assert_eq!(page.messages[0].text, "first");
+        assert_eq!(
+            page.messages[0].permalink.as_deref(),
+            Some("https://example.slack.com/archives/C123/p100000001")
+        );
+        assert_eq!(
+            page.messages[0].permalink_resolution,
+            PermalinkResolution::Complete
+        );
         assert!(page.has_more);
         assert_eq!(page.next_cursor.as_deref(), Some("next"));
 
@@ -10332,6 +10587,300 @@ mod tests {
             .unwrap();
         assert_eq!(thread.messages.len(), 2);
         assert_eq!(thread.thread_ts, "100.000001");
+    }
+
+    #[test]
+    fn canonical_permalinks_cover_conversation_kinds_roots_and_replies() {
+        let workspace = url::Url::parse("https://example.slack.com").unwrap();
+        for channel in ["C123", "D123", "G123"] {
+            let root = message_permalinks(&workspace, channel, "100.1", None);
+            assert_eq!(
+                root.permalink.as_deref(),
+                Some(format!("https://example.slack.com/archives/{channel}/p100100000").as_str())
+            );
+            assert_eq!(root.thread_root_permalink, None);
+            assert_eq!(root.resolution, PermalinkResolution::Complete);
+
+            let reply = message_permalinks(&workspace, channel, "101.000002", Some("100.100000"));
+            assert_eq!(
+                reply.permalink.as_deref(),
+                Some(
+                    format!(
+                        "https://example.slack.com/archives/{channel}/p101000002?thread_ts=100.100000&cid={channel}"
+                    )
+                    .as_str()
+                )
+            );
+            assert_eq!(
+                reply.thread_root_permalink.as_deref(),
+                Some(format!("https://example.slack.com/archives/{channel}/p100100000").as_str())
+            );
+            assert_eq!(reply.resolution, PermalinkResolution::Complete);
+        }
+    }
+
+    #[test]
+    fn canonical_permalinks_handle_self_roots_and_partial_degradation() {
+        let workspace = url::Url::parse("https://example.slack.com").unwrap();
+        let self_root = message_permalinks(&workspace, "C123", "100.1", Some("100.100000"));
+        assert_eq!(
+            self_root.permalink.as_deref(),
+            Some("https://example.slack.com/archives/C123/p100100000")
+        );
+        assert_eq!(self_root.thread_root_permalink, None);
+        assert_eq!(self_root.resolution, PermalinkResolution::Complete);
+
+        let root_only = message_permalinks(&workspace, "C123", "101.0000001", Some("100.000001"));
+        assert_eq!(root_only.permalink, None);
+        assert_eq!(
+            root_only.thread_root_permalink.as_deref(),
+            Some("https://example.slack.com/archives/C123/p100000001")
+        );
+        assert_eq!(root_only.resolution, PermalinkResolution::Partial);
+
+        let unavailable = message_permalinks(&workspace, "C123", "100.0000001", None);
+        assert_eq!(unavailable.permalink, None);
+        assert_eq!(unavailable.thread_root_permalink, None);
+        assert_eq!(unavailable.resolution, PermalinkResolution::Unavailable);
+
+        assert_eq!(
+            permalink_resolution(&Some("exact".into()), &None, true),
+            PermalinkResolution::Partial
+        );
+    }
+
+    #[test]
+    fn canonical_permalinks_reject_unsafe_origins_identifiers_and_timestamps() {
+        for origin in [
+            "http://example.slack.com",
+            "https://example.com",
+            "https://one.two.slack.com",
+            "https://user@example.slack.com",
+            "https://example.slack.com:444",
+            "https://example.slack.com/path",
+            "https://example.slack.com/?query=1",
+            "https://example.slack.com/#fragment",
+        ] {
+            let links = message_permalinks(
+                &url::Url::parse(origin).unwrap(),
+                "C123",
+                "100.000001",
+                None,
+            );
+            assert_eq!(links.resolution, PermalinkResolution::Unavailable);
+            assert_eq!(links.permalink, None);
+        }
+        for (channel, timestamp) in [
+            ("X123", "100.000001"),
+            ("C12/3", "100.000001"),
+            ("C123", "bad"),
+            ("C123", "100."),
+            ("C123", "100.1234567"),
+        ] {
+            let links = message_permalinks(
+                &url::Url::parse("https://example.slack.com").unwrap(),
+                channel,
+                timestamp,
+                None,
+            );
+            assert_eq!(links.resolution, PermalinkResolution::Unavailable);
+            assert_eq!(links.permalink, None);
+        }
+    }
+
+    #[test]
+    fn search_permalinks_are_always_canonical_local_serializations() {
+        let workspace = url::Url::parse("https://example.slack.com").unwrap();
+        let raw_candidates = vec![
+            None,
+            Some(
+                "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123"
+                    .into(),
+            ),
+            Some(
+                "https://example.slack.com/archives/C123/p101000002?cid=C123&thread_ts=100.000001"
+                    .into(),
+            ),
+            Some("https://other.slack.com/archives/C123/p101000002".into()),
+            Some("https://example.slack.com/archives/D123/p101000002".into()),
+            Some("https://example.slack.com/archives/C123/p999000002".into()),
+            Some(
+                "https://example.slack.com/archives/C123/p101000002?thread_ts=999.000001&cid=C123"
+                    .into(),
+            ),
+            Some(
+                "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=D123"
+                    .into(),
+            ),
+            Some(
+                "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&thread_ts=100.000001&cid=C123".into(),
+            ),
+            Some(
+                "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123&cid=C123".into(),
+            ),
+            Some(
+                "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123&tracking=1".into(),
+            ),
+            Some("https://example.slack.com/archives%2FC123%2Fp101000002".into()),
+            Some("https://example.slack.com/archives/C123/p101000002#fragment".into()),
+            Some("https://example.slack.com/archives/C123/p101000002\nunsafe".into()),
+            Some("x".repeat(9_000)),
+        ];
+        for candidate in raw_candidates {
+            let matches = normalize_search_matches(
+                &workspace,
+                vec![RawMessageSearchMatch {
+                    channel: RawMessageSearchChannel {
+                        id: "C123".into(),
+                        name: "general".into(),
+                    },
+                    ts: "101.000002".into(),
+                    thread_ts: Some("100.000001".into()),
+                    permalink: candidate,
+                    ..RawMessageSearchMatch::default()
+                }],
+            )
+            .unwrap();
+            assert_eq!(
+                matches[0].permalink.as_deref(),
+                Some(
+                    "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123"
+                )
+            );
+            assert_eq!(
+                matches[0].thread_root_permalink.as_deref(),
+                Some("https://example.slack.com/archives/C123/p100000001")
+            );
+            assert_eq!(
+                matches[0].permalink_resolution,
+                PermalinkResolution::Complete
+            );
+        }
+    }
+
+    #[test]
+    fn search_permalinks_safely_recover_missing_reply_context() {
+        let workspace = url::Url::parse("https://example.slack.com").unwrap();
+        let normalize = |thread_ts: Option<&str>, permalink: &str| {
+            normalize_search_matches(
+                &workspace,
+                vec![RawMessageSearchMatch {
+                    channel: RawMessageSearchChannel {
+                        id: "C123".into(),
+                        name: "general".into(),
+                    },
+                    ts: "101.000002".into(),
+                    thread_ts: thread_ts.map(str::to_owned),
+                    permalink: Some(permalink.into()),
+                    ..RawMessageSearchMatch::default()
+                }],
+            )
+            .unwrap()
+            .remove(0)
+        };
+
+        let derived = normalize(
+            None,
+            "https://example.slack.com/archives/C123/p101000002?thread_ts=100.1&cid=C123",
+        );
+        assert_eq!(derived.thread_ts.as_deref(), Some("100.100000"));
+        assert_eq!(
+            derived.permalink.as_deref(),
+            Some(
+                "https://example.slack.com/archives/C123/p101000002?thread_ts=100.100000&cid=C123"
+            )
+        );
+        assert_eq!(
+            derived.thread_root_permalink.as_deref(),
+            Some("https://example.slack.com/archives/C123/p100100000")
+        );
+        assert_eq!(derived.permalink_resolution, PermalinkResolution::Complete);
+
+        let root = normalize(None, "https://example.slack.com/archives/C123/p101000002");
+        assert_eq!(root.thread_ts, None);
+        assert_eq!(
+            root.permalink.as_deref(),
+            Some("https://example.slack.com/archives/C123/p101000002")
+        );
+        assert_eq!(root.thread_root_permalink, None);
+        assert_eq!(root.permalink_resolution, PermalinkResolution::Complete);
+
+        let missing = normalize_search_matches(
+            &workspace,
+            vec![RawMessageSearchMatch {
+                channel: RawMessageSearchChannel {
+                    id: "C123".into(),
+                    name: "general".into(),
+                },
+                ts: "101.000002".into(),
+                ..RawMessageSearchMatch::default()
+            }],
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(missing.thread_ts, None);
+        assert_eq!(missing.permalink, None);
+        assert_eq!(missing.thread_root_permalink, None);
+        assert_eq!(
+            missing.permalink_resolution,
+            PermalinkResolution::Unavailable
+        );
+
+        let mismatch = normalize(
+            Some("100.000001"),
+            "https://example.slack.com/archives/C123/p101000002?thread_ts=999.000001&cid=C123",
+        );
+        assert_eq!(mismatch.thread_ts.as_deref(), Some("100.000001"));
+        assert_eq!(
+            mismatch.permalink.as_deref(),
+            Some(
+                "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123"
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_search_permalinks_cannot_supply_thread_context() {
+        let workspace = url::Url::parse("https://example.slack.com").unwrap();
+        let candidates = vec![
+            "https://other.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123".into(),
+            "https://example.slack.com/archives/D123/p101000002?thread_ts=100.000001&cid=C123".into(),
+            "https://example.slack.com/archives/C123/p999000002?thread_ts=100.000001&cid=C123".into(),
+            "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=D123".into(),
+            "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&thread_ts=100.000001&cid=C123".into(),
+            "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123&cid=C123".into(),
+            "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123&tracking=1".into(),
+            "https://example.slack.com/archives%2FC123%2Fp101000002?thread_ts=100.000001&cid=C123".into(),
+            "https://example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123#fragment".into(),
+            "https://user@example.slack.com/archives/C123/p101000002?thread_ts=100.000001&cid=C123".into(),
+            "https://example.slack.com:444/archives/C123/p101000002?thread_ts=100.000001&cid=C123".into(),
+            "https://example.slack.com/archives/C123/p101000002?thread_ts=101.000002&cid=C123".into(),
+            "https://example.slack.com/archives/C123/p101000002\nunsafe".into(),
+            "x".repeat(9_000),
+        ];
+        for candidate in candidates {
+            let message = normalize_search_matches(
+                &workspace,
+                vec![RawMessageSearchMatch {
+                    channel: RawMessageSearchChannel {
+                        id: "C123".into(),
+                        name: "general".into(),
+                    },
+                    ts: "101.000002".into(),
+                    permalink: Some(candidate),
+                    ..RawMessageSearchMatch::default()
+                }],
+            )
+            .unwrap()
+            .remove(0);
+            assert_eq!(message.thread_ts, None);
+            assert_eq!(message.permalink, None);
+            assert_eq!(message.thread_root_permalink, None);
+            assert_eq!(
+                message.permalink_resolution,
+                PermalinkResolution::Unavailable
+            );
+        }
     }
 
     #[tokio::test]
@@ -12783,6 +13332,7 @@ mod tests {
     #[tokio::test]
     async fn unenriched_sent_messages_report_not_attempted() {
         let sent = normalize_sent_message(
+            &url::Url::parse("https://example.slack.com").unwrap(),
             "C123",
             None,
             "00000000-0000-4000-8000-000000000001".into(),
@@ -12799,6 +13349,37 @@ mod tests {
         assert_eq!(sent_json["message"]["rendered_text"], "sent <@U456>");
         assert_eq!(sent_json["message"]["mention_resolution"], "not_attempted");
         assert_eq!(sent_json["message"]["mentions"][0]["id"], "U456");
+        assert_eq!(
+            sent_json["message"]["permalink"],
+            "https://example.slack.com/archives/C123/p100000001"
+        );
+        assert_eq!(sent_json["message"]["thread_root_permalink"], json!(null));
+        assert_eq!(sent_json["message"]["permalink_resolution"], "complete");
+
+        let mut reply_message = raw_message("101.000002", "reply");
+        reply_message.thread_ts = Some("100.000001".into());
+        let reply = normalize_sent_message(
+            &url::Url::parse("https://example.slack.com").unwrap(),
+            "D123",
+            Some("100.000001"),
+            "00000000-0000-4000-8000-000000000002".into(),
+            RawPostMessageResponse {
+                channel: "D123".into(),
+                ts: "101.000002".into(),
+                message: reply_message,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reply.message.permalink.as_deref(),
+            Some(
+                "https://example.slack.com/archives/D123/p101000002?thread_ts=100.000001&cid=D123"
+            )
+        );
+        assert_eq!(
+            reply.message.thread_root_permalink.as_deref(),
+            Some("https://example.slack.com/archives/D123/p100000001")
+        );
     }
 
     #[tokio::test]
@@ -12872,6 +13453,12 @@ mod tests {
             }]
         });
         let expected = expected.as_object_mut().unwrap();
+        expected.insert(
+            "permalink".into(),
+            json!("https://example.slack.com/archives/C123/p100000002"),
+        );
+        expected.insert("thread_root_permalink".into(), json!(null));
+        expected.insert("permalink_resolution".into(), json!("complete"));
         expected.insert("rendered_text".into(), json!("target"));
         expected.insert("mention_resolution".into(), json!("not_needed"));
         expected.insert("mentions".into(), json!([]));
