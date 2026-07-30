@@ -257,6 +257,9 @@ pub(crate) struct RawConversation {
     pub user: Option<String>,
     #[serde(default)]
     pub num_members: Option<u64>,
+    /// First-party responses may include the newest message; activity reads only its timestamp.
+    #[serde(default)]
+    pub latest: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

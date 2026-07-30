@@ -705,6 +705,12 @@ Design decisions:
   messages per conversation, and 100 returned messages. Oldest-first reorders
   the same bounded recent candidate set; it does not imply an unbounded scan
   back to the start of a large interval.
+- When the first-party conversation directory includes Slack's validated
+  `latest` message timestamp, default scope prioritizes the most recently active
+  eligible conversations before applying the conversation cap. Missing or
+  malformed recency metadata sorts behind known recency and falls back
+  deterministically by stable ID. The chosen IDs are then sorted and frozen for
+  deterministic requests and continuation.
 - Repeated include and exclude selectors accept stable IDs or exact
   case-insensitive names. Includes narrow the discovered set and exclusions
   then remove selected conversations,
@@ -713,7 +719,8 @@ Design decisions:
   recovery guidance instead of silently producing a surprising report. Discovery, user
   enrichment, and history pagination retain existing hard page caps.
 - A dedicated Slack `conversations.history` request uses the documented time
-  filters with `inclusive=true`, requests replies rather than the ordinary
+  filters with `inclusive=true`, rounds both boundaries inward to the exact
+  microsecond timestamps Slack messages can represent, requests replies rather than the ordinary
   channel reader's root-only view, and never changes read state. Exact local
   timestamp filtering then enforces `[after, before)`, including a message
   exactly at `after` and excluding one exactly at `before`. Each selected

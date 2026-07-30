@@ -424,6 +424,13 @@ with `--per-conversation`, `--conversations`, and `--limit`; use
 visible unjoined channel; ambiguous, missing, or overlapping selectors fail
 with an actionable error.
 
+Before applying the conversation cap, Lurkline prioritizes eligible
+conversations by the validated `latest` message timestamp included in Slack's
+first-party conversation metadata. Conversations without usable recency
+metadata follow in stable ID order. Structured output reports
+`selection_truncated` whenever the cap or bounded directory scan omitted
+eligible conversations.
+
 Activity uses one reply-inclusive, time-bounded history request per selected
 conversation. It never calls a write or mark-read endpoint. Structured output
 keeps the enriched message schema and reports conversation-level `complete`,

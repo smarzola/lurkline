@@ -583,6 +583,17 @@ struct ActivitySelection {
     selection_truncated: bool,
 }
 
+struct ActivityConversationCandidate {
+    conversation: Conversation,
+    latest_ts: Option<String>,
+}
+
+struct ActivityConversationDirectory {
+    candidates: Vec<ActivityConversationCandidate>,
+    scanned_conversations: usize,
+    scan_truncated: bool,
+}
+
 impl SlackService {
     pub(crate) fn new(api: impl SlackApi + 'static, config: &Config) -> Self {
         Self {
@@ -2154,9 +2165,9 @@ impl SlackService {
         let selection = match &cursor {
             Some(cursor) => {
                 let by_id = all_conversations
-                    .conversations
+                    .candidates
                     .into_iter()
-                    .map(|conversation| (conversation.id.clone(), conversation))
+                    .map(|candidate| (candidate.conversation.id.clone(), candidate.conversation))
                     .collect::<HashMap<_, _>>();
                 let mut conversations = Vec::with_capacity(cursor.conversation_ids.len());
                 for id in &cursor.conversation_ids {
@@ -2179,15 +2190,22 @@ impl SlackService {
             )?,
         };
 
-        let oldest = slack_floor_timestamp(after_nanos)?;
-        let latest = slack_ceil_timestamp(before_nanos)?;
+        let slack_bounds = activity_slack_bounds(after_nanos, before_nanos)?;
         let mut items = Vec::new();
         let mut conversation_results = Vec::with_capacity(selection.conversations.len());
         let mut seen_keys = HashSet::new();
         for conversation in &selection.conversations {
+            let Some((oldest, latest)) = &slack_bounds else {
+                conversation_results.push(ActivityConversationResult {
+                    conversation: conversation.clone(),
+                    status: ActivityConversationStatus::Complete,
+                    messages_sampled: 0,
+                });
+                continue;
+            };
             let raw = match self
                 .api
-                .activity_history(&conversation.id, &oldest, &latest, per_conversation_limit)
+                .activity_history(&conversation.id, oldest, latest, per_conversation_limit)
                 .await
             {
                 Ok(raw) => raw,
@@ -2245,7 +2263,10 @@ impl SlackService {
             });
             enrich_messages_from_directory(&mut messages, &author_directory);
             for message in messages {
-                let key = (conversation.id.clone(), message.ts.clone());
+                let key = (
+                    conversation.id.clone(),
+                    canonical_activity_timestamp(&message.ts),
+                );
                 if !seen_keys.insert(key) {
                     return Err(Error::InvalidResponse { method: "activity" });
                 }
@@ -2411,8 +2432,8 @@ impl SlackService {
     async fn scan_activity_conversations(
         &self,
         users: &HashMap<String, User>,
-    ) -> Result<ActivitySelection> {
-        let mut conversations = Vec::new();
+    ) -> Result<ActivityConversationDirectory> {
+        let mut candidates = Vec::new();
         let mut seen_ids = HashSet::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
@@ -2426,23 +2447,31 @@ impl SlackService {
                     method: "conversations.list",
                 });
             }
-            for conversation in normalize_conversations(page.channels, users)? {
+            for raw in page.channels {
+                let latest_ts = activity_conversation_latest_timestamp(&raw);
+                let conversation = normalize_conversations(vec![raw], users)?.pop().ok_or(
+                    Error::InvalidResponse {
+                        method: "conversations.list",
+                    },
+                )?;
                 if !conversation.is_archived && !seen_ids.insert(conversation.id.clone()) {
                     return Err(Error::InvalidResponse {
                         method: "conversations.list",
                     });
                 }
                 if !conversation.is_archived {
-                    conversations.push(conversation);
+                    candidates.push(ActivityConversationCandidate {
+                        conversation,
+                        latest_ts,
+                    });
                 }
             }
             let next = response_cursor("conversations.list", page.response_metadata.next_cursor)?;
             let Some(next) = next else {
-                conversations.sort_by(|left, right| left.id.cmp(&right.id));
-                return Ok(ActivitySelection {
-                    scanned_conversations: conversations.len(),
-                    conversations,
-                    selection_truncated: false,
+                return Ok(ActivityConversationDirectory {
+                    scanned_conversations: candidates.len(),
+                    candidates,
+                    scan_truncated: false,
                 });
             };
             if !seen_cursors.insert(next.clone()) {
@@ -2452,11 +2481,10 @@ impl SlackService {
             }
             cursor = Some(next);
             if page_index + 1 == MAX_CONVERSATION_PAGES {
-                conversations.sort_by(|left, right| left.id.cmp(&right.id));
-                return Ok(ActivitySelection {
-                    scanned_conversations: conversations.len(),
-                    conversations,
-                    selection_truncated: true,
+                return Ok(ActivityConversationDirectory {
+                    scanned_conversations: candidates.len(),
+                    candidates,
+                    scan_truncated: true,
                 });
             }
         }
@@ -5846,31 +5874,47 @@ fn format_activity_instant(nanos: i64) -> Result<String> {
         .ok_or(Error::InvalidResponse { method: "activity" })
 }
 
-fn slack_floor_timestamp(nanos: i64) -> Result<String> {
-    if nanos < 0 {
+fn activity_slack_bounds(after_nanos: i64, before_nanos: i64) -> Result<Option<(String, String)>> {
+    if after_nanos < 0 || after_nanos >= before_nanos {
         return Err(Error::InvalidResponse { method: "activity" });
     }
-    let total_micros = nanos / 1_000;
-    Ok(format!(
-        "{}.{:06}",
-        total_micros / 1_000_000,
-        total_micros % 1_000_000
-    ))
+    let oldest_micros = ceil_activity_microseconds(after_nanos)?;
+    let latest_micros = ceil_activity_microseconds(before_nanos)?
+        .checked_sub(1)
+        .ok_or(Error::InvalidResponse { method: "activity" })?;
+    if oldest_micros > latest_micros {
+        return Ok(None);
+    }
+    Ok(Some((
+        format_slack_microseconds(oldest_micros),
+        format_slack_microseconds(latest_micros),
+    )))
 }
 
-fn slack_ceil_timestamp(nanos: i64) -> Result<String> {
-    if nanos < 0 {
-        return Err(Error::InvalidResponse { method: "activity" });
-    }
-    let total_micros = nanos
+fn ceil_activity_microseconds(nanos: i64) -> Result<i64> {
+    nanos
         .checked_add(999)
         .ok_or(Error::InvalidResponse { method: "activity" })?
-        / 1_000;
-    Ok(format!(
+        .checked_div(1_000)
+        .ok_or(Error::InvalidResponse { method: "activity" })
+}
+
+fn format_slack_microseconds(total_micros: i64) -> String {
+    format!(
         "{}.{:06}",
         total_micros / 1_000_000,
         total_micros % 1_000_000
-    ))
+    )
+}
+
+fn activity_conversation_latest_timestamp(conversation: &RawConversation) -> Option<String> {
+    let latest = conversation.latest.as_ref()?;
+    let timestamp = match latest {
+        serde_json::Value::String(timestamp) => timestamp.as_str(),
+        serde_json::Value::Object(message) => message.get("ts")?.as_str()?,
+        _ => return None,
+    };
+    is_valid_timestamp(timestamp).then(|| timestamp.to_owned())
 }
 
 fn timestamp_in_activity_interval(timestamp: &str, after: i64, before: i64) -> bool {
@@ -5909,11 +5953,28 @@ fn compare_decimal_fractions(left: &str, right: &str) -> Ordering {
 fn compare_slack_timestamps(left: &str, right: &str) -> Ordering {
     let (left_seconds, left_fraction) = left.split_once('.').unwrap_or((left, ""));
     let (right_seconds, right_fraction) = right.split_once('.').unwrap_or((right, ""));
+    let left_seconds = trim_decimal_leading_zeroes(left_seconds);
+    let right_seconds = trim_decimal_leading_zeroes(right_seconds);
     left_seconds
         .len()
         .cmp(&right_seconds.len())
         .then_with(|| left_seconds.cmp(right_seconds))
         .then_with(|| compare_decimal_fractions(left_fraction, right_fraction))
+}
+
+fn trim_decimal_leading_zeroes(value: &str) -> &str {
+    let trimmed = value.trim_start_matches('0');
+    if trimmed.is_empty() { "0" } else { trimmed }
+}
+
+fn canonical_activity_timestamp(timestamp: &str) -> String {
+    let (seconds, fraction) = timestamp.split_once('.').unwrap_or((timestamp, ""));
+    let fraction = fraction.trim_end_matches('0');
+    format!(
+        "{}.{}",
+        trim_decimal_leading_zeroes(seconds),
+        if fraction.is_empty() { "0" } else { fraction }
+    )
 }
 
 fn compare_activity_keys(
@@ -6031,7 +6092,7 @@ fn stale_activity_cursor() -> Error {
 }
 
 fn select_activity_conversations(
-    all: ActivitySelection,
+    all: ActivityConversationDirectory,
     include: &[String],
     exclude: &[String],
     limit: usize,
@@ -6042,8 +6103,8 @@ fn select_activity_conversations(
             "include and exclude accept at most 50 selectors in total",
         ));
     }
-    let include_ids = resolve_activity_selectors(&all.conversations, include, "include")?;
-    let exclude_ids = resolve_activity_selectors(&all.conversations, exclude, "exclude")?;
+    let include_ids = resolve_activity_selectors(&all.candidates, include, "include")?;
+    let exclude_ids = resolve_activity_selectors(&all.candidates, exclude, "exclude")?;
     if include_ids.iter().any(|id| exclude_ids.contains(id)) {
         return Err(Error::invalid_input(
             "include",
@@ -6051,9 +6112,10 @@ fn select_activity_conversations(
         ));
     }
     let mut selected = all
-        .conversations
+        .candidates
         .into_iter()
-        .filter(|conversation| {
+        .filter(|candidate| {
+            let conversation = &candidate.conversation;
             let included = if include_ids.is_empty() {
                 conversation.kind != ConversationKind::Channel || conversation.is_member
             } else {
@@ -6062,24 +6124,44 @@ fn select_activity_conversations(
             included && !exclude_ids.contains(&conversation.id)
         })
         .collect::<Vec<_>>();
-    selected.sort_by(|left, right| left.id.cmp(&right.id));
+    selected.sort_by(compare_activity_conversation_recency);
     if !include_ids.is_empty() && selected.len() > limit {
         return Err(Error::invalid_input(
             "conversation_limit",
             "is smaller than the number of explicitly included conversations",
         ));
     }
-    let selection_truncated = all.selection_truncated || selected.len() > limit;
+    let selection_truncated = all.scan_truncated || selected.len() > limit;
     selected.truncate(limit);
+    let mut conversations = selected
+        .into_iter()
+        .map(|candidate| candidate.conversation)
+        .collect::<Vec<_>>();
+    conversations.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(ActivitySelection {
-        conversations: selected,
+        conversations,
         scanned_conversations: all.scanned_conversations,
         selection_truncated,
     })
 }
 
+fn compare_activity_conversation_recency(
+    left: &ActivityConversationCandidate,
+    right: &ActivityConversationCandidate,
+) -> Ordering {
+    match (&left.latest_ts, &right.latest_ts) {
+        (Some(left_latest), Some(right_latest)) => {
+            compare_slack_timestamps(right_latest, left_latest)
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+    .then_with(|| left.conversation.id.cmp(&right.conversation.id))
+}
+
 fn resolve_activity_selectors(
-    conversations: &[Conversation],
+    candidates: &[ActivityConversationCandidate],
     selectors: &[String],
     field: &'static str,
 ) -> Result<HashSet<String>> {
@@ -6088,14 +6170,15 @@ fn resolve_activity_selectors(
         let needle = validate_activity_selector(field, selector)?;
         let lowered = needle.to_lowercase();
         let matches = if is_valid_any_conversation_id(&needle) {
-            conversations
+            candidates
                 .iter()
-                .filter(|conversation| conversation.id == needle)
+                .filter(|candidate| candidate.conversation.id == needle)
                 .collect::<Vec<_>>()
         } else {
-            conversations
+            candidates
                 .iter()
-                .filter(|conversation| {
+                .filter(|candidate| {
+                    let conversation = &candidate.conversation;
                     conversation.name.to_lowercase() == lowered
                         || conversation.display_name.to_lowercase() == lowered
                 })
@@ -6108,8 +6191,8 @@ fn resolve_activity_selectors(
                     "does not match an accessible Slack conversation",
                 ));
             }
-            [conversation] => {
-                ids.insert(conversation.id.clone());
+            [candidate] => {
+                ids.insert(candidate.conversation.id.clone());
             }
             _ => {
                 return Err(Error::invalid_input(
@@ -14524,8 +14607,22 @@ mod tests {
         );
 
         let submicro = parse_activity_rfc3339("after", "1970-01-01T00:01:40.000000501Z").unwrap();
-        assert_eq!(slack_floor_timestamp(submicro).unwrap(), "100.000000");
-        assert_eq!(slack_ceil_timestamp(submicro).unwrap(), "100.000001");
+        assert_eq!(
+            activity_slack_bounds(
+                parse_activity_rfc3339("after", "1970-01-01T00:01:40Z").unwrap(),
+                parse_activity_rfc3339("before", "1970-01-01T00:01:42Z").unwrap(),
+            )
+            .unwrap(),
+            Some(("100.000000".into(), "101.999999".into()))
+        );
+        assert_eq!(
+            activity_slack_bounds(
+                submicro,
+                parse_activity_rfc3339("before", "1970-01-01T00:01:42.000000501Z").unwrap(),
+            )
+            .unwrap(),
+            Some(("100.000001".into(), "102.000000".into()))
+        );
         assert!(!timestamp_in_activity_interval(
             "100.000000",
             submicro,
@@ -14630,18 +14727,61 @@ mod tests {
                 ActivityCall {
                     channel: "C001".into(),
                     oldest: "100.000000".into(),
-                    latest: "102.000000".into(),
+                    latest: "101.999999".into(),
                     limit: 10,
                 },
                 ActivityCall {
                     channel: "D001".into(),
                     oldest: "100.000000".into(),
-                    latest: "102.000000".into(),
+                    latest: "101.999999".into(),
                     limit: 10,
                 },
             ]
         );
         assert_single_user_directory_call(&user_calls);
+    }
+
+    #[tokio::test]
+    async fn activity_exclusive_upper_bound_cannot_consume_the_history_cap() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage::default()]));
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C001", "joined")],
+            ..RawConversationsPage::default()
+        }]));
+        api.activity_results = Mutex::new(VecDeque::from([Ok(RawMessagePage {
+            // Slack's cap of one applies after the exact request latest. A message at
+            // 102.000000 is not eligible to consume this slot.
+            messages: vec![raw_message("101.999999", "last included microsecond")],
+            has_more: true,
+            ..RawMessagePage::default()
+        })]));
+        let calls = Arc::clone(&api.activity_calls);
+        let report = service(api)
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40Z"),
+                before: Some("1970-01-01T00:01:42Z"),
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: Some(1),
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.items[0].message.ts, "101.999999");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[ActivityCall {
+                channel: "C001".into(),
+                oldest: "100.000000".into(),
+                latest: "101.999999".into(),
+                limit: 1,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -14946,31 +15086,45 @@ mod tests {
 
     #[test]
     fn activity_selection_resolves_exact_names_and_rejects_overlap() {
-        let all = ActivitySelection {
-            conversations: vec![
-                raw_conversation("C001", "joined"),
-                RawConversation {
-                    is_member: false,
-                    ..raw_conversation("C002", "visible")
-                },
-            ]
-            .into_iter()
-            .map(|raw| {
-                normalize_conversations(vec![raw], &HashMap::new())
-                    .unwrap()
-                    .remove(0)
-            })
-            .collect(),
+        let conversations = vec![
+            raw_conversation("C001", "joined"),
+            RawConversation {
+                is_member: false,
+                ..raw_conversation("C002", "visible")
+            },
+        ]
+        .into_iter()
+        .map(|raw| {
+            normalize_conversations(vec![raw], &HashMap::new())
+                .unwrap()
+                .remove(0)
+        })
+        .collect::<Vec<_>>();
+        let all = ActivityConversationDirectory {
+            candidates: conversations
+                .into_iter()
+                .map(|conversation| ActivityConversationCandidate {
+                    conversation,
+                    latest_ts: None,
+                })
+                .collect(),
             scanned_conversations: 2,
-            selection_truncated: false,
+            scan_truncated: false,
         };
         let selected = select_activity_conversations(all, &["visible".into()], &[], 10).unwrap();
         assert_eq!(selected.conversations[0].id, "C002");
 
-        let all = ActivitySelection {
-            conversations: selected.conversations,
+        let all = ActivityConversationDirectory {
+            candidates: selected
+                .conversations
+                .into_iter()
+                .map(|conversation| ActivityConversationCandidate {
+                    conversation,
+                    latest_ts: None,
+                })
+                .collect(),
             scanned_conversations: 1,
-            selection_truncated: false,
+            scan_truncated: false,
         };
         assert!(matches!(
             select_activity_conversations(all, &["C002".into()], &["visible".into()], 10),
@@ -14979,6 +15133,70 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn activity_selection_prefers_slack_latest_metadata_before_id_fallback() {
+        let candidates = (1..=12)
+            .map(|index| {
+                let id = format!("C{index:03}");
+                let conversation = normalize_conversations(
+                    vec![raw_conversation(&id, &format!("channel-{index}"))],
+                    &HashMap::new(),
+                )
+                .unwrap()
+                .remove(0);
+                let latest_ts = match index {
+                    12 => Some("200.000000".into()),
+                    11 => Some("199.000000".into()),
+                    _ => None,
+                };
+                ActivityConversationCandidate {
+                    conversation,
+                    latest_ts,
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected = select_activity_conversations(
+            ActivityConversationDirectory {
+                candidates,
+                scanned_conversations: 12,
+                scan_truncated: false,
+            },
+            &[],
+            &[],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            selected
+                .conversations
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C011", "C012"]
+        );
+        assert!(selected.selection_truncated);
+    }
+
+    #[test]
+    fn activity_recency_reads_only_valid_slack_latest_timestamps() {
+        let mut conversation = raw_conversation("C001", "joined");
+        conversation.latest = Some(json!({
+            "ts": "200.000001",
+            "text": "ignored synthetic body"
+        }));
+        assert_eq!(
+            activity_conversation_latest_timestamp(&conversation).as_deref(),
+            Some("200.000001")
+        );
+        conversation.latest = Some(json!("199.000001"));
+        assert_eq!(
+            activity_conversation_latest_timestamp(&conversation).as_deref(),
+            Some("199.000001")
+        );
+        conversation.latest = Some(json!({"ts": "unsafe"}));
+        assert!(activity_conversation_latest_timestamp(&conversation).is_none());
     }
 
     #[tokio::test]
