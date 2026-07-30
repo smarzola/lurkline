@@ -20,17 +20,19 @@ use crate::{
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     mcp,
     model::{
-        AuthorResolution, Conversation, ConversationKind, ConversationNameResolution,
-        ConversationPage, ConversationSearchReport, ConversationSearchTruncationReason,
-        CustomEmojiKind, CustomEmojiList, DoctorReport, Draft, DraftDeleteReport, DraftPage,
-        DraftSendReport, FileDownloadReport, FileDraftAssociation, FileDraftCreateReport,
-        FileReference, FileUploadReport, InboxReport, InboxTruncationReason, Message, MessagePage,
-        MessageSearchPage, ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage,
-        UnreadConversation, UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        ActivityConversationStatus, ActivityOrder, ActivityReport, AuthorResolution, Conversation,
+        ConversationKind, ConversationNameResolution, ConversationPage, ConversationSearchReport,
+        ConversationSearchTruncationReason, CustomEmojiKind, CustomEmojiList, DoctorReport, Draft,
+        DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
+        FileDraftCreateReport, FileReference, FileUploadReport, InboxReport, InboxTruncationReason,
+        Message, MessagePage, MessageSearchPage, ReactionMutationReport, RenderedMessage,
+        SentMessage, ThreadPage, UnreadConversation, UnreadReport, UserSearchReport,
+        UserSearchTruncationReason,
     },
     service::{
-        DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES, FileDraftCreateRequest,
-        MAX_CONVERSATIONS, MAX_FILE_DOWNLOAD_BYTES, MAX_FILE_UPLOAD_BYTES, MAX_USERS, SlackService,
+        ActivityRequest, DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES,
+        FileDraftCreateRequest, MAX_CONVERSATIONS, MAX_FILE_DOWNLOAD_BYTES, MAX_FILE_UPLOAD_BYTES,
+        MAX_USERS, SlackService,
     },
 };
 
@@ -75,6 +77,42 @@ pub enum Command {
         /// Maximum recent messages to load per unread conversation, from 1 through 200.
         #[arg(long = "messages", default_value_t = 20)]
         message_limit: usize,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read bounded recent activity across joined channels and direct conversations.
+    Activity {
+        /// Relative elapsed interval such as 6h or 1d12h.
+        #[arg(long, conflicts_with_all = ["after", "before", "cursor"])]
+        since: Option<String>,
+        /// Inclusive RFC 3339 lower bound; requires --before.
+        #[arg(long, requires = "before", conflicts_with_all = ["since", "cursor"])]
+        after: Option<String>,
+        /// Exclusive RFC 3339 upper bound; requires --after.
+        #[arg(long, requires = "after", conflicts_with_all = ["since", "cursor"])]
+        before: Option<String>,
+        /// Include only an exact conversation ID or name; repeatable.
+        #[arg(long, conflicts_with = "cursor")]
+        include: Vec<String>,
+        /// Exclude an exact conversation ID or name; repeatable.
+        #[arg(long, conflicts_with = "cursor")]
+        exclude: Vec<String>,
+        /// Return the bounded recent sample oldest-first.
+        #[arg(long, conflicts_with = "cursor")]
+        oldest_first: bool,
+        /// Maximum selected conversations, from 1 through 50.
+        #[arg(long = "conversations", conflicts_with = "cursor")]
+        conversation_limit: Option<usize>,
+        /// Maximum recent messages sampled per conversation, from 1 through 200.
+        #[arg(long = "per-conversation", conflicts_with = "cursor")]
+        per_conversation_limit: Option<usize>,
+        /// Maximum globally ordered messages on this page, from 1 through 100.
+        #[arg(long, conflicts_with = "cursor")]
+        limit: Option<usize>,
+        /// Opaque cursor from a previous activity response; use by itself.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Emit stable JSON.
         #[arg(long)]
         json: bool,
@@ -597,6 +635,38 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
             service.inbox(conversation_limit, message_limit).await?,
             json,
         ),
+        Command::Activity {
+            since,
+            after,
+            before,
+            include,
+            exclude,
+            oldest_first,
+            conversation_limit,
+            per_conversation_limit,
+            limit,
+            cursor,
+            json,
+        } => {
+            let order = oldest_first.then_some(ActivityOrder::OldestFirst);
+            print_activity(
+                service
+                    .activity(ActivityRequest {
+                        since: since.as_deref(),
+                        after: after.as_deref(),
+                        before: before.as_deref(),
+                        include: &include,
+                        exclude: &exclude,
+                        order,
+                        conversation_limit,
+                        per_conversation_limit,
+                        limit,
+                        cursor: cursor.as_deref(),
+                    })
+                    .await?,
+                json,
+            )
+        }
         Command::Conversations {
             command:
                 ConversationsCommand::List {
@@ -1401,6 +1471,72 @@ fn print_inbox(report: InboxReport, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_activity(report: ActivityReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    println!(
+        "interval\t[{}, {})",
+        escape_human(&report.effective_after),
+        escape_human(&report.effective_before)
+    );
+    println!(
+        "order\t{}",
+        match report.order {
+            ActivityOrder::NewestFirst => "newest-first",
+            ActivityOrder::OldestFirst => "oldest-first",
+        }
+    );
+    if report.items.is_empty() {
+        println!("No activity matched.");
+    } else {
+        for item in &report.items {
+            let link = item.message.permalink.as_deref().unwrap_or("-");
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                escape_human(&item.message.ts),
+                escape_human(&item.conversation_display_name),
+                escape_human(&item.conversation_id),
+                format_author(
+                    item.message.author_id.as_deref(),
+                    item.message.author_name.as_deref(),
+                    item.message.author_display_name.as_deref(),
+                    item.message.author_resolution,
+                ),
+                escape_human(&item.message.rendered_text),
+                escape_human(link)
+            );
+        }
+    }
+    for result in &report.conversation_results {
+        let state = match result.status {
+            ActivityConversationStatus::Complete => continue,
+            ActivityConversationStatus::MessageLimit => "message-limit",
+            ActivityConversationStatus::Inaccessible => "inaccessible",
+            ActivityConversationStatus::Unavailable => "unavailable",
+        };
+        println!(
+            "partial\t{}\t{}\t{}",
+            escape_human(&result.conversation.id),
+            state,
+            result.messages_sampled
+        );
+    }
+    if report.selection_truncated {
+        println!(
+            "partial\tconversation-scope\tscanned={}\tselected={}",
+            report.scanned_conversations, report.selected_conversations
+        );
+    }
+    if report.response_byte_limit_reached {
+        println!("partial\tresponse-byte-limit");
+    }
+    if let Some(cursor) = report.next_cursor {
+        println!("more\t{}", escape_human(&cursor));
+    }
+    Ok(())
+}
+
 fn inbox_is_clear(report: &InboxReport) -> bool {
     report.conversations.is_empty() && !report.threads.has_unreads && !report.has_more_conversations
 }
@@ -1870,6 +2006,39 @@ mod tests {
 
     #[test]
     fn parses_all_read_commands_and_bounds_flags() {
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline",
+                "activity",
+                "--since",
+                "6h",
+                "--include",
+                "@self",
+                "--oldest-first",
+                "--conversations",
+                "4",
+                "--per-conversation",
+                "8",
+                "--limit",
+                "12",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Activity {
+                since: Some(_),
+                oldest_first: true,
+                conversation_limit: Some(4),
+                per_conversation_limit: Some(8),
+                limit: Some(12),
+                json: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["lurkline", "activity", "--cursor", "next", "--limit", "12"])
+                .is_err()
+        );
         assert!(matches!(
             Cli::try_parse_from([
                 "lurkline",

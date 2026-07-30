@@ -117,7 +117,7 @@ Follow `AGENTS.md`.
   payloads, workspace messages, names, identifiers, URLs, or file contents.
   Use synthetic fixtures in code, tests, documentation, review packets, and
   commits.
-- Live smoke tests may use the already signed-in `sferait` profile only in
+- Live smoke tests may use the already signed-in `sfera` profile only in
   `smarzola`'s self-DM. Create the minimum uniquely labeled synthetic message
   or file needed for a test, never inspect or mutate unrelated content, keep
   credentials and live output ephemeral, remove only artifacts whose removal
@@ -207,7 +207,7 @@ The goal is complete only when:
 - [x] Milestone 3: Name unread conversations and release `v0.10.0` for #18.
 - [x] Milestone 4: Render mentions safely and release `v0.11.0` for #14.
 - [x] Milestone 5: Expose canonical permalinks and release `v0.12.0` for #19.
-- [ ] Milestone 6: Deliver recent activity and release `v0.13.0` for #15.
+- [x] Milestone 6: Deliver recent activity and release `v0.13.0` for #15.
 
 ### Per-Issue Checkpoint And Delivery Protocol
 
@@ -646,9 +646,13 @@ Implementation and verification:
   No live Slack smoke was needed because construction is pure and fully
   covered by synthetic route fixtures.
 
-Status: Locally complete and publication-ready on 2026-07-30 at
-`4579974bf8be5915dbc77abc386136b4062fb33f`; PR, merge, tag, workflow, release,
-and published-asset evidence follow before Milestone 6 begins.
+PR #24 passed CI and was squash-merged as
+`08a0f8f057855f2aa0c6dd19976f2ed78f5fbf3e`, closing #19. Annotated tag
+`v0.12.0` dereferences to that exact commit. Release workflow `30548550472`,
+tag CI `30548539707`, and main CI `30548477326` all succeeded. GitHub Release
+`362470562` contained exactly six expected assets; every independently
+downloaded checksum and exact versioned `lurkline`, `README.md`, and `LICENSE`
+archive layout passed verification.
 
 ## Milestone 6: Bounded Recent Activity (`v0.13.0`, #15)
 
@@ -681,7 +685,112 @@ cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
 
-Status: Not started.
+Status: Started on 2026-07-30 from
+`08a0f8f057855f2aa0c6dd19976f2ed78f5fbf3e`, the exact `v0.12.0`
+`origin/main`.
+
+Design decisions:
+
+- `lurkline activity` and `slack_read_activity` use the same typed service
+  operation. A first page accepts either one compact positive relative duration
+  such as `6h` or `1d12h`, or both an RFC 3339 `after` and RFC 3339 `before`.
+  RFC 3339 inputs require an explicit offset. The effective interval
+  is reported in canonical UTC and has inclusive-lower, exclusive-upper
+  semantics: `[after, before)`. Omitted `before` and every relative interval
+  freeze the current clock as the upper boundary.
+- The default journey is newest-first across at most 10 joined channels, DMs,
+  and group DMs, 20
+  recent messages per conversation, and 50 returned messages. Callers can
+  choose oldest-first and raise explicit bounds up to 50 conversations, 200
+  messages per conversation, and 100 returned messages. Oldest-first reorders
+  the same bounded recent candidate set; it does not imply an unbounded scan
+  back to the start of a large interval.
+- When the first-party conversation directory includes Slack's validated
+  `latest` message timestamp, default scope prioritizes the most recently active
+  eligible conversations before applying the conversation cap. Missing or
+  malformed recency metadata sorts behind known recency and falls back
+  deterministically by stable ID. The chosen IDs are then sorted and frozen for
+  deterministic requests and continuation.
+- Repeated include and exclude selectors accept stable IDs or exact
+  case-insensitive names. Includes narrow the discovered set and exclusions
+  then remove selected conversations,
+  and explicit includes can opt an otherwise visible unjoined channel into the
+  result. Overlap, ambiguous names, and unknown explicit includes fail with
+  recovery guidance instead of silently producing a surprising report. Discovery, user
+  enrichment, and history pagination retain existing hard page caps.
+- A dedicated Slack `conversations.history` request uses the documented time
+  filters with `inclusive=true`, rounds both boundaries inward to the exact
+  microsecond timestamps Slack messages can represent, requests replies rather than the ordinary
+  channel reader's root-only view, and never changes read state. Exact local
+  timestamp filtering then enforces `[after, before)`, including a message
+  exactly at `after` and excluding one exactly at `before`. Each selected
+  conversation is sampled newest-first with exactly one request bounded by the
+  per-conversation cap.
+  Access failures and transient failures are reported per conversation;
+  successfully collected messages remain useful. Authentication failure still
+  fails the operation so an expired profile cannot masquerade as an empty
+  activity report.
+- Every result carries the existing enriched `Message` plus stable conversation
+  identity and display context. Structured output reports the effective
+  interval, ordering, all effective limits, selection truncation, per-
+  conversation `complete`, `truncated`, `inaccessible`, or `unavailable`
+  status, response-byte truncation, and continuation state. Human output starts
+  with the interval and uses the rendered author, rendered body, conversation
+  name, timestamp, and exact permalink where available.
+- Continuation cursors are versioned, checksum-protected, URL-safe opaque
+  values. They bind to the active team and freeze the effective interval,
+  selected conversation IDs, ordering, all limits, the last emitted
+  timestamp-and-conversation key, failed-conversation states, and a digest of
+  the bounded candidate snapshot. A cursor is used by itself. Continuation
+  re-reads the same bounded snapshot, keyset-filters past the last emitted
+  result, excludes messages newer than the frozen upper bound, and refuses a
+  stale cursor if candidate identities or content changed. This
+  provides no gaps or duplicates while the snapshot is stable instead of
+  silently pretending Slack offers immutable snapshots.
+- The configured JSON response byte limit is applied after enrichment. If
+  fewer than the requested global limit fit, the page shortens and returns a
+  cursor from the exact emitted offset; if even an empty report cannot fit, the
+  operation returns the existing response-too-large error.
+- Relative parsing and RFC 3339 normalization use the already locked `chrono`
+  implementation as a direct dependency. URL-safe cursor encoding promotes the
+  already locked `base64` implementation. No persistence, cache, background
+  task, Slack search dependency, per-result identity lookup, or new mutation is
+  added.
+
+Status: Implementation accepted for publication on 2026-07-30. The branch
+started from `08a0f8f057855f2aa0c6dd19976f2ed78f5fbf3e`, the exact `v0.12.0`
+`origin/main`.
+
+Implementation and verification:
+
+- `lurkline activity` and `slack_read_activity` now share one typed bounded
+  snapshot operation with relative or exact-offset intervals, deterministic
+  conversation selection, exact `[after, before)` filtering, reply-inclusive
+  history, enriched flat results, explicit completeness, byte-aware pages, and
+  stale-snapshot continuation protection.
+- Conversation selection uses Slack's validated first-party `latest` metadata
+  before a deterministic ID fallback. Each selected conversation receives
+  exactly one bounded history request; no write or mark-read endpoint is used.
+- Activity cursors use a shared 8,192-character producer/consumer bound. A
+  maximal accepted 50-conversation cursor exceeds the generic 2,048-character
+  Slack cursor bound and now round-trips in regression coverage.
+- The retained reviewer found an exclusive-upper-bound rounding defect and
+  arbitrary capped selection, then a nanosecond-ceiling overflow edge. Both
+  repair rounds passed. The fresh auditor found the activity cursor
+  producer/consumer size mismatch; the repair and its README clarification
+  passed both reviewers at `118138c922bd74bdfde640d12a86067c6eff525a`
+  with no remaining blocking or actionable finding.
+- The full gate passed with 275 library tests, 12 CLI-process tests, 2 raw-MCP
+  tests, and 1 package-metadata test, plus formatting, strict locked Clippy,
+  release build, Rust 1.88 compatibility, credential scanning, diff checking,
+  version readback, and deterministic macOS ARM64 package checksum/layout
+  verification.
+- An authorized read-only smoke against the `sfera` profile's `smarzola`
+  self-DM returned 30 bounded activity items, including 3 replies, from exactly
+  one selected conversation. The conversation status was complete, the result
+  was neither partial nor paginated, every returned conversation ID matched the
+  authorized DM, no synthetic Slack content was created, and the mode-0600 raw
+  output was deleted immediately.
 
 ## Final Verification
 

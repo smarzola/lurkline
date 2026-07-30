@@ -257,6 +257,9 @@ pub(crate) struct RawConversation {
     pub user: Option<String>,
     #[serde(default)]
     pub num_members: Option<u64>,
+    /// First-party responses may include the newest message; activity reads only its timestamp.
+    #[serde(default)]
+    pub latest: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -748,6 +751,60 @@ pub struct InboxReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation_reason: Option<InboxTruncationReason>,
     pub threads: UnreadThreads,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityOrder {
+    NewestFirst,
+    OldestFirst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityConversationStatus {
+    Complete,
+    MessageLimit,
+    Inaccessible,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ActivityConversationResult {
+    pub conversation: Conversation,
+    pub status: ActivityConversationStatus,
+    pub messages_sampled: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ActivityItem {
+    pub conversation_id: String,
+    pub conversation_name: String,
+    pub conversation_display_name: String,
+    pub conversation_kind: ConversationKind,
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ActivityReport {
+    pub team_id: String,
+    /// Canonical UTC lower bound. The interval includes this instant.
+    pub effective_after: String,
+    /// Canonical UTC upper bound. The interval excludes this instant.
+    pub effective_before: String,
+    pub order: ActivityOrder,
+    pub items: Vec<ActivityItem>,
+    pub conversation_results: Vec<ActivityConversationResult>,
+    pub scanned_conversations: usize,
+    pub selected_conversations: usize,
+    pub conversation_limit: usize,
+    pub per_conversation_limit: usize,
+    pub limit: usize,
+    pub selection_truncated: bool,
+    pub partial: bool,
+    pub response_byte_limit_reached: bool,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

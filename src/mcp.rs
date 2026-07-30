@@ -14,15 +14,15 @@ use crate::{
     local_file::{McpFileRoot, validate_mcp_download_path, validate_mcp_upload_path},
     markdown::render_markdown,
     model::{
-        ConversationPage, ConversationSearchReport, CustomEmojiList, DoctorReport, Draft,
-        DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport, FileDraftCreateReport,
-        FileReference, FileUploadReport, InboxReport, Message, MessagePage, MessageSearchPage,
-        ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage, UnreadReport,
-        UserSearchReport,
+        ActivityOrder, ActivityReport, ConversationPage, ConversationSearchReport, CustomEmojiList,
+        DoctorReport, Draft, DraftDeleteReport, DraftPage, DraftSendReport, FileDownloadReport,
+        FileDraftCreateReport, FileReference, FileUploadReport, InboxReport, Message, MessagePage,
+        MessageSearchPage, ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage,
+        UnreadReport, UserSearchReport,
     },
     service::{
-        DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES, FileDraftCreateRequest,
-        MAX_FILE_DOWNLOAD_BYTES, MAX_FILE_UPLOAD_BYTES, SlackService,
+        ActivityRequest, DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES,
+        FileDraftCreateRequest, MAX_FILE_DOWNLOAD_BYTES, MAX_FILE_UPLOAD_BYTES, SlackService,
     },
 };
 
@@ -58,6 +58,32 @@ struct ReadInboxRequest {
     /// Maximum recent messages to load per conversation, from 1 through 200.
     #[serde(default = "default_inbox_message_limit")]
     message_limit: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReadActivityRequest {
+    /// Relative elapsed interval such as 6h or 1d12h; exclusive with absolute bounds.
+    since: Option<String>,
+    /// Inclusive RFC 3339 lower bound; provide together with before.
+    after: Option<String>,
+    /// Exclusive RFC 3339 upper bound; provide together with after.
+    before: Option<String>,
+    /// Exact conversation IDs or names to include.
+    #[serde(default)]
+    include: Vec<String>,
+    /// Exact conversation IDs or names to exclude.
+    #[serde(default)]
+    exclude: Vec<String>,
+    /// Global ordering; newest_first is the default.
+    order: Option<ActivityOrder>,
+    /// Maximum selected conversations, from 1 through 50.
+    conversation_limit: Option<usize>,
+    /// Maximum recent messages sampled per conversation, from 1 through 200.
+    per_conversation_limit: Option<usize>,
+    /// Maximum globally ordered messages on this page, from 1 through 100.
+    limit: Option<usize>,
+    /// Opaque cursor from a previous response; provide without any other field.
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -787,6 +813,40 @@ impl McpServer {
         )
     }
 
+    /// Read a deterministic, bounded recent-activity snapshot without changing Slack read state.
+    #[tool(
+        name = "slack_read_activity",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ActivityReport>>(),
+        annotations(
+            title = "Read recent Slack activity",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn read_activity(
+        &self,
+        Parameters(request): Parameters<ReadActivityRequest>,
+    ) -> CallToolResult {
+        tool_result(
+            self.service
+                .activity(ActivityRequest {
+                    since: request.since.as_deref(),
+                    after: request.after.as_deref(),
+                    before: request.before.as_deref(),
+                    include: &request.include,
+                    exclude: &request.exclude,
+                    order: request.order,
+                    conversation_limit: request.conversation_limit,
+                    per_conversation_limit: request.per_conversation_limit,
+                    limit: request.limit,
+                    cursor: request.cursor.as_deref(),
+                })
+                .await,
+        )
+    }
+
     /// List a bounded page of Slack channels, DMs, and group DMs with names.
     #[tool(
         name = "slack_list_conversations",
@@ -1330,6 +1390,7 @@ mod tests {
                 "slack_list_custom_emoji",
                 "slack_list_drafts",
                 "slack_list_unreads",
+                "slack_read_activity",
                 "slack_read_channel",
                 "slack_read_inbox",
                 "slack_read_thread",

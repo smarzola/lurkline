@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet, hash_map::Entry},
     io::{self, Write},
     sync::Arc,
@@ -6,6 +7,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -15,7 +20,8 @@ use crate::{
     local_file::{BoundedDownload, DownloadDurability, UploadPass, UploadSource},
     markdown::{MAX_MARKDOWN_BYTES, render_markdown},
     model::{
-        AuthorResolution, ClientCountsPayload, Conversation, ConversationKind,
+        ActivityConversationResult, ActivityConversationStatus, ActivityItem, ActivityOrder,
+        ActivityReport, AuthorResolution, ClientCountsPayload, Conversation, ConversationKind,
         ConversationNameResolution, ConversationPage, ConversationSearchReport,
         ConversationSearchTruncationReason, CustomEmoji, CustomEmojiKind, CustomEmojiList,
         DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport, DraftDestination, DraftPage,
@@ -36,6 +42,18 @@ use crate::{
 
 const MAX_MESSAGES: usize = 200;
 pub(crate) const MAX_INBOX_CONVERSATIONS: usize = 50;
+pub(crate) const MAX_ACTIVITY_CONVERSATIONS: usize = 50;
+pub(crate) const MAX_ACTIVITY_MESSAGES: usize = 100;
+pub(crate) const MAX_ACTIVITY_PER_CONVERSATION: usize = 200;
+const DEFAULT_ACTIVITY_CONVERSATIONS: usize = 10;
+const DEFAULT_ACTIVITY_MESSAGES: usize = 50;
+const DEFAULT_ACTIVITY_PER_CONVERSATION: usize = 20;
+const MAX_ACTIVITY_DURATION_SECONDS: i64 = 365 * 24 * 60 * 60;
+const MAX_ACTIVITY_SELECTORS: usize = 50;
+const MAX_ACTIVITY_CURSOR_LENGTH: usize = 8_192;
+const ACTIVITY_CURSOR_VERSION: u8 = 1;
+const ACTIVITY_CURSOR_PREFIX: &str = "activity-v1";
+const ACTIVITY_CURSOR_DOMAIN: &[u8] = b"lurkline-activity-cursor-v1\0";
 pub(crate) const MAX_USERS: usize = 100;
 pub(crate) const MAX_CONVERSATIONS: usize = 100;
 pub(crate) const CONVERSATIONS_PAGE_SIZE: usize = 200;
@@ -77,6 +95,19 @@ pub(crate) struct FileDraftCreateRequest<'a> {
     pub(crate) confirmed: bool,
 }
 
+pub(crate) struct ActivityRequest<'a> {
+    pub(crate) since: Option<&'a str>,
+    pub(crate) after: Option<&'a str>,
+    pub(crate) before: Option<&'a str>,
+    pub(crate) include: &'a [String],
+    pub(crate) exclude: &'a [String],
+    pub(crate) order: Option<ActivityOrder>,
+    pub(crate) conversation_limit: Option<usize>,
+    pub(crate) per_conversation_limit: Option<usize>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) cursor: Option<&'a str>,
+}
+
 pub(crate) struct ChatPostMessageRequest<'a> {
     pub(crate) channel: &'a str,
     pub(crate) thread_ts: Option<&'a str>,
@@ -105,6 +136,16 @@ pub(crate) trait SlackApi: Send + Sync {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<RawMessagePage>;
+    async fn activity_history(
+        &self,
+        channel: &str,
+        oldest: &str,
+        latest: &str,
+        limit: usize,
+    ) -> Result<RawMessagePage> {
+        let _ = (oldest, latest);
+        self.conversation_history(channel, None, limit).await
+    }
     async fn conversation_replies(
         &self,
         channel: &str,
@@ -314,7 +355,7 @@ pub(crate) struct SlackService {
     api: Arc<dyn SlackApi>,
     team_id: String,
     workspace_url: url::Url,
-    inbox_byte_limit: usize,
+    max_response_bytes: usize,
     now_millis: fn() -> Result<String>,
     upload_reconciliation_delays_ms: &'static [u64],
     draft_reconciliation_delays_ms: &'static [u64],
@@ -514,13 +555,53 @@ enum UserDirectoryScan {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct ActivityKey {
+    ts: String,
+    conversation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct ActivityCursor {
+    version: u8,
+    team_id: String,
+    after_nanos: i64,
+    before_nanos: i64,
+    order: ActivityOrder,
+    conversation_ids: Vec<String>,
+    conversation_limit: usize,
+    per_conversation_limit: usize,
+    limit: usize,
+    scanned_conversations: usize,
+    selection_truncated: bool,
+    last_key: ActivityKey,
+    snapshot_digest: String,
+}
+
+struct ActivitySelection {
+    conversations: Vec<Conversation>,
+    scanned_conversations: usize,
+    selection_truncated: bool,
+}
+
+struct ActivityConversationCandidate {
+    conversation: Conversation,
+    latest_ts: Option<String>,
+}
+
+struct ActivityConversationDirectory {
+    candidates: Vec<ActivityConversationCandidate>,
+    scanned_conversations: usize,
+    scan_truncated: bool,
+}
+
 impl SlackService {
     pub(crate) fn new(api: impl SlackApi + 'static, config: &Config) -> Self {
         Self {
             api: Arc::new(api),
             team_id: config.team_id.clone(),
             workspace_url: config.workspace_url.clone(),
-            inbox_byte_limit: config.max_response_bytes,
+            max_response_bytes: config.max_response_bytes,
             now_millis: system_unix_milliseconds,
             upload_reconciliation_delays_ms: UPLOAD_RECONCILIATION_DELAYS_MS,
             draft_reconciliation_delays_ms: DRAFT_RECONCILIATION_DELAYS_MS,
@@ -1932,10 +2013,10 @@ impl SlackService {
                 .then_some(InboxTruncationReason::ByteLimit),
             threads: unreads.threads,
         };
-        if !serialized_json_fits(&report, self.inbox_byte_limit) {
+        if !serialized_json_fits(&report, self.max_response_bytes) {
             return Err(Error::ResponseTooLarge {
                 method: "inbox",
-                limit: self.inbox_byte_limit,
+                limit: self.max_response_bytes,
             });
         }
         let mut byte_limited = false;
@@ -1981,7 +2062,7 @@ impl SlackService {
             } else {
                 Some(InboxTruncationReason::ByteLimit)
             };
-            if !serialized_json_fits(&report, self.inbox_byte_limit) {
+            if !serialized_json_fits(&report, self.max_response_bytes) {
                 report.conversations.pop();
                 byte_limited = true;
                 break;
@@ -1995,13 +2076,420 @@ impl SlackService {
         } else {
             None
         };
-        if !serialized_json_fits(&report, self.inbox_byte_limit) {
+        if !serialized_json_fits(&report, self.max_response_bytes) {
             return Err(Error::ResponseTooLarge {
                 method: "inbox",
-                limit: self.inbox_byte_limit,
+                limit: self.max_response_bytes,
             });
         }
         Ok(report)
+    }
+
+    pub(crate) async fn activity(&self, request: ActivityRequest<'_>) -> Result<ActivityReport> {
+        let cursor = match request.cursor {
+            Some(cursor) => {
+                if request.since.is_some()
+                    || request.after.is_some()
+                    || request.before.is_some()
+                    || !request.include.is_empty()
+                    || !request.exclude.is_empty()
+                    || request.order.is_some()
+                    || request.conversation_limit.is_some()
+                    || request.per_conversation_limit.is_some()
+                    || request.limit.is_some()
+                {
+                    return Err(Error::invalid_input(
+                        "cursor",
+                        "must be used without interval, filter, ordering, or limit options",
+                    ));
+                }
+                let cursor = decode_activity_cursor(cursor)?;
+                validate_activity_cursor(&cursor, &self.team_id)?;
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        let (after_nanos, before_nanos, order, conversation_limit, per_conversation_limit, limit) =
+            if let Some(cursor) = &cursor {
+                (
+                    cursor.after_nanos,
+                    cursor.before_nanos,
+                    cursor.order,
+                    cursor.conversation_limit,
+                    cursor.per_conversation_limit,
+                    cursor.limit,
+                )
+            } else {
+                let (after_nanos, before_nanos) =
+                    self.resolve_activity_interval(request.since, request.after, request.before)?;
+                let conversation_limit = request
+                    .conversation_limit
+                    .unwrap_or(DEFAULT_ACTIVITY_CONVERSATIONS);
+                let per_conversation_limit = request
+                    .per_conversation_limit
+                    .unwrap_or(DEFAULT_ACTIVITY_PER_CONVERSATION);
+                let limit = request.limit.unwrap_or(DEFAULT_ACTIVITY_MESSAGES);
+                validate_limit(
+                    "conversation_limit",
+                    conversation_limit,
+                    MAX_ACTIVITY_CONVERSATIONS,
+                )?;
+                validate_limit(
+                    "per_conversation_limit",
+                    per_conversation_limit,
+                    MAX_ACTIVITY_PER_CONVERSATION,
+                )?;
+                validate_limit("limit", limit, MAX_ACTIVITY_MESSAGES)?;
+                (
+                    after_nanos,
+                    before_nanos,
+                    request.order.unwrap_or(ActivityOrder::NewestFirst),
+                    conversation_limit,
+                    per_conversation_limit,
+                    limit,
+                )
+            };
+
+        let author_directory = match self.scan_user_directory().await {
+            UserDirectoryScan::Finished(directory) => AuthorDirectory::Loaded(directory),
+            UserDirectoryScan::Interrupted { directory, error } => {
+                if matches!(error, Error::Authentication) {
+                    return Err(error);
+                }
+                AuthorDirectory::Interrupted(directory)
+            }
+        };
+        let all_conversations = self
+            .scan_activity_conversations(author_directory_users(&author_directory))
+            .await?;
+        let selection = match &cursor {
+            Some(cursor) => {
+                let by_id = all_conversations
+                    .candidates
+                    .into_iter()
+                    .map(|candidate| (candidate.conversation.id.clone(), candidate.conversation))
+                    .collect::<HashMap<_, _>>();
+                let mut conversations = Vec::with_capacity(cursor.conversation_ids.len());
+                for id in &cursor.conversation_ids {
+                    let Some(conversation) = by_id.get(id) else {
+                        return Err(stale_activity_cursor());
+                    };
+                    conversations.push(conversation.clone());
+                }
+                ActivitySelection {
+                    conversations,
+                    scanned_conversations: cursor.scanned_conversations,
+                    selection_truncated: cursor.selection_truncated,
+                }
+            }
+            None => select_activity_conversations(
+                all_conversations,
+                request.include,
+                request.exclude,
+                conversation_limit,
+            )?,
+        };
+
+        let slack_bounds = activity_slack_bounds(after_nanos, before_nanos)?;
+        let mut items = Vec::new();
+        let mut conversation_results = Vec::with_capacity(selection.conversations.len());
+        let mut seen_keys = HashSet::new();
+        for conversation in &selection.conversations {
+            let Some((oldest, latest)) = &slack_bounds else {
+                conversation_results.push(ActivityConversationResult {
+                    conversation: conversation.clone(),
+                    status: ActivityConversationStatus::Complete,
+                    messages_sampled: 0,
+                });
+                continue;
+            };
+            let raw = match self
+                .api
+                .activity_history(&conversation.id, oldest, latest, per_conversation_limit)
+                .await
+            {
+                Ok(raw) => raw,
+                Err(error) if matches!(error, Error::Authentication) => return Err(error),
+                Err(error) => {
+                    conversation_results.push(ActivityConversationResult {
+                        conversation: conversation.clone(),
+                        status: activity_error_status(&error),
+                        messages_sampled: 0,
+                    });
+                    continue;
+                }
+            };
+            let next_cursor = match response_cursor(
+                "conversations.history",
+                raw.response_metadata.next_cursor.clone(),
+            ) {
+                Ok(next_cursor) => next_cursor,
+                Err(_) => {
+                    conversation_results.push(ActivityConversationResult {
+                        conversation: conversation.clone(),
+                        status: ActivityConversationStatus::Unavailable,
+                        messages_sampled: 0,
+                    });
+                    continue;
+                }
+            };
+            let status = if raw.messages.len() > per_conversation_limit
+                || raw.has_more
+                || next_cursor.is_some()
+            {
+                ActivityConversationStatus::MessageLimit
+            } else {
+                ActivityConversationStatus::Complete
+            };
+            let mut messages = match normalize_messages(
+                &self.workspace_url,
+                &conversation.id,
+                raw.messages,
+                per_conversation_limit,
+                "conversations.history",
+            ) {
+                Ok(messages) => messages,
+                Err(_) => {
+                    conversation_results.push(ActivityConversationResult {
+                        conversation: conversation.clone(),
+                        status: ActivityConversationStatus::Unavailable,
+                        messages_sampled: 0,
+                    });
+                    continue;
+                }
+            };
+            messages.retain(|message| {
+                timestamp_in_activity_interval(&message.ts, after_nanos, before_nanos)
+            });
+            enrich_messages_from_directory(&mut messages, &author_directory);
+            for message in messages {
+                let key = (
+                    conversation.id.clone(),
+                    canonical_activity_timestamp(&message.ts),
+                );
+                if !seen_keys.insert(key) {
+                    return Err(Error::InvalidResponse { method: "activity" });
+                }
+                items.push(ActivityItem {
+                    conversation_id: conversation.id.clone(),
+                    conversation_name: conversation.name.clone(),
+                    conversation_display_name: conversation.display_name.clone(),
+                    conversation_kind: conversation.kind,
+                    message,
+                });
+            }
+            conversation_results.push(ActivityConversationResult {
+                conversation: conversation.clone(),
+                status,
+                messages_sampled: items
+                    .iter()
+                    .filter(|item| item.conversation_id == conversation.id)
+                    .count(),
+            });
+        }
+        items.sort_by(|left, right| {
+            compare_activity_keys(
+                &left.message.ts,
+                &left.conversation_id,
+                &right.message.ts,
+                &right.conversation_id,
+            )
+        });
+        if order == ActivityOrder::NewestFirst {
+            items.reverse();
+        }
+        conversation_results
+            .sort_by(|left, right| left.conversation.id.cmp(&right.conversation.id));
+
+        let snapshot_digest = activity_snapshot_digest(&items, &conversation_results)?;
+        let start = if let Some(cursor) = &cursor {
+            if cursor.snapshot_digest != snapshot_digest {
+                return Err(stale_activity_cursor());
+            }
+            items
+                .iter()
+                .position(|item| activity_item_key(item) == cursor.last_key)
+                .map(|index| index + 1)
+                .ok_or_else(stale_activity_cursor)?
+        } else {
+            0
+        };
+        let desired_end = start.saturating_add(limit).min(items.len());
+        let mut page_items = items[start..desired_end].to_vec();
+        let partial_without_bytes = selection.selection_truncated
+            || conversation_results
+                .iter()
+                .any(|result| result.status != ActivityConversationStatus::Complete);
+        let conversation_ids = selection
+            .conversations
+            .iter()
+            .map(|conversation| conversation.id.clone())
+            .collect::<Vec<_>>();
+        let mut byte_limited = false;
+
+        loop {
+            let end = start + page_items.len();
+            let has_more = end < items.len();
+            let next_cursor = if has_more {
+                let last = page_items.last().ok_or(Error::ResponseTooLarge {
+                    method: "activity",
+                    limit: self.max_response_bytes,
+                })?;
+                Some(encode_activity_cursor(&ActivityCursor {
+                    version: ACTIVITY_CURSOR_VERSION,
+                    team_id: self.team_id.clone(),
+                    after_nanos,
+                    before_nanos,
+                    order,
+                    conversation_ids: conversation_ids.clone(),
+                    conversation_limit,
+                    per_conversation_limit,
+                    limit,
+                    scanned_conversations: selection.scanned_conversations,
+                    selection_truncated: selection.selection_truncated,
+                    last_key: activity_item_key(last),
+                    snapshot_digest: snapshot_digest.clone(),
+                })?)
+            } else {
+                None
+            };
+            let report = ActivityReport {
+                team_id: self.team_id.clone(),
+                effective_after: format_activity_instant(after_nanos)?,
+                effective_before: format_activity_instant(before_nanos)?,
+                order,
+                items: page_items.clone(),
+                conversation_results: conversation_results.clone(),
+                scanned_conversations: selection.scanned_conversations,
+                selected_conversations: selection.conversations.len(),
+                conversation_limit,
+                per_conversation_limit,
+                limit,
+                selection_truncated: selection.selection_truncated,
+                partial: partial_without_bytes || byte_limited,
+                response_byte_limit_reached: byte_limited,
+                has_more,
+                next_cursor,
+            };
+            if serialized_json_fits(&report, self.max_response_bytes) {
+                return Ok(report);
+            }
+            if page_items.pop().is_none() || page_items.is_empty() {
+                return Err(Error::ResponseTooLarge {
+                    method: "activity",
+                    limit: self.max_response_bytes,
+                });
+            }
+            byte_limited = true;
+        }
+    }
+
+    fn resolve_activity_interval(
+        &self,
+        since: Option<&str>,
+        after: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<(i64, i64)> {
+        match (since, after, before) {
+            (Some(since), None, None) => {
+                let duration = parse_activity_duration(since)?;
+                let now_millis = (self.now_millis)()?
+                    .parse::<i64>()
+                    .map_err(|_| Error::SystemClock)?;
+                let before = now_millis
+                    .checked_mul(1_000_000)
+                    .ok_or(Error::SystemClock)?;
+                let after = before
+                    .checked_sub(
+                        duration
+                            .num_nanoseconds()
+                            .ok_or_else(|| Error::invalid_input("since", "is too large"))?,
+                    )
+                    .ok_or_else(|| Error::invalid_input("since", "is too large"))?;
+                if after < 0 {
+                    return Err(Error::invalid_input(
+                        "since",
+                        "extends earlier than the Unix epoch",
+                    ));
+                }
+                Ok((after, before))
+            }
+            (None, Some(after), Some(before)) => {
+                let after = parse_activity_rfc3339("after", after)?;
+                let before = parse_activity_rfc3339("before", before)?;
+                if after >= before {
+                    return Err(Error::invalid_input("after", "must be earlier than before"));
+                }
+                Ok((after, before))
+            }
+            _ => Err(Error::invalid_input(
+                "interval",
+                "provide either since or both after and before",
+            )),
+        }
+    }
+
+    async fn scan_activity_conversations(
+        &self,
+        users: &HashMap<String, User>,
+    ) -> Result<ActivityConversationDirectory> {
+        let mut candidates = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        for page_index in 0..MAX_CONVERSATION_PAGES {
+            let page = self
+                .api
+                .conversations_list(cursor.as_deref(), CONVERSATIONS_PAGE_SIZE)
+                .await?;
+            if page.channels.len() > CONVERSATIONS_PAGE_SIZE {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+            for raw in page.channels {
+                let latest_ts = activity_conversation_latest_timestamp(&raw);
+                let conversation = normalize_conversations(vec![raw], users)?.pop().ok_or(
+                    Error::InvalidResponse {
+                        method: "conversations.list",
+                    },
+                )?;
+                if !conversation.is_archived && !seen_ids.insert(conversation.id.clone()) {
+                    return Err(Error::InvalidResponse {
+                        method: "conversations.list",
+                    });
+                }
+                if !conversation.is_archived {
+                    candidates.push(ActivityConversationCandidate {
+                        conversation,
+                        latest_ts,
+                    });
+                }
+            }
+            let next = response_cursor("conversations.list", page.response_metadata.next_cursor)?;
+            let Some(next) = next else {
+                return Ok(ActivityConversationDirectory {
+                    scanned_conversations: candidates.len(),
+                    candidates,
+                    scan_truncated: false,
+                });
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(Error::InvalidResponse {
+                    method: "conversations.list",
+                });
+            }
+            cursor = Some(next);
+            if page_index + 1 == MAX_CONVERSATION_PAGES {
+                return Ok(ActivityConversationDirectory {
+                    scanned_conversations: candidates.len(),
+                    candidates,
+                    scan_truncated: true,
+                });
+            }
+        }
+        unreachable!("bounded activity conversation scan always returns")
     }
 
     pub(crate) async fn list_conversations(
@@ -5299,6 +5787,469 @@ fn system_unix_milliseconds() -> Result<String> {
         .map_err(|_| Error::SystemClock)
 }
 
+fn parse_activity_duration(value: &str) -> Result<TimeDelta> {
+    if value.is_empty() || value.len() > 64 || value.chars().any(char::is_whitespace) {
+        return Err(Error::invalid_input(
+            "since",
+            "must be a positive duration such as 6h or 1d12h",
+        ));
+    }
+    let mut total_seconds = 0_i64;
+    let mut number = 0_i64;
+    let mut has_digits = false;
+    for character in value.chars() {
+        if let Some(digit) = character.to_digit(10) {
+            has_digits = true;
+            number = number
+                .checked_mul(10)
+                .and_then(|number| number.checked_add(i64::from(digit)))
+                .ok_or_else(|| Error::invalid_input("since", "is too large"))?;
+            continue;
+        }
+        if !has_digits || number == 0 {
+            return Err(Error::invalid_input(
+                "since",
+                "must be a positive duration such as 6h or 1d12h",
+            ));
+        }
+        let multiplier = match character {
+            's' => 1,
+            'm' => 60,
+            'h' => 60 * 60,
+            'd' => 24 * 60 * 60,
+            'w' => 7 * 24 * 60 * 60,
+            _ => {
+                return Err(Error::invalid_input(
+                    "since",
+                    "must use s, m, h, d, or w units",
+                ));
+            }
+        };
+        total_seconds = total_seconds
+            .checked_add(
+                number
+                    .checked_mul(multiplier)
+                    .ok_or_else(|| Error::invalid_input("since", "is too large"))?,
+            )
+            .ok_or_else(|| Error::invalid_input("since", "is too large"))?;
+        if total_seconds > MAX_ACTIVITY_DURATION_SECONDS {
+            return Err(Error::invalid_input("since", "must not exceed 365 days"));
+        }
+        number = 0;
+        has_digits = false;
+    }
+    if has_digits || total_seconds == 0 {
+        return Err(Error::invalid_input(
+            "since",
+            "must be a positive duration such as 6h or 1d12h",
+        ));
+    }
+    TimeDelta::try_seconds(total_seconds)
+        .ok_or_else(|| Error::invalid_input("since", "is too large"))
+}
+
+fn parse_activity_rfc3339(field: &'static str, value: &str) -> Result<i64> {
+    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| {
+        Error::invalid_input(
+            field,
+            "must be RFC 3339 with Z or an explicit numeric offset",
+        )
+    })?;
+    let nanos = parsed.timestamp_nanos_opt().ok_or_else(|| {
+        Error::invalid_input(field, "must be within the supported Unix timestamp range")
+    })?;
+    if nanos < 0 {
+        return Err(Error::invalid_input(
+            field,
+            "must not be earlier than the Unix epoch",
+        ));
+    }
+    Ok(nanos)
+}
+
+fn format_activity_instant(nanos: i64) -> Result<String> {
+    let seconds = nanos.div_euclid(1_000_000_000);
+    let subsecond = nanos.rem_euclid(1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(seconds, subsecond)
+        .map(|instant| instant.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+        .ok_or(Error::InvalidResponse { method: "activity" })
+}
+
+fn activity_slack_bounds(after_nanos: i64, before_nanos: i64) -> Result<Option<(String, String)>> {
+    if after_nanos < 0 || after_nanos >= before_nanos {
+        return Err(Error::InvalidResponse { method: "activity" });
+    }
+    let oldest_micros = ceil_activity_microseconds(after_nanos)?;
+    let latest_micros = ceil_activity_microseconds(before_nanos)?
+        .checked_sub(1)
+        .ok_or(Error::InvalidResponse { method: "activity" })?;
+    if oldest_micros > latest_micros {
+        return Ok(None);
+    }
+    Ok(Some((
+        format_slack_microseconds(oldest_micros),
+        format_slack_microseconds(latest_micros),
+    )))
+}
+
+fn ceil_activity_microseconds(nanos: i64) -> Result<i64> {
+    (nanos / 1_000)
+        .checked_add(i64::from(nanos % 1_000 != 0))
+        .ok_or(Error::InvalidResponse { method: "activity" })
+}
+
+fn format_slack_microseconds(total_micros: i64) -> String {
+    format!(
+        "{}.{:06}",
+        total_micros / 1_000_000,
+        total_micros % 1_000_000
+    )
+}
+
+fn activity_conversation_latest_timestamp(conversation: &RawConversation) -> Option<String> {
+    let latest = conversation.latest.as_ref()?;
+    let timestamp = match latest {
+        serde_json::Value::String(timestamp) => timestamp.as_str(),
+        serde_json::Value::Object(message) => message.get("ts")?.as_str()?,
+        _ => return None,
+    };
+    is_valid_timestamp(timestamp).then(|| timestamp.to_owned())
+}
+
+fn timestamp_in_activity_interval(timestamp: &str, after: i64, before: i64) -> bool {
+    compare_slack_timestamp_to_nanos(timestamp, after) != Some(Ordering::Less)
+        && compare_slack_timestamp_to_nanos(timestamp, before) == Some(Ordering::Less)
+}
+
+fn compare_slack_timestamp_to_nanos(timestamp: &str, nanos: i64) -> Option<Ordering> {
+    let (seconds, fraction) = timestamp.split_once('.')?;
+    let seconds = seconds.parse::<i64>().ok()?;
+    let bound_seconds = nanos.div_euclid(1_000_000_000);
+    match seconds.cmp(&bound_seconds) {
+        Ordering::Equal => {
+            let bound_fraction = format!("{:09}", nanos.rem_euclid(1_000_000_000));
+            Some(compare_decimal_fractions(fraction, &bound_fraction))
+        }
+        ordering => Some(ordering),
+    }
+}
+
+fn compare_decimal_fractions(left: &str, right: &str) -> Ordering {
+    let length = left.len().max(right.len());
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    for index in 0..length {
+        let left = left.get(index).copied().unwrap_or(b'0');
+        let right = right.get(index).copied().unwrap_or(b'0');
+        match left.cmp(&right) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_slack_timestamps(left: &str, right: &str) -> Ordering {
+    let (left_seconds, left_fraction) = left.split_once('.').unwrap_or((left, ""));
+    let (right_seconds, right_fraction) = right.split_once('.').unwrap_or((right, ""));
+    let left_seconds = trim_decimal_leading_zeroes(left_seconds);
+    let right_seconds = trim_decimal_leading_zeroes(right_seconds);
+    left_seconds
+        .len()
+        .cmp(&right_seconds.len())
+        .then_with(|| left_seconds.cmp(right_seconds))
+        .then_with(|| compare_decimal_fractions(left_fraction, right_fraction))
+}
+
+fn trim_decimal_leading_zeroes(value: &str) -> &str {
+    let trimmed = value.trim_start_matches('0');
+    if trimmed.is_empty() { "0" } else { trimmed }
+}
+
+fn canonical_activity_timestamp(timestamp: &str) -> String {
+    let (seconds, fraction) = timestamp.split_once('.').unwrap_or((timestamp, ""));
+    let fraction = fraction.trim_end_matches('0');
+    format!(
+        "{}.{}",
+        trim_decimal_leading_zeroes(seconds),
+        if fraction.is_empty() { "0" } else { fraction }
+    )
+}
+
+fn compare_activity_keys(
+    left_ts: &str,
+    left_conversation_id: &str,
+    right_ts: &str,
+    right_conversation_id: &str,
+) -> Ordering {
+    compare_slack_timestamps(left_ts, right_ts)
+        .then_with(|| left_conversation_id.cmp(right_conversation_id))
+}
+
+fn activity_item_key(item: &ActivityItem) -> ActivityKey {
+    ActivityKey {
+        ts: item.message.ts.clone(),
+        conversation_id: item.conversation_id.clone(),
+    }
+}
+
+fn activity_snapshot_digest(
+    items: &[ActivityItem],
+    conversation_results: &[ActivityConversationResult],
+) -> Result<String> {
+    let encoded = serde_json::to_vec(&(items, conversation_results)).map_err(|_| Error::Output)?;
+    Ok(sha256_hex(&encoded))
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn encode_activity_cursor(cursor: &ActivityCursor) -> Result<String> {
+    let payload = serde_json::to_vec(cursor).map_err(|_| Error::Output)?;
+    let mut checked = Vec::with_capacity(ACTIVITY_CURSOR_DOMAIN.len() + payload.len());
+    checked.extend_from_slice(ACTIVITY_CURSOR_DOMAIN);
+    checked.extend_from_slice(&payload);
+    let encoded = format!(
+        "{ACTIVITY_CURSOR_PREFIX}.{}.{}",
+        URL_SAFE_NO_PAD.encode(payload),
+        sha256_hex(&checked)
+    );
+    if encoded.len() > MAX_ACTIVITY_CURSOR_LENGTH {
+        return Err(Error::Output);
+    }
+    Ok(encoded)
+}
+
+fn decode_activity_cursor(value: &str) -> Result<ActivityCursor> {
+    if value.trim().is_empty()
+        || value.len() > MAX_ACTIVITY_CURSOR_LENGTH
+        || value.chars().any(char::is_control)
+    {
+        return Err(invalid_activity_cursor());
+    }
+    let mut parts = value.split('.');
+    let prefix = parts.next();
+    let payload = parts.next();
+    let checksum = parts.next();
+    if prefix != Some(ACTIVITY_CURSOR_PREFIX)
+        || payload.is_none()
+        || checksum.is_none()
+        || parts.next().is_some()
+    {
+        return Err(invalid_activity_cursor());
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload.unwrap_or_default())
+        .map_err(|_| invalid_activity_cursor())?;
+    let mut checked = Vec::with_capacity(ACTIVITY_CURSOR_DOMAIN.len() + payload.len());
+    checked.extend_from_slice(ACTIVITY_CURSOR_DOMAIN);
+    checked.extend_from_slice(&payload);
+    let expected_checksum = sha256_hex(&checked);
+    if checksum != Some(expected_checksum.as_str()) {
+        return Err(invalid_activity_cursor());
+    }
+    serde_json::from_slice(&payload).map_err(|_| invalid_activity_cursor())
+}
+
+fn validate_activity_cursor(cursor: &ActivityCursor, team_id: &str) -> Result<()> {
+    if cursor.version != ACTIVITY_CURSOR_VERSION
+        || cursor.team_id != team_id
+        || cursor.after_nanos < 0
+        || cursor.after_nanos >= cursor.before_nanos
+        || !(1..=MAX_ACTIVITY_CONVERSATIONS).contains(&cursor.conversation_limit)
+        || !(1..=MAX_ACTIVITY_PER_CONVERSATION).contains(&cursor.per_conversation_limit)
+        || !(1..=MAX_ACTIVITY_MESSAGES).contains(&cursor.limit)
+        || cursor.conversation_ids.is_empty()
+        || cursor.conversation_ids.len() > cursor.conversation_limit
+        || cursor
+            .conversation_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || cursor
+            .conversation_ids
+            .iter()
+            .any(|id| !is_valid_any_conversation_id(id))
+        || !is_valid_timestamp(&cursor.last_key.ts)
+        || !cursor
+            .conversation_ids
+            .contains(&cursor.last_key.conversation_id)
+        || cursor.snapshot_digest.len() != 64
+        || !cursor
+            .snapshot_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(invalid_activity_cursor());
+    }
+    Ok(())
+}
+
+fn invalid_activity_cursor() -> Error {
+    Error::invalid_input("cursor", "is not a valid activity continuation cursor")
+}
+
+fn stale_activity_cursor() -> Error {
+    Error::invalid_input(
+        "cursor",
+        "is stale because the bounded Slack snapshot changed; start a new activity query",
+    )
+}
+
+fn select_activity_conversations(
+    all: ActivityConversationDirectory,
+    include: &[String],
+    exclude: &[String],
+    limit: usize,
+) -> Result<ActivitySelection> {
+    if include.len().saturating_add(exclude.len()) > MAX_ACTIVITY_SELECTORS {
+        return Err(Error::invalid_input(
+            "include",
+            "include and exclude accept at most 50 selectors in total",
+        ));
+    }
+    let include_ids = resolve_activity_selectors(&all.candidates, include, "include")?;
+    let exclude_ids = resolve_activity_selectors(&all.candidates, exclude, "exclude")?;
+    if include_ids.iter().any(|id| exclude_ids.contains(id)) {
+        return Err(Error::invalid_input(
+            "include",
+            "must not select the same conversation as exclude",
+        ));
+    }
+    let mut selected = all
+        .candidates
+        .into_iter()
+        .filter(|candidate| {
+            let conversation = &candidate.conversation;
+            let included = if include_ids.is_empty() {
+                conversation.kind != ConversationKind::Channel || conversation.is_member
+            } else {
+                include_ids.contains(&conversation.id)
+            };
+            included && !exclude_ids.contains(&conversation.id)
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by(compare_activity_conversation_recency);
+    if !include_ids.is_empty() && selected.len() > limit {
+        return Err(Error::invalid_input(
+            "conversation_limit",
+            "is smaller than the number of explicitly included conversations",
+        ));
+    }
+    let selection_truncated = all.scan_truncated || selected.len() > limit;
+    selected.truncate(limit);
+    let mut conversations = selected
+        .into_iter()
+        .map(|candidate| candidate.conversation)
+        .collect::<Vec<_>>();
+    conversations.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(ActivitySelection {
+        conversations,
+        scanned_conversations: all.scanned_conversations,
+        selection_truncated,
+    })
+}
+
+fn compare_activity_conversation_recency(
+    left: &ActivityConversationCandidate,
+    right: &ActivityConversationCandidate,
+) -> Ordering {
+    match (&left.latest_ts, &right.latest_ts) {
+        (Some(left_latest), Some(right_latest)) => {
+            compare_slack_timestamps(right_latest, left_latest)
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+    .then_with(|| left.conversation.id.cmp(&right.conversation.id))
+}
+
+fn resolve_activity_selectors(
+    candidates: &[ActivityConversationCandidate],
+    selectors: &[String],
+    field: &'static str,
+) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for selector in selectors {
+        let needle = validate_activity_selector(field, selector)?;
+        let lowered = needle.to_lowercase();
+        let matches = if is_valid_any_conversation_id(&needle) {
+            candidates
+                .iter()
+                .filter(|candidate| candidate.conversation.id == needle)
+                .collect::<Vec<_>>()
+        } else {
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    let conversation = &candidate.conversation;
+                    conversation.name.to_lowercase() == lowered
+                        || conversation.display_name.to_lowercase() == lowered
+                })
+                .collect::<Vec<_>>()
+        };
+        match matches.as_slice() {
+            [] => {
+                return Err(Error::invalid_input(
+                    field,
+                    "does not match an accessible Slack conversation",
+                ));
+            }
+            [candidate] => {
+                ids.insert(candidate.conversation.id.clone());
+            }
+            _ => {
+                return Err(Error::invalid_input(
+                    field,
+                    "matches more than one Slack conversation; use its ID",
+                ));
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn validate_activity_selector(field: &'static str, selector: &str) -> Result<String> {
+    let selector = selector.trim();
+    let selector = selector
+        .strip_prefix('#')
+        .or_else(|| selector.strip_prefix('@'))
+        .unwrap_or(selector)
+        .trim();
+    if !is_valid_conversation_name(selector) {
+        return Err(Error::invalid_input(
+            field,
+            "must be a Slack conversation ID or a 1 to 128 character exact name",
+        ));
+    }
+    Ok(selector.to_owned())
+}
+
+fn activity_error_status(error: &Error) -> ActivityConversationStatus {
+    match error {
+        Error::Authorization { .. } | Error::NotFound { .. } => {
+            ActivityConversationStatus::Inaccessible
+        }
+        Error::SlackApi { code, .. }
+            if matches!(
+                code.as_str(),
+                "access_denied"
+                    | "channel_is_limited_access"
+                    | "channel_not_found"
+                    | "no_permission"
+                    | "not_in_channel"
+            ) =>
+        {
+            ActivityConversationStatus::Inaccessible
+        }
+        _ => ActivityConversationStatus::Unavailable,
+    }
+}
+
 fn validate_draft_id(draft_id: &str) -> Result<()> {
     if is_valid_draft_id(draft_id) {
         Ok(())
@@ -5539,6 +6490,8 @@ mod tests {
         count_calls: Arc<Mutex<usize>>,
         history: RawMessagePage,
         history_pages: Mutex<VecDeque<RawMessagePage>>,
+        activity_results: Mutex<VecDeque<Result<RawMessagePage>>>,
+        activity_calls: Arc<Mutex<Vec<ActivityCall>>>,
         replies: RawMessagePage,
         reply_pages: Mutex<VecDeque<RawMessagePage>>,
         message_list: RawMessagesList,
@@ -5607,6 +6560,14 @@ mod tests {
     struct HistoryCall {
         channel: String,
         cursor: Option<String>,
+        limit: usize,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ActivityCall {
+        channel: String,
+        oldest: String,
+        latest: String,
         limit: usize,
     }
 
@@ -5732,6 +6693,26 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| self.history.clone()))
+        }
+
+        async fn activity_history(
+            &self,
+            channel: &str,
+            oldest: &str,
+            latest: &str,
+            limit: usize,
+        ) -> Result<RawMessagePage> {
+            self.activity_calls.lock().unwrap().push(ActivityCall {
+                channel: channel.into(),
+                oldest: oldest.into(),
+                latest: latest.into(),
+                limit,
+            });
+            self.activity_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(self.history.clone()))
         }
 
         async fn conversation_replies(
@@ -6308,6 +7289,8 @@ mod tests {
             count_calls: Arc::new(Mutex::new(0)),
             history: RawMessagePage::default(),
             history_pages: Mutex::new(VecDeque::new()),
+            activity_results: Mutex::new(VecDeque::new()),
+            activity_calls: Arc::new(Mutex::new(Vec::new())),
             replies: RawMessagePage::default(),
             reply_pages: Mutex::new(VecDeque::new()),
             message_list: RawMessagesList::default(),
@@ -9665,7 +10648,7 @@ mod tests {
         let api = make_api();
         let history_calls = api.history_calls.clone();
         let mut bounded_service = service(api);
-        bounded_service.inbox_byte_limit = byte_limit;
+        bounded_service.max_response_bytes = byte_limit;
         let report = bounded_service.inbox(3, 1).await.unwrap();
 
         assert_eq!(report.conversations.len(), 1);
@@ -9703,7 +10686,7 @@ mod tests {
         let api = make_api();
         let history_calls = api.history_calls.clone();
         let mut bounded_service = service(api);
-        bounded_service.inbox_byte_limit = boundary_limit;
+        bounded_service.max_response_bytes = boundary_limit;
         let report = bounded_service.inbox(2, 1).await.unwrap();
 
         assert_eq!(report.conversations.len(), 1);
@@ -9721,7 +10704,7 @@ mod tests {
         let conversation_calls = api.conversation_calls.clone();
         let history_calls = api.history_calls.clone();
         let mut bounded_service = service(api);
-        bounded_service.inbox_byte_limit = 1;
+        bounded_service.max_response_bytes = 1;
 
         assert!(matches!(
             bounded_service.inbox(1, 1).await,
@@ -13611,6 +14594,689 @@ mod tests {
                 method: "users.list"
             })
         ));
+    }
+
+    #[test]
+    fn activity_time_parsing_is_exact_and_timezone_independent() {
+        assert_eq!(
+            parse_activity_duration("1d12h30m").unwrap().num_seconds(),
+            131_400
+        );
+        assert!(parse_activity_duration("0h").is_err());
+        assert!(parse_activity_duration("366d").is_err());
+
+        let before_fallback =
+            parse_activity_rfc3339("before", "2026-10-25T02:30:00+01:00").unwrap();
+        let after_fallback = parse_activity_rfc3339("after", "2026-10-25T02:30:00+02:00").unwrap();
+        assert_eq!(before_fallback - after_fallback, 3_600_000_000_000);
+        assert_eq!(
+            format_activity_instant(after_fallback).unwrap(),
+            "2026-10-25T00:30:00Z"
+        );
+
+        let submicro = parse_activity_rfc3339("after", "1970-01-01T00:01:40.000000501Z").unwrap();
+        assert_eq!(
+            activity_slack_bounds(
+                parse_activity_rfc3339("after", "1970-01-01T00:01:40Z").unwrap(),
+                parse_activity_rfc3339("before", "1970-01-01T00:01:42Z").unwrap(),
+            )
+            .unwrap(),
+            Some(("100.000000".into(), "101.999999".into()))
+        );
+        assert_eq!(
+            activity_slack_bounds(
+                submicro,
+                parse_activity_rfc3339("before", "1970-01-01T00:01:42.000000501Z").unwrap(),
+            )
+            .unwrap(),
+            Some(("100.000001".into(), "102.000000".into()))
+        );
+        let maximum = parse_activity_rfc3339("before", "2262-04-11T23:47:16.854775807Z").unwrap();
+        assert_eq!(maximum, i64::MAX);
+        assert_eq!(
+            ceil_activity_microseconds(maximum).unwrap(),
+            i64::MAX / 1_000 + 1
+        );
+        assert!(!timestamp_in_activity_interval(
+            "100.000000",
+            submicro,
+            submicro + 1_000
+        ));
+        assert!(timestamp_in_activity_interval(
+            "100.000001",
+            submicro,
+            submicro + 1_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn activity_selects_useful_defaults_and_preserves_boundaries_replies_and_ties() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![
+                raw_user("U123", "writer", "Writer"),
+                raw_user("U999", "self", "Self"),
+            ],
+            ..RawUsersPage::default()
+        }]));
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                raw_conversation("C001", "joined"),
+                RawConversation {
+                    is_member: false,
+                    ..raw_conversation("C002", "visible")
+                },
+                RawConversation {
+                    id: "D001".into(),
+                    is_im: true,
+                    is_private: true,
+                    is_member: true,
+                    user: Some("U999".into()),
+                    ..RawConversation::default()
+                },
+            ],
+            ..RawConversationsPage::default()
+        }]));
+        api.activity_results = Mutex::new(VecDeque::from([
+            Ok(RawMessagePage {
+                messages: vec![
+                    RawMessage {
+                        thread_ts: Some("100.000000".into()),
+                        ..raw_message("101.000000", "reply")
+                    },
+                    raw_message("100.000000", "after boundary"),
+                    raw_message("102.000000", "before boundary"),
+                    raw_message("99.999999", "too old"),
+                ],
+                has_more: true,
+                ..RawMessagePage::default()
+            }),
+            Ok(RawMessagePage {
+                messages: vec![raw_message("101.000000", "same instant")],
+                ..RawMessagePage::default()
+            }),
+        ]));
+        let activity_calls = Arc::clone(&api.activity_calls);
+        let user_calls = Arc::clone(&api.user_calls);
+        let report = service(api)
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40Z"),
+                before: Some("1970-01-01T00:01:42Z"),
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: Some(10),
+                limit: Some(10),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report
+                .items
+                .iter()
+                .map(|item| (item.conversation_id.as_str(), item.message.ts.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("D001", "101.000000"),
+                ("C001", "101.000000"),
+                ("C001", "100.000000"),
+            ]
+        );
+        assert_eq!(
+            report.items[1].message.thread_ts.as_deref(),
+            Some("100.000000")
+        );
+        assert_eq!(
+            report.conversation_results[0].status,
+            ActivityConversationStatus::MessageLimit
+        );
+        assert_eq!(report.selected_conversations, 2);
+        assert_eq!(
+            activity_calls.lock().unwrap().as_slice(),
+            &[
+                ActivityCall {
+                    channel: "C001".into(),
+                    oldest: "100.000000".into(),
+                    latest: "101.999999".into(),
+                    limit: 10,
+                },
+                ActivityCall {
+                    channel: "D001".into(),
+                    oldest: "100.000000".into(),
+                    latest: "101.999999".into(),
+                    limit: 10,
+                },
+            ]
+        );
+        assert_single_user_directory_call(&user_calls);
+    }
+
+    #[tokio::test]
+    async fn activity_exclusive_upper_bound_cannot_consume_the_history_cap() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage::default()]));
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C001", "joined")],
+            ..RawConversationsPage::default()
+        }]));
+        api.activity_results = Mutex::new(VecDeque::from([Ok(RawMessagePage {
+            // Slack's cap of one applies after the exact request latest. A message at
+            // 102.000000 is not eligible to consume this slot.
+            messages: vec![raw_message("101.999999", "last included microsecond")],
+            has_more: true,
+            ..RawMessagePage::default()
+        })]));
+        let calls = Arc::clone(&api.activity_calls);
+        let report = service(api)
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40Z"),
+                before: Some("1970-01-01T00:01:42Z"),
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: Some(1),
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.items[0].message.ts, "101.999999");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[ActivityCall {
+                channel: "C001".into(),
+                oldest: "100.000000".into(),
+                latest: "101.999999".into(),
+                limit: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_skips_history_when_the_interval_contains_no_slack_microsecond() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage::default()]));
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C001", "joined")],
+            ..RawConversationsPage::default()
+        }]));
+        let calls = Arc::clone(&api.activity_calls);
+        let report = service(api)
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40.000000001Z"),
+                before: Some("1970-01-01T00:01:40.000000999Z"),
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: Some(1),
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(report.items.is_empty());
+        assert_eq!(
+            report.conversation_results[0].status,
+            ActivityConversationStatus::Complete
+        );
+        assert!(!report.partial);
+    }
+
+    #[tokio::test]
+    async fn activity_cursor_resumes_by_key_and_ignores_newer_than_frozen_window() {
+        let conversation_page = RawConversationsPage {
+            channels: vec![raw_conversation("C001", "joined")],
+            ..RawConversationsPage::default()
+        };
+        let first_snapshot = RawMessagePage {
+            messages: vec![
+                raw_message("103.000000", "third"),
+                raw_message("102.000000", "second"),
+                raw_message("101.000000", "first"),
+            ],
+            ..RawMessagePage::default()
+        };
+        let mut second_snapshot = first_snapshot.clone();
+        second_snapshot
+            .messages
+            .insert(0, raw_message("105.000001", "new after frozen before"));
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([
+            RawUsersPage::default(),
+            RawUsersPage::default(),
+        ]));
+        api.conversation_pages = Mutex::new(VecDeque::from([
+            conversation_page.clone(),
+            conversation_page,
+        ]));
+        api.activity_results =
+            Mutex::new(VecDeque::from([Ok(first_snapshot), Ok(second_snapshot)]));
+        let service = service(api);
+        let first = service
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40Z"),
+                before: Some("1970-01-01T00:01:45Z"),
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: Some(10),
+                limit: Some(2),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 2);
+        let cursor = first.next_cursor.clone().unwrap();
+        let second = service
+            .activity(ActivityRequest {
+                since: None,
+                after: None,
+                before: None,
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: None,
+                limit: None,
+                cursor: Some(&cursor),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].message.ts, "101.000000");
+        assert!(!second.has_more);
+
+        let mut tampered = cursor.into_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'a' { b'b' } else { b'a' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert!(matches!(
+            service
+                .activity(ActivityRequest {
+                    since: None,
+                    after: None,
+                    before: None,
+                    include: &[],
+                    exclude: &[],
+                    order: None,
+                    conversation_limit: None,
+                    per_conversation_limit: None,
+                    limit: None,
+                    cursor: Some(&tampered),
+                })
+                .await,
+            Err(Error::InvalidInput {
+                field: "cursor",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn activity_cursor_round_trips_the_maximum_valid_domain() {
+        let conversation_ids = (0..MAX_ACTIVITY_CONVERSATIONS)
+            .map(|index| format!("C{index:02}{}", "A".repeat(61)))
+            .collect::<Vec<_>>();
+        let team_id = format!("T{}", "A".repeat(63));
+        let cursor = ActivityCursor {
+            version: ACTIVITY_CURSOR_VERSION,
+            team_id: team_id.clone(),
+            after_nanos: 0,
+            before_nanos: i64::MAX,
+            order: ActivityOrder::OldestFirst,
+            conversation_ids: conversation_ids.clone(),
+            conversation_limit: MAX_ACTIVITY_CONVERSATIONS,
+            per_conversation_limit: MAX_ACTIVITY_PER_CONVERSATION,
+            limit: MAX_ACTIVITY_MESSAGES,
+            scanned_conversations: usize::MAX,
+            selection_truncated: true,
+            last_key: ActivityKey {
+                ts: format!("{}.{}", "9".repeat(15), "9".repeat(16)),
+                conversation_id: conversation_ids[0].clone(),
+            },
+            snapshot_digest: "a".repeat(64),
+        };
+
+        let encoded = encode_activity_cursor(&cursor).unwrap();
+        assert!(encoded.len() > 2_048);
+        assert!(encoded.len() <= MAX_ACTIVITY_CURSOR_LENGTH);
+        let decoded = decode_activity_cursor(&encoded).unwrap();
+        assert_eq!(decoded, cursor);
+        validate_activity_cursor(&decoded, &team_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_preserves_successes_beside_inaccessible_conversations() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage::default()]));
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![
+                raw_conversation("C001", "available"),
+                raw_conversation("C002", "inaccessible"),
+            ],
+            ..RawConversationsPage::default()
+        }]));
+        api.activity_results = Mutex::new(VecDeque::from([
+            Ok(RawMessagePage {
+                messages: vec![raw_message("101.000000", "kept")],
+                ..RawMessagePage::default()
+            }),
+            Err(Error::SlackApi {
+                method: "conversations.history",
+                code: "not_in_channel".into(),
+            }),
+        ]));
+        let report = service(api)
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40Z"),
+                before: Some("1970-01-01T00:01:42Z"),
+                include: &[],
+                exclude: &[],
+                order: Some(ActivityOrder::OldestFirst),
+                conversation_limit: None,
+                per_conversation_limit: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.items.len(), 1);
+        assert!(report.partial);
+        assert_eq!(
+            report.conversation_results[1].status,
+            ActivityConversationStatus::Inaccessible
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_authentication_failure_is_not_reported_as_partial() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage::default()]));
+        api.conversation_pages = Mutex::new(VecDeque::from([RawConversationsPage {
+            channels: vec![raw_conversation("C001", "joined")],
+            ..RawConversationsPage::default()
+        }]));
+        api.activity_results = Mutex::new(VecDeque::from([Err(Error::Authentication)]));
+        assert!(matches!(
+            service(api)
+                .activity(ActivityRequest {
+                    since: Some("1h"),
+                    after: None,
+                    before: None,
+                    include: &[],
+                    exclude: &[],
+                    order: None,
+                    conversation_limit: None,
+                    per_conversation_limit: None,
+                    limit: None,
+                    cursor: None,
+                })
+                .await,
+            Err(Error::Authentication)
+        ));
+    }
+
+    #[tokio::test]
+    async fn activity_rejects_a_changed_bounded_snapshot_as_stale() {
+        let conversation_page = RawConversationsPage {
+            channels: vec![raw_conversation("C001", "joined")],
+            ..RawConversationsPage::default()
+        };
+        let first_snapshot = RawMessagePage {
+            messages: vec![
+                raw_message("103.000000", "third"),
+                raw_message("102.000000", "second"),
+            ],
+            ..RawMessagePage::default()
+        };
+        let mut changed_snapshot = first_snapshot.clone();
+        changed_snapshot.messages[1].text = "edited".into();
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([
+            RawUsersPage::default(),
+            RawUsersPage::default(),
+        ]));
+        api.conversation_pages = Mutex::new(VecDeque::from([
+            conversation_page.clone(),
+            conversation_page,
+        ]));
+        api.activity_results =
+            Mutex::new(VecDeque::from([Ok(first_snapshot), Ok(changed_snapshot)]));
+        let service = service(api);
+        let first = service
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40Z"),
+                before: Some("1970-01-01T00:01:45Z"),
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: Some(10),
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .activity(ActivityRequest {
+                    since: None,
+                    after: None,
+                    before: None,
+                    include: &[],
+                    exclude: &[],
+                    order: None,
+                    conversation_limit: None,
+                    per_conversation_limit: None,
+                    limit: None,
+                    cursor: first.next_cursor.as_deref(),
+                })
+                .await,
+            Err(Error::InvalidInput {
+                field: "cursor",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn activity_shortens_a_page_at_the_complete_response_byte_limit() {
+        let conversation_page = RawConversationsPage {
+            channels: vec![raw_conversation("C001", "joined")],
+            ..RawConversationsPage::default()
+        };
+        let snapshot = RawMessagePage {
+            messages: vec![
+                raw_message("103.000000", &"x".repeat(500)),
+                raw_message("102.000000", &"y".repeat(500)),
+                raw_message("101.000000", &"z".repeat(500)),
+            ],
+            ..RawMessagePage::default()
+        };
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([
+            RawUsersPage::default(),
+            RawUsersPage::default(),
+        ]));
+        api.conversation_pages = Mutex::new(VecDeque::from([
+            conversation_page.clone(),
+            conversation_page,
+        ]));
+        api.activity_results = Mutex::new(VecDeque::from([Ok(snapshot.clone()), Ok(snapshot)]));
+        let mut service = service(api);
+        let unbounded = service
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40Z"),
+                before: Some("1970-01-01T00:01:45Z"),
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: Some(10),
+                limit: Some(2),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let full_size = serde_json::to_vec_pretty(&unbounded).unwrap().len();
+        let mut one_item = unbounded.clone();
+        one_item.items.pop();
+        one_item.partial = true;
+        one_item.response_byte_limit_reached = true;
+        let one_size = serde_json::to_vec_pretty(&one_item).unwrap().len();
+        assert!(full_size > one_size);
+        service.max_response_bytes = one_size;
+
+        let bounded = service
+            .activity(ActivityRequest {
+                since: None,
+                after: Some("1970-01-01T00:01:40Z"),
+                before: Some("1970-01-01T00:01:45Z"),
+                include: &[],
+                exclude: &[],
+                order: None,
+                conversation_limit: None,
+                per_conversation_limit: Some(10),
+                limit: Some(2),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(bounded.items.len(), 1);
+        assert!(bounded.response_byte_limit_reached);
+        assert!(bounded.partial);
+        assert!(bounded.has_more);
+        assert!(bounded.next_cursor.is_some());
+        assert!(serialized_json_fits(&bounded, one_size));
+    }
+
+    #[test]
+    fn activity_selection_resolves_exact_names_and_rejects_overlap() {
+        let conversations = vec![
+            raw_conversation("C001", "joined"),
+            RawConversation {
+                is_member: false,
+                ..raw_conversation("C002", "visible")
+            },
+        ]
+        .into_iter()
+        .map(|raw| {
+            normalize_conversations(vec![raw], &HashMap::new())
+                .unwrap()
+                .remove(0)
+        })
+        .collect::<Vec<_>>();
+        let all = ActivityConversationDirectory {
+            candidates: conversations
+                .into_iter()
+                .map(|conversation| ActivityConversationCandidate {
+                    conversation,
+                    latest_ts: None,
+                })
+                .collect(),
+            scanned_conversations: 2,
+            scan_truncated: false,
+        };
+        let selected = select_activity_conversations(all, &["visible".into()], &[], 10).unwrap();
+        assert_eq!(selected.conversations[0].id, "C002");
+
+        let all = ActivityConversationDirectory {
+            candidates: selected
+                .conversations
+                .into_iter()
+                .map(|conversation| ActivityConversationCandidate {
+                    conversation,
+                    latest_ts: None,
+                })
+                .collect(),
+            scanned_conversations: 1,
+            scan_truncated: false,
+        };
+        assert!(matches!(
+            select_activity_conversations(all, &["C002".into()], &["visible".into()], 10),
+            Err(Error::InvalidInput {
+                field: "include",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn activity_selection_prefers_slack_latest_metadata_before_id_fallback() {
+        let candidates = (1..=12)
+            .map(|index| {
+                let id = format!("C{index:03}");
+                let conversation = normalize_conversations(
+                    vec![raw_conversation(&id, &format!("channel-{index}"))],
+                    &HashMap::new(),
+                )
+                .unwrap()
+                .remove(0);
+                let latest_ts = match index {
+                    12 => Some("200.000000".into()),
+                    11 => Some("199.000000".into()),
+                    _ => None,
+                };
+                ActivityConversationCandidate {
+                    conversation,
+                    latest_ts,
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected = select_activity_conversations(
+            ActivityConversationDirectory {
+                candidates,
+                scanned_conversations: 12,
+                scan_truncated: false,
+            },
+            &[],
+            &[],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            selected
+                .conversations
+                .iter()
+                .map(|conversation| conversation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C011", "C012"]
+        );
+        assert!(selected.selection_truncated);
+    }
+
+    #[test]
+    fn activity_recency_reads_only_valid_slack_latest_timestamps() {
+        let mut conversation = raw_conversation("C001", "joined");
+        conversation.latest = Some(json!({
+            "ts": "200.000001",
+            "text": "ignored synthetic body"
+        }));
+        assert_eq!(
+            activity_conversation_latest_timestamp(&conversation).as_deref(),
+            Some("200.000001")
+        );
+        conversation.latest = Some(json!("199.000001"));
+        assert_eq!(
+            activity_conversation_latest_timestamp(&conversation).as_deref(),
+            Some("199.000001")
+        );
+        conversation.latest = Some(json!({"ts": "unsafe"}));
+        assert!(activity_conversation_latest_timestamp(&conversation).is_none());
     }
 
     #[tokio::test]

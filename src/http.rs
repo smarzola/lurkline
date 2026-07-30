@@ -257,6 +257,35 @@ impl SlackApi for SlackHttpClient {
         .await
     }
 
+    async fn activity_history(
+        &self,
+        channel: &str,
+        oldest: &str,
+        latest: &str,
+        limit: usize,
+    ) -> Result<RawMessagePage> {
+        self.post_form(
+            "conversations.history",
+            "lurkline-recent-activity",
+            &[
+                ("channel", channel.into()),
+                ("oldest", oldest.into()),
+                ("latest", latest.into()),
+                ("limit", limit.to_string()),
+                ("ignore_replies", "false".into()),
+                ("inclusive", "true".into()),
+                ("include_pin_count", "true".into()),
+                ("no_user_profile", "true".into()),
+                ("include_stories", "true".into()),
+                ("include_free_team_extra_messages", "true".into()),
+                ("include_date_joined", "true".into()),
+                ("include_tombstones", "true".into()),
+                ("cached_latest_updates", "{}".into()),
+            ],
+        )
+        .await
+    }
+
     async fn conversation_replies(
         &self,
         channel: &str,
@@ -1731,6 +1760,25 @@ mod tests {
                 ],
             ),
             (
+                "activity",
+                br#"{"ok":true,"messages":[]}"#.as_slice(),
+                "/api/conversations.history",
+                vec![
+                    "C123",
+                    "oldest",
+                    "100.000000",
+                    "latest",
+                    "200.000001",
+                    "limit",
+                    "20",
+                    "ignore_replies",
+                    "false",
+                    "inclusive",
+                    "true",
+                    "lurkline-recent-activity",
+                ],
+            ),
+            (
                 "replies",
                 br#"{"ok":true,"messages":[]}"#.as_slice(),
                 "/api/conversations.replies",
@@ -1824,6 +1872,12 @@ mod tests {
                         .await
                         .unwrap();
                 }
+                "activity" => {
+                    client
+                        .activity_history("C123", "100.000000", "200.000001", 20)
+                        .await
+                        .unwrap();
+                }
                 "replies" => {
                     client
                         .conversation_replies("C123", "100.000001", Some("replies-cursor"), 20)
@@ -1878,6 +1932,11 @@ mod tests {
                         "timestamps": ["100.000001"]
                     }])
                 );
+            }
+            if case == "activity" {
+                assert_eq!(multipart_text_field(&body, "ignore_replies"), Some("false"));
+                assert_eq!(multipart_text_field(&body, "inclusive"), Some("true"));
+                assert!(multipart_text_field(&body, "cursor").is_none());
             }
         }
     }
