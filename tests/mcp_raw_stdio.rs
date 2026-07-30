@@ -648,6 +648,32 @@ async fn raw_json_rpc_exposes_and_guards_enabled_file_uploads() {
     assert_eq!(upload["annotations"]["destructiveHint"], false);
     assert_eq!(upload["annotations"]["idempotentHint"], false);
     assert_eq!(upload["annotations"]["openWorldHint"], true);
+    let download = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "slack_download_file")
+        .expect("enabled download tool");
+    for property in ["file_id", "path", "max_bytes"] {
+        assert!(
+            download["inputSchema"]["properties"][property].is_object(),
+            "missing download input property {property}"
+        );
+    }
+    let output_schema = serde_json::to_string(&download["outputSchema"]).unwrap();
+    for expected in ["file", "output_path", "bytes_written", "durability_warning"] {
+        assert!(output_schema.contains(expected), "{expected}");
+    }
+    assert_eq!(
+        download["annotations"],
+        json!({
+            "title": "Download private Slack file",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": true
+        })
+    );
     let create_file_draft = tools["result"]["tools"]
         .as_array()
         .unwrap()
@@ -761,6 +787,40 @@ async fn raw_json_rpc_exposes_and_guards_enabled_file_uploads() {
     assert_eq!(
         unsafe_path["result"]["structuredContent"]["error"]["code"],
         "local_file"
+    );
+
+    let unsafe_download = call_tool(
+        &mut stdin,
+        &mut stdout,
+        106,
+        "slack_download_file",
+        json!({
+            "file_id": "F123",
+            "path": "../outside.txt"
+        }),
+    )
+    .await;
+    assert_eq!(unsafe_download["result"]["isError"], true);
+    assert_eq!(
+        unsafe_download["result"]["structuredContent"]["error"]["code"],
+        "local_file"
+    );
+
+    let invalid_download = call_tool(
+        &mut stdin,
+        &mut stdout,
+        107,
+        "slack_download_file",
+        json!({
+            "file_id": "not-a-file",
+            "path": "output"
+        }),
+    )
+    .await;
+    assert_eq!(invalid_download["result"]["isError"], true);
+    assert_eq!(
+        invalid_download["result"]["structuredContent"]["error"]["code"],
+        "invalid_input"
     );
 
     drop(stdin);

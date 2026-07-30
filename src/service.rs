@@ -171,9 +171,11 @@ pub(crate) trait SlackApi: Send + Sync {
     async fn download_private_file(
         &self,
         download_url: &str,
+        expected_size: u64,
+        expected_mimetype: Option<&str>,
         target: &mut BoundedDownload,
     ) -> Result<()> {
-        let _ = (download_url, target);
+        let _ = (download_url, expected_size, expected_mimetype, target);
         Err(Error::InvalidResponse {
             method: "files.download",
         })
@@ -468,6 +470,22 @@ impl SlackService {
         mut target: BoundedDownload,
         output_path: String,
     ) -> Result<FileDownloadReport> {
+        if file.is_external == Some(true)
+            || file.mode.as_deref().is_some_and(|mode| mode != "hosted")
+        {
+            return Err(Error::Unsupported {
+                resource: "non-hosted Slack file downloads",
+            });
+        }
+        if file
+            .file_access
+            .as_deref()
+            .is_some_and(|access| access != "visible")
+        {
+            return Err(Error::Authorization {
+                resource: "the requested Slack file",
+            });
+        }
         let expected_size = file.size.ok_or(Error::NotFound {
             resource: "Slack file size",
         })?;
@@ -481,11 +499,17 @@ impl SlackService {
             resource: "Slack file download",
         })?;
         self.api
-            .download_private_file(download_url, &mut target)
+            .download_private_file(
+                download_url,
+                expected_size,
+                file.mimetype.as_deref(),
+                &mut target,
+            )
             .await?;
         if target.bytes_written() != expected_size {
-            return Err(Error::InvalidResponse {
-                method: "files.download",
+            return Err(Error::FileDownloadSizeMismatch {
+                expected: expected_size,
+                actual: target.bytes_written(),
             });
         }
         let commit = target.commit()?;
@@ -4510,6 +4534,8 @@ mod tests {
         async fn download_private_file(
             &self,
             _download_url: &str,
+            _expected_size: u64,
+            _expected_mimetype: Option<&str>,
             target: &mut BoundedDownload,
         ) -> Result<()> {
             for chunk in self.download_bytes.chunks(2) {
@@ -8798,7 +8824,7 @@ mod tests {
             filetype: Some("text".into()),
             pretty_type: Some("Plain Text".into()),
             mode: Some("hosted".into()),
-            file_access: None,
+            file_access: Some("visible".into()),
             uploader_id: Some("U123".into()),
             size: Some(4),
             created: Some(1),
@@ -8826,6 +8852,24 @@ mod tests {
         assert_eq!(report.bytes_written, 4);
         assert_eq!(std::fs::read(directory.join("output")).unwrap(), b"safe");
 
+        for (path, mode, file_access) in [
+            ("missing-mode", None, Some("visible".into())),
+            ("missing-file-access", Some("hosted".into()), None),
+        ] {
+            let mut legacy = file.clone();
+            legacy.mode = mode;
+            legacy.file_access = file_access;
+            let target = root
+                .prepare_download(std::path::Path::new(path), 10)
+                .unwrap();
+            let report = service(fake_api())
+                .download_file(legacy, target, path.into())
+                .await
+                .unwrap();
+            assert_eq!(report.bytes_written, 4);
+            assert_eq!(std::fs::read(directory.join(path)).unwrap(), b"safe");
+        }
+
         let mut mismatch = fake_api();
         mismatch.download_bytes = b"short".to_vec();
         let target = root
@@ -8835,11 +8879,59 @@ mod tests {
             service(mismatch)
                 .download_file(file.clone(), target, "mismatch".into())
                 .await,
-            Err(Error::InvalidResponse {
-                method: "files.download"
+            Err(Error::FileDownloadSizeMismatch {
+                expected: 4,
+                actual: 5
             })
         ));
         assert!(!directory.join("mismatch").exists());
+
+        let mut unsupported = file.clone();
+        unsupported.mode = Some("external".into());
+        unsupported.is_external = Some(true);
+        let target = root
+            .prepare_download(std::path::Path::new("unsupported"), 10)
+            .unwrap();
+        assert!(matches!(
+            service(fake_api())
+                .download_file(unsupported, target, "unsupported".into())
+                .await,
+            Err(Error::Unsupported {
+                resource: "non-hosted Slack file downloads"
+            })
+        ));
+        assert!(!directory.join("unsupported").exists());
+
+        let mut inaccessible = file.clone();
+        inaccessible.file_access = Some("check_file_info".into());
+        let target = root
+            .prepare_download(std::path::Path::new("inaccessible"), 10)
+            .unwrap();
+        assert!(matches!(
+            service(fake_api())
+                .download_file(inaccessible, target, "inaccessible".into())
+                .await,
+            Err(Error::Authorization {
+                resource: "the requested Slack file"
+            })
+        ));
+        assert!(!directory.join("inaccessible").exists());
+
+        let mut oversized = file.clone();
+        oversized.size = Some(MAX_FILE_DOWNLOAD_BYTES + 1);
+        let target = root
+            .prepare_download(std::path::Path::new("oversized"), 10)
+            .unwrap();
+        assert!(matches!(
+            service(fake_api())
+                .download_file(oversized, target, "oversized".into())
+                .await,
+            Err(Error::InvalidInput {
+                field: "max_bytes",
+                reason: "Slack file is larger than the 1 GiB hard limit"
+            })
+        ));
+        assert!(!directory.join("oversized").exists());
 
         let mut unknown_size = file.clone();
         unknown_size.size = None;

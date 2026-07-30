@@ -456,14 +456,21 @@ success with a durability warning. Local paths are limited to 4,096 bytes, 64
 components, and 255 bytes per component.
 
 Lurkline obtains the download URL from `files.info`; callers can't supply one.
-The response must include both an exact byte size and a private download URL.
-It uses a separate file client. The first validated
+The file must have an exact byte size and private download URL. Explicitly
+external, non-hosted, or inaccessible files fail before local output is
+committed. Legacy file objects that omit `mode` or `file_access` remain
+downloadable when the other trusted metadata and URL checks pass. Lurkline
+uses a separate file client. The first validated
 `https://files.slack.com` request carries the browser token and cookie because
-Slack requires both for private file bytes. A successful response must have the
-observed `application/force-download` media type before any bytes are written.
-Any validated redirect is followed without either credential. Redirects away
-from that exact origin, non-HTTPS URLs, embedded URL credentials, and more than
-three hops fail.
+Slack requires both for private file bytes. A successful body is accepted when
+Slack marks it as an attachment, reports the file's metadata MIME type, or uses
+a generic download MIME type; hosted images and documents therefore keep their
+natural media types. The declared and streamed byte counts must match
+`files.info`. Any validated redirect is followed without either credential.
+Redirects away from that exact origin, non-HTTPS URLs, embedded URL
+credentials, and more than three hops fail. Authentication, authorization,
+unsupported file mode, HTTP status, redirect, response-shape, and size-mismatch
+failures remain distinct so callers can recover without guessing.
 
 List custom emoji and aliases:
 

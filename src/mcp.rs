@@ -383,9 +383,15 @@ fn error_code(error: &Error) -> &'static str {
         Error::FileRootRequired => "file_root_required",
         Error::ConfirmationRequired { .. } => "confirmation_required",
         Error::Authentication => "authentication",
+        Error::Authorization { .. } => "authorization",
+        Error::Unsupported { .. } => "unsupported",
         Error::SlackApi { .. } => "slack_api",
         Error::HttpStatus { .. } => "http_status",
+        Error::UnsafeRedirect { .. } => "unsafe_redirect",
+        Error::RedirectLimit { .. } => "redirect_limit",
         Error::ResponseTooLarge { .. } => "response_too_large",
+        Error::FileDownloadResponse => "file_download_response",
+        Error::FileDownloadSizeMismatch { .. } => "file_download_size_mismatch",
         Error::InvalidResponse { .. } => "invalid_response",
         Error::Timeout { .. } => "timeout",
         Error::Transport { .. } => "transport",
@@ -1557,6 +1563,47 @@ mod tests {
                 server.tool_router.has_route("slack_create_file_draft"),
                 upload_visible
             );
+        }
+    }
+
+    #[test]
+    fn file_download_failures_have_distinct_structured_codes() {
+        for (error, expected) in [
+            (
+                Error::Authorization {
+                    resource: "the requested Slack file",
+                },
+                "authorization",
+            ),
+            (
+                Error::Unsupported {
+                    resource: "non-hosted Slack file downloads",
+                },
+                "unsupported",
+            ),
+            (
+                Error::UnsafeRedirect {
+                    method: "files.download",
+                },
+                "unsafe_redirect",
+            ),
+            (
+                Error::RedirectLimit {
+                    method: "files.download",
+                    limit: 3,
+                },
+                "redirect_limit",
+            ),
+            (Error::FileDownloadResponse, "file_download_response"),
+            (
+                Error::FileDownloadSizeMismatch {
+                    expected: 4,
+                    actual: 5,
+                },
+                "file_download_size_mismatch",
+            ),
+        ] {
+            assert_eq!(error_code(&error), expected);
         }
     }
 
