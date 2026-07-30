@@ -341,12 +341,18 @@ Design decisions:
   activity conversation cap, and make explicit selectors outside the allowed
   kinds fail actionably.
 - Continue through conversation scope with the existing single opaque activity
-  cursor instead of adding a second pagination interface. Give the cursor
-  explicit message and scope phases, and expose which phase the next cursor
+  cursor instead of adding a second pagination interface. Give the cursor a
+  tagged message or scope phase, and expose which phase the next cursor
   represents.
 - Reconstruct the complete bounded eligible scope on continuation and protect
   it with a digest plus offset. Scope drift must fail stale before any history
   read; the cursor must not embed an unbounded list of conversation IDs.
+- Order eligible scope by stable conversation ID and digest only ordered
+  ID/kind eligibility data. Do not let display-name changes or mutable Slack
+  `latest` metadata outside the frozen interval make a valid traversal stale.
+- Treat `--conversations` as a per-call slice bound, including for explicit
+  includes. Canonicalize kinds in enum order and resolved selector IDs in
+  sorted order before cursor creation.
 - Keep each response to at most 50 conversations and one bounded,
   reply-inclusive history request per selected conversation. Expose eligible
   count, scope progress, remaining scope, and hard directory-scan truncation.

@@ -424,12 +424,27 @@ with `--per-conversation`, `--conversations`, and `--limit`; use
 visible unjoined channel; ambiguous, missing, or overlapping selectors fail
 with an actionable error.
 
-Before applying the conversation cap, Lurkline prioritizes eligible
-conversations by the validated `latest` message timestamp included in Slack's
-first-party conversation metadata. Conversations without usable recency
-metadata follow in stable ID order. Structured output reports
-`selection_truncated` whenever the cap or bounded directory scan omitted
-eligible conversations.
+Restrict the eligible scope before the cap with repeatable kinds:
+
+```sh
+lurkline activity --since 6h --kind channel
+lurkline activity --since 6h \
+  --kind direct-message \
+  --kind group-direct-message
+```
+
+Kinds are normalized and deduplicated. They apply before includes, excludes,
+and `--conversations`; a selector that names a disallowed kind fails with an
+actionable error. With no `--kind`, all three current kinds are eligible.
+
+`--conversations` is the maximum conversation slice read by one call, not a
+global scope cap. Eligible conversations use stable ID order so unrelated
+newer Slack activity cannot reshuffle a traversal. Structured output exposes
+the normalized `conversation_kinds`, `eligible_conversations`, zero-based
+`scope_offset`, `selected_conversations`, `remaining_conversations`,
+`scope_has_more`, and `conversation_scan_truncated`. `selection_truncated`
+remains true whenever this response represents only one slice or the bounded
+directory scan itself stopped early.
 
 Activity uses one reply-inclusive, time-bounded history request per selected
 conversation. It never calls a write or mark-read endpoint. Structured output
@@ -443,11 +458,30 @@ Continue only with the returned opaque cursor:
 lurkline activity --cursor '<next-cursor>'
 ```
 
-The cursor freezes the team, effective interval, selected conversation IDs,
-ordering, limits, and last emitted key. Messages newer than the frozen upper
-bound cannot shift later pages. If a message in the bounded Slack sample is
-edited, deleted, or becomes inaccessible, Lurkline rejects the cursor as stale
-instead of silently returning a gap or duplicate.
+`continuation_kind` says whether `next_cursor` advances `messages` within the
+current conversation slice or advances to the next `conversation_scope`
+slice. Human output reports the same distinction as `more messages` or
+`more conversation-scope`. A message continuation always finishes its current
+slice before Lurkline returns the next scope continuation; an empty slice can
+advance immediately.
+
+The cursor freezes the team, effective interval, normalized kinds, resolved
+include/exclude IDs, ordering, limits, and checked scope offset. It protects
+the fully ordered eligible ID/kind scope with a digest and rejects scope drift
+before any history request, without embedding the whole workspace directory.
+Message continuations also protect the current bounded message sample and last
+emitted key. Messages newer than the frozen upper bound cannot shift later
+message pages.
+
+Each scope slice is globally ordered internally. To combine a complete
+multi-slice traversal, collect every `items` array and sort by canonical Slack
+timestamp, then conversation ID: ascending for `oldest_first`, or reverse that
+exact comparator for `newest_first`. Do not concatenate scope responses.
+
+Slack directory discovery remains capped at 20 pages of 200. If
+`conversation_scan_truncated` is true, callers can traverse every eligible
+conversation in the discovered bounded scope, but there is deliberately no
+cursor beyond Slack's unscanned directory remainder.
 
 ## Read messages and users
 
@@ -1044,7 +1078,7 @@ The following table lists primary and auxiliary bounds:
 | Message search | One page of 100 | With `--in`: 20 conversation pages; exact names can also scan 20 user pages |
 | Unreads | Every explicit unread count in the snapshot | One scan of up to 20 conversation pages and, only for matched DMs, one shared scan of up to 20 user pages |
 | Inbox | 50 conversations; one history page of 200 each; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages and one shared scan of up to 20 user pages when DM naming or author resolution needs it |
-| Recent activity | 100 returned messages from one newest-200-message sample for each of up to 50 conversations; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages, one shared scan of up to 20 user pages, and exactly one reply-inclusive history request per selected conversation |
+| Recent activity | 100 returned messages from one newest-200-message sample for each of up to 50 conversations in the current scope slice; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | Per continuation: 20 conversation pages, one shared scan of up to 20 user pages, and exactly one reply-inclusive history request per selected conversation; scope cursors traverse the full bounded eligible directory |
 | Channel history | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Thread replies | One page of 200 | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
 | Exact message | One message | Exact names can scan 20 conversation and 20 user pages; IDs skip discovery |
@@ -1056,10 +1090,10 @@ The following table lists primary and auxiliary bounds:
 | User find | 100 | 20 user pages of 200 |
 
 Slack-provided opaque cursors are limited to 2,048 non-control characters.
-Locally issued activity continuation cursors are limited to 8,192 so the
-maximum 50-conversation snapshot can round-trip. Repeated response cursors fail
-instead of creating pagination loops. Result JSON reports continuation or scan
-truncation when the operation supports it.
+Locally issued activity continuation cursors are limited to 8,192 bytes and
+carry only bounded filters, offsets, and digests. Repeated response cursors
+fail instead of creating pagination loops. Result JSON reports continuation or
+scan truncation when the operation supports it.
 
 ### Configure request controls
 

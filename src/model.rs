@@ -257,9 +257,6 @@ pub(crate) struct RawConversation {
     pub user: Option<String>,
     #[serde(default)]
     pub num_members: Option<u64>,
-    /// First-party responses may include the newest message; activity reads only its timestamp.
-    #[serde(default)]
-    pub latest: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -417,7 +414,9 @@ pub(crate) struct RawUserProfile {
     pub image_72: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationKind {
     Channel,
@@ -769,6 +768,13 @@ pub enum ActivityConversationStatus {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityContinuationKind {
+    Messages,
+    ConversationScope,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct ActivityConversationResult {
     pub conversation: Conversation,
@@ -793,17 +799,28 @@ pub struct ActivityReport {
     /// Canonical UTC upper bound. The interval excludes this instant.
     pub effective_before: String,
     pub order: ActivityOrder,
+    /// Normalized conversation kinds included in the eligible scope.
+    pub conversation_kinds: Vec<ConversationKind>,
     pub items: Vec<ActivityItem>,
     pub conversation_results: Vec<ActivityConversationResult>,
     pub scanned_conversations: usize,
+    pub eligible_conversations: usize,
+    /// Zero-based offset of this response's conversation slice.
+    pub scope_offset: usize,
     pub selected_conversations: usize,
+    pub remaining_conversations: usize,
     pub conversation_limit: usize,
     pub per_conversation_limit: usize,
     pub limit: usize,
+    /// The bounded Slack conversation scan ended before Slack's directory did.
+    pub conversation_scan_truncated: bool,
     pub selection_truncated: bool,
+    pub scope_has_more: bool,
     pub partial: bool,
     pub response_byte_limit_reached: bool,
     pub has_more: bool,
+    /// What the next cursor advances; absent when there is no next cursor.
+    pub continuation_kind: Option<ActivityContinuationKind>,
     pub next_cursor: Option<String>,
 }
 
