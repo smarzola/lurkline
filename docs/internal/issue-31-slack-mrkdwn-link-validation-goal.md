@@ -109,7 +109,7 @@ The goal is complete only when:
 
 ## Milestone
 
-- [ ] Milestone 1: Reject Slack-native labeled links and release `v0.15.1` for
+- [x] Milestone 1: Reject Slack-native labeled links and release `v0.15.1` for
   issue #31.
 
 ### Implementation Shape
@@ -179,4 +179,23 @@ cargo test --locked --test mcp_raw_stdio
   labeled invalid `sfera` self-DM send locally with the documented diagnostic;
   aggregate readback found zero matching messages, so the smoke left no Slack
   residue. External PR, merge, tag, workflow, release, and asset verification
-  remain pending, so the milestone stays unchecked.
+  remained pending at this checkpoint.
+- 2026-08-01: External delivery completed. Ready PR
+  [#32](https://github.com/smarzola/lurkline/pull/32) passed both CI matrices
+  and squash-merged exact reviewed head
+  `ff315a59229aa4f67a8bdb93f209ea5b4d344483` as
+  `59d34d5f2f3a9a3e70ddbe6033d34f208d353107`; its `Closes #31` reference
+  closed the issue. The merge tree exactly matched the audited head tree.
+- 2026-08-01: Annotated tag `v0.15.1` peels to exact merge commit
+  `59d34d5f2f3a9a3e70ddbe6033d34f208d353107`. Release workflow
+  [30701991258](https://github.com/smarzola/lurkline/actions/runs/30701991258)
+  succeeded through tag validation, reusable quality gates, all three native
+  builds, artifact-set validation, and publication. The non-draft,
+  non-prerelease [GitHub Release](https://github.com/smarzola/lurkline/releases/tag/v0.15.1)
+  was published at 2026-08-01T13:41:38Z.
+- 2026-08-01: Independent release readback found exactly the expected Linux
+  x86-64, Linux ARM64, and macOS ARM64 archives plus their three checksum
+  files. Every checksum passed. Each archive contained only its platform
+  directory with executable-mode `lurkline`, `README.md`, and `LICENSE`; file
+  inspection confirmed the advertised architecture, and the native macOS
+  binary reported `lurkline 0.15.1`.
