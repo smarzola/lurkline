@@ -1,4 +1,4 @@
-use std::iter::Peekable;
+use std::{iter::Peekable, ops::Range};
 
 use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 use serde_json::{Map, Value, json};
@@ -107,78 +107,178 @@ pub(crate) fn render_markdown(source: &str) -> Result<RenderedMessage> {
 }
 
 fn validate_slack_native_links(source: &str, options: Options) -> Result<()> {
-    let mut prose_owned = vec![false; source.len()];
+    let mut visible = VisibleMarkdown::default();
     let mut code_block_depth = 0_usize;
+    let mut next_code_owner = 1_usize;
 
     for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(_)) => {
+                visible.push_line_break();
                 code_block_depth = code_block_depth.saturating_add(1);
             }
             Event::End(TagEnd::CodeBlock) => {
                 code_block_depth = code_block_depth.saturating_sub(1);
+                visible.push_line_break();
             }
             Event::Start(Tag::Link {
                 link_type: LinkType::Autolink,
+                dest_url,
                 ..
-            }) if code_block_depth == 0 => prose_owned[range].fill(true),
-            Event::Text(_)
-            | Event::Html(_)
-            | Event::InlineHtml(_)
-            | Event::InlineMath(_)
-            | Event::DisplayMath(_)
+            }) if code_block_depth == 0 && autolink_is_slack_native(&dest_url) => {
+                return Err(Error::invalid_input("markdown", SLACK_LINK_SYNTAX_ERROR));
+            }
+            Event::Text(text)
+            | Event::Html(text)
+            | Event::InlineHtml(text)
+            | Event::InlineMath(text)
+            | Event::DisplayMath(text)
                 if code_block_depth == 0 =>
             {
-                prose_owned[range].fill(true);
+                visible.push_text(&text, None, source, range);
             }
+            Event::Code(text) if code_block_depth == 0 => {
+                visible.push_text(&text, Some(next_code_owner), source, range);
+                next_code_owner = next_code_owner.saturating_add(1);
+            }
+            Event::SoftBreak | Event::HardBreak if code_block_depth == 0 => {
+                visible.push_line_break();
+            }
+            Event::End(end) if code_block_depth == 0 && ends_visible_block(end) => {
+                visible.push_line_break();
+            }
+            Event::Rule if code_block_depth == 0 => visible.push_line_break(),
             _ => {}
         }
     }
 
-    if contains_slack_native_link(source, &prose_owned) {
+    if visible.contains_slack_native_link(source) {
         return Err(Error::invalid_input("markdown", SLACK_LINK_SYNTAX_ERROR));
     }
     Ok(())
 }
 
-fn contains_slack_native_link(source: &str, prose_owned: &[bool]) -> bool {
-    let bytes = source.as_bytes();
-    let mut cursor = 0_usize;
-    while cursor < bytes.len() {
-        let Some(relative_start) = bytes[cursor..].iter().position(|byte| *byte == b'<') else {
-            return false;
-        };
-        let start = cursor + relative_start;
-        cursor = start.saturating_add(1);
+#[derive(Default)]
+struct VisibleMarkdown {
+    bytes: Vec<u8>,
+    code_owners: Vec<Option<usize>>,
+    source_offsets: Vec<Option<usize>>,
+}
 
-        if !prose_owned[start] || opening_delimiter_is_escaped(bytes, start) {
-            continue;
-        }
-        let Some(scheme_length) = slack_http_scheme_length(bytes, start) else {
-            continue;
-        };
-        let destination_start = start + scheme_length;
-        let line_end = bytes[destination_start..]
-            .iter()
-            .position(|byte| matches!(*byte, b'\n' | b'\r'))
-            .map_or(bytes.len(), |relative| destination_start + relative);
-        let Some(end) = (destination_start..line_end)
-            .find(|position| bytes[*position] == b'>' && prose_owned[*position])
-        else {
-            continue;
-        };
-        let Some(pipe) = (destination_start..end)
-            .find(|position| bytes[*position] == b'|' && prose_owned[*position])
-        else {
-            continue;
-        };
-
-        let candidate_url = &source[start + 1..pipe];
-        if is_supported_link(candidate_url) {
-            return true;
+impl VisibleMarkdown {
+    fn push_text(
+        &mut self,
+        text: &str,
+        code_owner: Option<usize>,
+        source: &str,
+        range: Range<usize>,
+    ) {
+        let source_bytes = source.as_bytes();
+        let mut source_cursor = range.start;
+        for byte in text.bytes() {
+            let source_offset = source_bytes[source_cursor..range.end]
+                .iter()
+                .position(|candidate| *candidate == byte)
+                .map(|relative| source_cursor + relative);
+            if let Some(offset) = source_offset {
+                source_cursor = offset.saturating_add(1);
+            }
+            self.bytes.push(byte);
+            self.code_owners.push(code_owner);
+            self.source_offsets.push(source_offset);
         }
     }
-    false
+
+    fn push_line_break(&mut self) {
+        if self.bytes.last() != Some(&b'\n') {
+            self.bytes.push(b'\n');
+            self.code_owners.push(None);
+            self.source_offsets.push(None);
+        }
+    }
+
+    fn contains_slack_native_link(&self, source: &str) -> bool {
+        let mut cursor = 0_usize;
+        while cursor < self.bytes.len() {
+            let Some(relative_start) = self.bytes[cursor..].iter().position(|byte| *byte == b'<')
+            else {
+                return false;
+            };
+            let start = cursor + relative_start;
+            cursor = start.saturating_add(1);
+
+            if self.source_offsets[start]
+                .is_some_and(|offset| opening_delimiter_is_escaped(source.as_bytes(), offset))
+            {
+                continue;
+            }
+            let Some(scheme_length) = slack_http_scheme_length(&self.bytes, start) else {
+                continue;
+            };
+            let destination_start = start + scheme_length;
+            let line_end = self.bytes[destination_start..]
+                .iter()
+                .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                .map_or(self.bytes.len(), |relative| destination_start + relative);
+            let Some(relative_end) = self.bytes[destination_start..line_end]
+                .iter()
+                .position(|byte| *byte == b'>')
+            else {
+                continue;
+            };
+            let end = destination_start + relative_end;
+            let Some(relative_pipe) = self.bytes[destination_start..end]
+                .iter()
+                .position(|byte| *byte == b'|')
+            else {
+                continue;
+            };
+            let pipe = destination_start + relative_pipe;
+            let Ok(candidate_url) = std::str::from_utf8(&self.bytes[start + 1..pipe]) else {
+                continue;
+            };
+            if is_supported_link(candidate_url) && !self.is_one_code_example(start, end) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_one_code_example(&self, start: usize, end: usize) -> bool {
+        self.code_owners[start].is_some_and(|owner| {
+            self.code_owners[start..=end]
+                .iter()
+                .all(|candidate| *candidate == Some(owner))
+        })
+    }
+}
+
+fn autolink_is_slack_native(destination: &str) -> bool {
+    let Some((candidate_url, _)) = destination.split_once('|') else {
+        return false;
+    };
+    http_scheme_length(candidate_url.as_bytes(), 0).is_some() && is_supported_link(candidate_url)
+}
+
+fn ends_visible_block(end: TagEnd) -> bool {
+    matches!(
+        end,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::MetadataBlock(_)
+    )
 }
 
 fn opening_delimiter_is_escaped(bytes: &[u8], start: usize) -> bool {
@@ -193,6 +293,17 @@ fn opening_delimiter_is_escaped(bytes: &[u8], start: usize) -> bool {
 
 fn slack_http_scheme_length(bytes: &[u8], start: usize) -> Option<usize> {
     [b"<https://".as_slice(), b"<http://".as_slice()]
+        .into_iter()
+        .find(|scheme| {
+            bytes
+                .get(start..start.saturating_add(scheme.len()))
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(scheme))
+        })
+        .map(<[u8]>::len)
+}
+
+fn http_scheme_length(bytes: &[u8], start: usize) -> Option<usize> {
+    [b"https://".as_slice(), b"http://".as_slice()]
         .into_iter()
         .find(|scheme| {
             bytes
@@ -1005,6 +1116,9 @@ mod tests {
             "<https://example.com|**Bold** Label>",
             "<https://example.com|Label `code`>",
             "<https://example.com|read [docs](<https://other.example>)>",
+            r#"`<https://example.com`|Label>"#,
+            r#"`<https://example.com|`Label>"#,
+            r#"<https://example.com|Label `>`"#,
         ] {
             assert_eq!(
                 render_markdown(source).unwrap_err().to_string(),
