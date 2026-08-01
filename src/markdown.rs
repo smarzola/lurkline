@@ -1,4 +1,4 @@
-use std::{iter::Peekable, ops::Range};
+use std::iter::Peekable;
 
 use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 use serde_json::{Map, Value, json};
@@ -107,8 +107,7 @@ pub(crate) fn render_markdown(source: &str) -> Result<RenderedMessage> {
 }
 
 fn validate_slack_native_links(source: &str, options: Options) -> Result<()> {
-    let mut prose_ranges = Vec::new();
-    let mut autolink_ranges = Vec::new();
+    let mut prose_owned = vec![false; source.len()];
     let mut code_block_depth = 0_usize;
 
     for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
@@ -122,7 +121,7 @@ fn validate_slack_native_links(source: &str, options: Options) -> Result<()> {
             Event::Start(Tag::Link {
                 link_type: LinkType::Autolink,
                 ..
-            }) if code_block_depth == 0 => autolink_ranges.push(range),
+            }) if code_block_depth == 0 => prose_owned[range].fill(true),
             Event::Text(_)
             | Event::Html(_)
             | Event::InlineHtml(_)
@@ -130,66 +129,45 @@ fn validate_slack_native_links(source: &str, options: Options) -> Result<()> {
             | Event::DisplayMath(_)
                 if code_block_depth == 0 =>
             {
-                prose_ranges.push(range);
+                prose_owned[range].fill(true);
             }
             _ => {}
         }
     }
 
-    merge_adjacent_ranges(&mut prose_ranges);
-    if autolink_ranges
-        .iter()
-        .chain(&prose_ranges)
-        .any(|range| contains_slack_native_link(source, range.clone()))
-    {
+    if contains_slack_native_link(source, &prose_owned) {
         return Err(Error::invalid_input("markdown", SLACK_LINK_SYNTAX_ERROR));
     }
     Ok(())
 }
 
-fn merge_adjacent_ranges(ranges: &mut Vec<Range<usize>>) {
-    ranges.sort_unstable_by_key(|range| range.start);
-    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
-        if let Some(previous) = merged
-            .last_mut()
-            .filter(|previous| range.start <= previous.end)
-        {
-            previous.end = previous.end.max(range.end);
-        } else {
-            merged.push(range);
-        }
-    }
-    *ranges = merged;
-}
-
-fn contains_slack_native_link(source: &str, range: Range<usize>) -> bool {
+fn contains_slack_native_link(source: &str, prose_owned: &[bool]) -> bool {
     let bytes = source.as_bytes();
-    let mut cursor = range.start;
-    while cursor < range.end {
-        let Some(relative_start) = bytes[cursor..range.end]
-            .iter()
-            .position(|byte| *byte == b'<')
-        else {
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() {
+        let Some(relative_start) = bytes[cursor..].iter().position(|byte| *byte == b'<') else {
             return false;
         };
         let start = cursor + relative_start;
         cursor = start.saturating_add(1);
 
-        if opening_delimiter_is_escaped(bytes, start) {
+        if !prose_owned[start] || opening_delimiter_is_escaped(bytes, start) {
             continue;
         }
-        let Some(scheme_length) = slack_http_scheme_length(bytes, start, range.end) else {
+        let Some(scheme_length) = slack_http_scheme_length(bytes, start) else {
             continue;
         };
         let destination_start = start + scheme_length;
-        let Some(relative_end) = bytes[destination_start..range.end]
+        let Some(relative_end) = bytes[destination_start..]
             .iter()
-            .position(|byte| *byte == b'>')
+            .position(|byte| matches!(*byte, b'>' | b'\n' | b'\r'))
         else {
             continue;
         };
         let end = destination_start + relative_end;
+        if bytes[end] != b'>' {
+            continue;
+        }
         let Some(relative_pipe) = bytes[destination_start..end]
             .iter()
             .position(|byte| *byte == b'|')
@@ -219,13 +197,12 @@ fn opening_delimiter_is_escaped(bytes: &[u8], start: usize) -> bool {
         == 1
 }
 
-fn slack_http_scheme_length(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+fn slack_http_scheme_length(bytes: &[u8], start: usize) -> Option<usize> {
     [b"<https://".as_slice(), b"<http://".as_slice()]
         .into_iter()
         .find(|scheme| {
             bytes
                 .get(start..start.saturating_add(scheme.len()))
-                .filter(|_| start.saturating_add(scheme.len()) <= end)
                 .is_some_and(|candidate| candidate.eq_ignore_ascii_case(scheme))
         })
         .map(<[u8]>::len)
@@ -1031,6 +1008,8 @@ mod tests {
             "Before (<http://example.com/path|a label>), after.",
             "First <https://example.com/one|one>; second <https://example.com/two|two>.",
             "[<https://example.com/nested|nested>](https://example.com/outer)",
+            "<https://example.com|**Bold** Label>",
+            "<https://example.com|Label `code`>",
         ] {
             assert_eq!(
                 render_markdown(source).unwrap_err().to_string(),
@@ -1075,12 +1054,15 @@ mod tests {
 
     #[test]
     fn markdown_keeps_standard_links_and_plain_autolinks_unchanged() {
-        let standard = render_markdown(
-            "[standard](https://example.com/path|value) and <https://example.com/plain>",
-        )
+        let standard = render_markdown(concat!(
+            "[standard](https://example.com/path|value) and ",
+            "[angled](<https://example.com/angled|value>) and ",
+            "<https://example.com/plain>",
+        ))
         .unwrap();
         let encoded = serde_json::to_string(&standard.blocks).unwrap();
         assert!(encoded.contains("\"url\":\"https://example.com/path|value\""));
+        assert!(encoded.contains("\"url\":\"https://example.com/angled|value\""));
         assert!(encoded.contains("\"url\":\"https://example.com/plain\""));
 
         let encoded_pipe = render_markdown("<https://example.com/path%7Cvalue>").unwrap();
