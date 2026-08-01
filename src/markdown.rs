@@ -158,26 +158,20 @@ fn contains_slack_native_link(source: &str, prose_owned: &[bool]) -> bool {
             continue;
         };
         let destination_start = start + scheme_length;
-        let Some(relative_end) = bytes[destination_start..]
+        let line_end = bytes[destination_start..]
             .iter()
-            .position(|byte| matches!(*byte, b'>' | b'\n' | b'\r'))
+            .position(|byte| matches!(*byte, b'\n' | b'\r'))
+            .map_or(bytes.len(), |relative| destination_start + relative);
+        let Some(end) = (destination_start..line_end)
+            .find(|position| bytes[*position] == b'>' && prose_owned[*position])
         else {
             continue;
         };
-        let end = destination_start + relative_end;
-        if bytes[end] != b'>' {
-            continue;
-        }
-        let Some(relative_pipe) = bytes[destination_start..end]
-            .iter()
-            .position(|byte| *byte == b'|')
+        let Some(pipe) = (destination_start..end)
+            .find(|position| bytes[*position] == b'|' && prose_owned[*position])
         else {
             continue;
         };
-        let pipe = destination_start + relative_pipe;
-        if pipe == destination_start {
-            continue;
-        }
 
         let candidate_url = &source[start + 1..pipe];
         if is_supported_link(candidate_url) {
@@ -1010,6 +1004,7 @@ mod tests {
             "[<https://example.com/nested|nested>](https://example.com/outer)",
             "<https://example.com|**Bold** Label>",
             "<https://example.com|Label `code`>",
+            "<https://example.com|read [docs](<https://other.example>)>",
         ] {
             assert_eq!(
                 render_markdown(source).unwrap_err().to_string(),
@@ -1067,6 +1062,15 @@ mod tests {
 
         let encoded_pipe = render_markdown("<https://example.com/path%7Cvalue>").unwrap();
         assert_eq!(encoded_pipe.text, "https://example.com/path%7Cvalue");
+
+        let incomplete =
+            render_markdown("<https://example.com|unfinished [docs](<https://other.example>)")
+                .unwrap();
+        assert!(
+            incomplete
+                .text
+                .starts_with("<https://example.com|unfinished")
+        );
     }
 
     #[test]
