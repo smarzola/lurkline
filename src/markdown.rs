@@ -1,6 +1,6 @@
-use std::iter::Peekable;
+use std::{iter::Peekable, ops::Range};
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 use serde_json::{Map, Value, json};
 use url::Url;
 
@@ -14,6 +14,8 @@ const MAX_RENDERED_BYTES: usize = 100_000;
 const MAX_RICH_ELEMENTS: usize = 1_000;
 const MAX_LIST_DEPTH: usize = 8;
 const MAX_PARSE_DEPTH: usize = 64;
+const SLACK_LINK_SYNTAX_ERROR: &str =
+    "Slack-native <URL|label> link syntax is unsupported; use standard Markdown: [label](URL)";
 
 type Events<'a> = Peekable<Parser<'a>>;
 
@@ -54,6 +56,7 @@ struct Inline {
 pub(crate) fn render_markdown(source: &str) -> Result<RenderedMessage> {
     validate_source(source)?;
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    validate_slack_native_links(source, options)?;
     validate_parse_depth(source, options)?;
     let mut events = Parser::new_ext(source, options).peekable();
     let parsed = parse_blocks(&mut events, None);
@@ -101,6 +104,213 @@ pub(crate) fn render_markdown(source: &str) -> Result<RenderedMessage> {
     }
 
     Ok(RenderedMessage { text, blocks })
+}
+
+fn validate_slack_native_links(source: &str, options: Options) -> Result<()> {
+    let mut visible = VisibleMarkdown::default();
+    let mut code_block_depth = 0_usize;
+    let mut next_code_owner = 1_usize;
+
+    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                visible.push_line_break();
+                code_block_depth = code_block_depth.saturating_add(1);
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                code_block_depth = code_block_depth.saturating_sub(1);
+                visible.push_line_break();
+            }
+            Event::Start(Tag::Link {
+                link_type: LinkType::Autolink,
+                dest_url,
+                ..
+            }) if code_block_depth == 0 && autolink_is_slack_native(&dest_url) => {
+                return Err(Error::invalid_input("markdown", SLACK_LINK_SYNTAX_ERROR));
+            }
+            Event::Text(text)
+            | Event::Html(text)
+            | Event::InlineHtml(text)
+            | Event::InlineMath(text)
+            | Event::DisplayMath(text)
+                if code_block_depth == 0 =>
+            {
+                visible.push_text(&text, None, source, range);
+            }
+            Event::Code(text) if code_block_depth == 0 => {
+                visible.push_text(&text, Some(next_code_owner), source, range);
+                next_code_owner = next_code_owner.saturating_add(1);
+            }
+            Event::SoftBreak | Event::HardBreak if code_block_depth == 0 => {
+                visible.push_line_break();
+            }
+            Event::End(end) if code_block_depth == 0 && ends_visible_block(end) => {
+                visible.push_line_break();
+            }
+            Event::Rule if code_block_depth == 0 => visible.push_line_break(),
+            _ => {}
+        }
+    }
+
+    if visible.contains_slack_native_link(source) {
+        return Err(Error::invalid_input("markdown", SLACK_LINK_SYNTAX_ERROR));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct VisibleMarkdown {
+    bytes: Vec<u8>,
+    code_owners: Vec<Option<usize>>,
+    source_offsets: Vec<Option<usize>>,
+}
+
+impl VisibleMarkdown {
+    fn push_text(
+        &mut self,
+        text: &str,
+        code_owner: Option<usize>,
+        source: &str,
+        range: Range<usize>,
+    ) {
+        let source_bytes = source.as_bytes();
+        let mut source_cursor = range.start;
+        for byte in text.bytes() {
+            let source_offset = source_bytes[source_cursor..range.end]
+                .iter()
+                .position(|candidate| *candidate == byte)
+                .map(|relative| source_cursor + relative);
+            if let Some(offset) = source_offset {
+                source_cursor = offset.saturating_add(1);
+            }
+            self.bytes.push(byte);
+            self.code_owners.push(code_owner);
+            self.source_offsets.push(source_offset);
+        }
+    }
+
+    fn push_line_break(&mut self) {
+        if self.bytes.last() != Some(&b'\n') {
+            self.bytes.push(b'\n');
+            self.code_owners.push(None);
+            self.source_offsets.push(None);
+        }
+    }
+
+    fn contains_slack_native_link(&self, source: &str) -> bool {
+        let mut cursor = 0_usize;
+        while cursor < self.bytes.len() {
+            let Some(relative_start) = self.bytes[cursor..].iter().position(|byte| *byte == b'<')
+            else {
+                return false;
+            };
+            let start = cursor + relative_start;
+            cursor = start.saturating_add(1);
+
+            if self.source_offsets[start]
+                .is_some_and(|offset| opening_delimiter_is_escaped(source.as_bytes(), offset))
+            {
+                continue;
+            }
+            let Some(scheme_length) = slack_http_scheme_length(&self.bytes, start) else {
+                continue;
+            };
+            let destination_start = start + scheme_length;
+            let line_end = self.bytes[destination_start..]
+                .iter()
+                .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                .map_or(self.bytes.len(), |relative| destination_start + relative);
+            let Some(relative_end) = self.bytes[destination_start..line_end]
+                .iter()
+                .position(|byte| *byte == b'>')
+            else {
+                continue;
+            };
+            let end = destination_start + relative_end;
+            let Some(relative_pipe) = self.bytes[destination_start..end]
+                .iter()
+                .position(|byte| *byte == b'|')
+            else {
+                continue;
+            };
+            let pipe = destination_start + relative_pipe;
+            let Ok(candidate_url) = std::str::from_utf8(&self.bytes[start + 1..pipe]) else {
+                continue;
+            };
+            if is_supported_link(candidate_url) && !self.is_one_code_example(start, end) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_one_code_example(&self, start: usize, end: usize) -> bool {
+        self.code_owners[start].is_some_and(|owner| {
+            self.code_owners[start..=end]
+                .iter()
+                .all(|candidate| *candidate == Some(owner))
+        })
+    }
+}
+
+fn autolink_is_slack_native(destination: &str) -> bool {
+    let Some((candidate_url, _)) = destination.split_once('|') else {
+        return false;
+    };
+    http_scheme_length(candidate_url.as_bytes(), 0).is_some() && is_supported_link(candidate_url)
+}
+
+fn ends_visible_block(end: TagEnd) -> bool {
+    matches!(
+        end,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::MetadataBlock(_)
+    )
+}
+
+fn opening_delimiter_is_escaped(bytes: &[u8], start: usize) -> bool {
+    bytes[..start]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn slack_http_scheme_length(bytes: &[u8], start: usize) -> Option<usize> {
+    [b"<https://".as_slice(), b"<http://".as_slice()]
+        .into_iter()
+        .find(|scheme| {
+            bytes
+                .get(start..start.saturating_add(scheme.len()))
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(scheme))
+        })
+        .map(<[u8]>::len)
+}
+
+fn http_scheme_length(bytes: &[u8], start: usize) -> Option<usize> {
+    [b"https://".as_slice(), b"http://".as_slice()]
+        .into_iter()
+        .find(|scheme| {
+            bytes
+                .get(start..start.saturating_add(scheme.len()))
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(scheme))
+        })
+        .map(<[u8]>::len)
 }
 
 fn validate_parse_depth(source: &str, options: Options) -> Result<()> {
@@ -893,6 +1103,88 @@ mod tests {
         let encoded = serde_json::to_string(&rendered.blocks).unwrap();
         assert!(encoded.contains("<b>not interpreted</b>"));
         assert!(!encoded.contains("\"type\":\"link\""));
+    }
+
+    #[test]
+    fn markdown_rejects_slack_native_labeled_links_in_prose() {
+        for source in [
+            "<https://example.com/one|One Label>",
+            "<https://example.com/two|Two>",
+            "Before (<http://example.com/path|a label>), after.",
+            "First <https://example.com/one|one>; second <https://example.com/two|two>.",
+            "[<https://example.com/nested|nested>](https://example.com/outer)",
+            "<https://example.com|**Bold** Label>",
+            "<https://example.com|Label `code`>",
+            "<https://example.com|read [docs](<https://other.example>)>",
+            r#"`<https://example.com`|Label>"#,
+            r#"`<https://example.com|`Label>"#,
+            r#"<https://example.com|Label `>`"#,
+        ] {
+            assert_eq!(
+                render_markdown(source).unwrap_err().to_string(),
+                format!("invalid markdown: {SLACK_LINK_SYNTAX_ERROR}"),
+                "accepted unsupported source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_preserves_escaped_and_code_slack_link_examples() {
+        for source in [
+            r"\<https://example.com/escaped|Label>",
+            r"\\\<https://example.com/escaped|Label>",
+            r"`<https://example.com/inline|Label>`",
+            "```text\n<https://example.com/fenced|Label>\n```",
+            "    <https://example.com/indented|Label>\n",
+        ] {
+            let rendered = render_markdown(source).unwrap();
+            assert!(
+                rendered.text.contains("<https://example.com"),
+                "example was not preserved: {source}"
+            );
+        }
+
+        for source in [
+            r"\\<https://example.com/unescaped|Label>",
+            r"\\\\<https://example.com/unescaped|Label>",
+        ] {
+            assert!(
+                matches!(
+                    render_markdown(source),
+                    Err(Error::InvalidInput {
+                        field: "markdown",
+                        reason: SLACK_LINK_SYNTAX_ERROR,
+                    })
+                ),
+                "even escape parity hid unsupported source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_keeps_standard_links_and_plain_autolinks_unchanged() {
+        let standard = render_markdown(concat!(
+            "[standard](https://example.com/path|value) and ",
+            "[angled](<https://example.com/angled|value>) and ",
+            "<https://example.com/plain>",
+        ))
+        .unwrap();
+        let encoded = serde_json::to_string(&standard.blocks).unwrap();
+        assert!(encoded.contains("\"url\":\"https://example.com/path|value\""));
+        assert!(encoded.contains("\"url\":\"https://example.com/angled|value\""));
+        assert!(encoded.contains("\"url\":\"https://example.com/plain\""));
+
+        let encoded_pipe = render_markdown("<https://example.com/path%7Cvalue>").unwrap();
+        assert_eq!(encoded_pipe.text, "https://example.com/path%7Cvalue");
+
+        let incomplete =
+            render_markdown("<https://example.com|unfinished [docs](<https://other.example>)")
+                .unwrap();
+        assert!(
+            incomplete
+                .text
+                .starts_with("<https://example.com|unfinished")
+        );
     }
 
     #[test]

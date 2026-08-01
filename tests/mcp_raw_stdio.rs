@@ -380,6 +380,36 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
+            "id": 20031,
+            "method": "tools/call",
+            "params": {
+                "name": "slack_render_markdown",
+                "arguments": {
+                    "markdown": "Use <https://example.com/runbook|the runbook>."
+                }
+            }
+        }),
+    )
+    .await;
+    let slack_link = response_with_id(&mut stdout, 20031).await;
+    assert_eq!(slack_link["result"]["isError"], true);
+    assert_eq!(
+        slack_link["result"]["structuredContent"],
+        json!({
+            "error": {
+                "code": "invalid_input",
+                "message": concat!(
+                    "invalid markdown: Slack-native <URL|label> link syntax is unsupported; ",
+                    "use standard Markdown: [label](URL)"
+                )
+            }
+        })
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
             "id": 23,
             "method": "tools/call",
             "params": {

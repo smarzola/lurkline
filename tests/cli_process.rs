@@ -361,6 +361,20 @@ fn markdown_render_is_local_bounded_and_emits_stable_rich_text() {
         String::from_utf8(nested.stderr).unwrap(),
         "error: invalid markdown: nesting exceeds 64 levels\n"
     );
+
+    let slack_link = run_with_stdin(
+        &["message", "render"],
+        b"Use <https://example.com/runbook|the runbook>.",
+    );
+    assert_eq!(slack_link.status.code(), Some(1));
+    assert!(slack_link.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(slack_link.stderr).unwrap(),
+        concat!(
+            "error: invalid markdown: Slack-native <URL|label> link syntax is unsupported; ",
+            "use standard Markdown: [label](URL)\n"
+        )
+    );
 }
 
 #[test]

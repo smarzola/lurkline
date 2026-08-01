@@ -8618,7 +8618,9 @@ mod tests {
     async fn drafts_write_gate_validation_and_confirmation_fail_before_network_io() {
         let api = fake_api();
         let calls = api.draft_calls.clone();
+        let upload_calls = api.upload_calls.clone();
         let service = service(api);
+        let fixture = UploadFixture::new(b"synthetic");
 
         assert!(service.list_drafts(None, 0).await.is_err());
         assert!(service.list_drafts(Some("."), 25).await.is_err());
@@ -8641,6 +8643,42 @@ mod tests {
                 .await
                 .is_err()
         );
+        for result in [
+            service
+                .create_draft("C123", None, false, "<https://example.com/draft|Draft>")
+                .await,
+            service
+                .update_draft("DR-valid", "<https://example.com/draft|Updated draft>")
+                .await,
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidInput {
+                    field: "markdown",
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            service
+                .create_file_draft(
+                    FileDraftCreateRequest {
+                        conversation: "C123",
+                        thread_ts: None,
+                        broadcast: false,
+                        markdown: "<https://example.com/file|File draft>",
+                        title: None,
+                        alt_text: Some("Synthetic test file"),
+                        confirmed: true,
+                    },
+                    fixture.source(),
+                )
+                .await,
+            Err(Error::InvalidInput {
+                field: "markdown",
+                ..
+            })
+        ));
         assert!(matches!(
             service.delete_draft("DR-valid", false).await,
             Err(Error::ConfirmationRequired {
@@ -8648,6 +8686,7 @@ mod tests {
             })
         ));
         assert!(calls.lock().unwrap().is_empty());
+        assert!(upload_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -9762,6 +9801,23 @@ mod tests {
                 ..
             })
         ));
+        for (thread_ts, broadcast) in [(None, false), (Some("6000.000001"), true)] {
+            assert!(matches!(
+                service
+                    .send_message(
+                        "C123",
+                        thread_ts,
+                        broadcast,
+                        "<https://example.com/write|Unsupported write>",
+                        true,
+                    )
+                    .await,
+                Err(Error::InvalidInput {
+                    field: "markdown",
+                    ..
+                })
+            ));
+        }
 
         let calls = post_calls.lock().unwrap();
         assert_eq!(calls.len(), 2);

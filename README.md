@@ -773,6 +773,12 @@ The renderer supports the following Markdown:
 | Headings | Bold rich-text sections |
 | Raw HTML | Literal text |
 
+Write labeled links as standard Markdown, for example
+`[the runbook](https://example.com)`. Slack-native `<URL|label>` syntax in
+prose is rejected with that recovery guidance before any Slack request. The
+same text remains available for documentation inside inline, fenced, or
+indented code.
+
 Empty input, control characters, excessive nesting, and over-limit input fail
 before a Slack request.
 

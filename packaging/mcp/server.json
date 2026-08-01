@@ -1,6 +1,6 @@
 {
   "name": "lurkline",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "transport": {
     "type": "stdio",
     "command": "lurkline",
