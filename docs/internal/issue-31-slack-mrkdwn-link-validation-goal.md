@@ -164,3 +164,19 @@ cargo test --locked --test mcp_raw_stdio
 - 2026-08-01: Goal established from exact `origin/main` at
   `bd7a0570a9f10ee06124fbdfe4d85e92b7356557`. Issue #31 is the sole open
   issue and therefore the highest-priority delivery.
+- 2026-08-01: Local release candidate completed at
+  `05f56c4f61924464ea0f84815f39e1058fdd1ef2`. Parsed visible-projection
+  validation rejects prose and partial-inline-code constructions while
+  preserving whole code examples, escapes, standard destinations, and
+  ordinary autolinks. Retained review repaired one range-merge bypass, one
+  destination false positive, and one partial-code bypass before declaring
+  the whole milestone clean. A separate context-independent final audit was
+  also clean.
+- 2026-08-01: Final local gates passed: formatter, strict locked all-target
+  Clippy, 287 library tests, 12 CLI-process tests, 2 raw-MCP tests, 1 package
+  metadata test, release build, Rust 1.88 all-target check, credential scan,
+  and native package checksum smoke. The release binary rejected a uniquely
+  labeled invalid `sfera` self-DM send locally with the documented diagnostic;
+  aggregate readback found zero matching messages, so the smoke left no Slack
+  residue. External PR, merge, tag, workflow, release, and asset verification
+  remain pending, so the milestone stays unchecked.
