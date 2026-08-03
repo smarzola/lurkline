@@ -146,8 +146,8 @@ The goal is complete only when:
 
 ## Milestone
 
-- [ ] Milestone 1: Publish explicit outbound user mentions and release
-  `v0.16.0` for #34.
+- [x] Milestone 1: Complete the local explicit outbound user mention candidate
+  for `v0.16.0` and #34.
 
 Acceptance criteria are success criteria 1 through 6. Likely touchpoints are
 `src/markdown.rs`, `src/model.rs`, `src/service.rs`, `src/cli.rs`, `src/mcp.rs`,
@@ -164,6 +164,35 @@ cargo test --locked mcp::tests
 cargo test --locked --test cli_process
 cargo test --locked --test mcp_raw_stdio
 ```
+
+### Local Completion Evidence
+
+- Goal commit `0592e58bc501606f20e18f30ccb8d33d5c3d6ea7`, implementation
+  commit `5c953ca08cd54b12845f9bd60654e2f2b624c954`, and audit-repair
+  commit `314310fb31a895ce0b615b50c2d47541a6bda8d6` form the exact local
+  candidate.
+- The retained adversarial reviewer completed one finding-and-repair round,
+  then returned clean. A fresh context-independent auditor completed a
+  separate finding-and-repair round, then returned clean on the audit repair.
+- Exact-candidate gates passed: format, strict locked all-target Clippy, 297
+  library tests, 13 CLI process tests, two raw MCP tests, one metadata test,
+  locked release build, Rust 1.88 all-target check, credential scan, version
+  readback, and diff/status checks.
+- Two independently generated native packages were byte-identical with
+  identical checksum files. The checksum, epoch timestamps, exact versioned
+  directory and three-file layout, `0755` binary mode, `0644` documentation
+  modes, ARM64 Mach-O architecture, linker signature, and packaged `0.16.0`
+  version readback all passed; both temporary package directories were removed.
+- Read-only signed-in CLI and MCP renders on the exact candidate each produced
+  one ordered username-resolution proof, one structured Slack user element,
+  and the literal fallback label. No Slack write was made by the exact-head
+  rerun. Earlier publication-path smoke created exactly one minimal synthetic
+  root message in the verified current-user self-DM; exact readback proved the
+  destination, content, root placement, blocks, one structured self mention,
+  complete mention resolution, and absence of files or attachments. That one
+  self-DM message is the only unavoidable Slack residue.
+- Pull-request, merge, tag, workflow, release-asset, and final queue evidence
+  remain delivery checkpoints and are not claimed by this local milestone.
 
 ### Checkpoint And Delivery Protocol
 
