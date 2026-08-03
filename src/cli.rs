@@ -17,7 +17,7 @@ use crate::{
         prepare_cli_download, prepare_cli_upload, validate_cli_download_path,
         validate_cli_upload_path,
     },
-    markdown::{MAX_MARKDOWN_BYTES, render_markdown},
+    markdown::{MAX_MARKDOWN_BYTES, outbound_mention_references, render_markdown},
     mcp,
     model::{
         ActivityContinuationKind, ActivityConversationStatus, ActivityOrder, ActivityReport,
@@ -26,8 +26,9 @@ use crate::{
         CustomEmojiKind, CustomEmojiList, DoctorReport, Draft, DraftDeleteReport, DraftPage,
         DraftSendReport, FileDownloadReport, FileDraftAssociation, FileDraftCreateReport,
         FileReference, FileUploadReport, InboxReport, InboxTruncationReason, Message, MessagePage,
-        MessageSearchPage, ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage,
-        UnreadConversation, UnreadReport, UserSearchReport, UserSearchTruncationReason,
+        MessageSearchPage, OutboundMentionResolution, ReactionMutationReport, RenderedMessage,
+        SentMessage, ThreadPage, UnreadConversation, UnreadReport, UserSearchReport,
+        UserSearchTruncationReason,
     },
     service::{
         ActivityRequest, DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES,
@@ -391,9 +392,9 @@ pub enum MessageCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Render bounded Markdown from standard input as Slack rich text.
+    /// Render bounded Markdown from standard input; explicit slack-user links resolve users.
     Render {
-        /// Emit the plain-text fallback and Slack blocks as stable JSON.
+        /// Emit the fallback, Slack blocks, and explicit mention proof as stable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -581,7 +582,19 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
         Command::Auth { command } => run_auth(command, cli.profile.as_deref()).await,
         Command::Message {
             command: MessageCommand::Render { json },
-        } => print_rendered(render_markdown(&read_markdown_stdin()?)?, json),
+        } => {
+            let markdown = read_markdown_stdin()?;
+            let rendered = if outbound_mention_references(&markdown)?.is_empty() {
+                render_markdown(&markdown)?
+            } else {
+                let config = resolve_config(cli.profile.as_deref())?;
+                let client = SlackHttpClient::new(config)?;
+                SlackService::new(client.clone(), client.config())
+                    .render_markdown(&markdown)
+                    .await?
+            };
+            print_rendered(rendered, json)
+        }
         command => run_slack_command(command, cli.profile.as_deref()).await,
     }
 }
@@ -862,7 +875,9 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                 &file_name,
             )?;
             let markdown = read_markdown_stdin()?;
-            render_markdown(&markdown)?;
+            if outbound_mention_references(&markdown)?.is_empty() {
+                render_markdown(&markdown)?;
+            }
             let source = prepare_cli_upload(&path, max_bytes)?;
             print_file_draft_create(
                 service
@@ -1213,6 +1228,19 @@ fn print_rendered(rendered: RenderedMessage, json: bool) -> Result<()> {
         print_json(&rendered)
     } else {
         println!("{}", rendered.text);
+        for mention in rendered.outbound_mentions {
+            println!(
+                "mention\t{}\t{}\t{}\t{}",
+                escape_human(&mention.label),
+                escape_human(&mention.reference),
+                escape_human(&mention.user_id),
+                match mention.resolution {
+                    OutboundMentionResolution::UserId => "user_id",
+                    OutboundMentionResolution::Username => "username",
+                    OutboundMentionResolution::DisplayName => "display_name",
+                }
+            );
+        }
         Ok(())
     }
 }

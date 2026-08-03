@@ -1,4 +1,8 @@
-use std::{iter::Peekable, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    iter::Peekable,
+    ops::Range,
+};
 
 use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 use serde_json::{Map, Value, json};
@@ -6,7 +10,7 @@ use url::Url;
 
 use crate::{
     error::{Error, Result},
-    model::RenderedMessage,
+    model::{OutboundMention, OutboundMentionResolution, RenderedMessage},
 };
 
 pub(crate) const MAX_MARKDOWN_BYTES: usize = 40_000;
@@ -14,6 +18,9 @@ const MAX_RENDERED_BYTES: usize = 100_000;
 const MAX_RICH_ELEMENTS: usize = 1_000;
 const MAX_LIST_DEPTH: usize = 8;
 const MAX_PARSE_DEPTH: usize = 64;
+const MAX_OUTBOUND_MENTIONS: usize = 256;
+const OUTBOUND_MENTION_PREFIX: &str = "slack-user:";
+const RESOLVED_USER_PREFIX: &str = "lurkline-resolved-user:";
 const SLACK_LINK_SYNTAX_ERROR: &str =
     "Slack-native <URL|label> link syntax is unsupported; use standard Markdown: [label](URL)";
 
@@ -53,13 +60,76 @@ struct Inline {
     link: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedOutboundUser {
+    pub(crate) reference: String,
+    pub(crate) user_id: String,
+    pub(crate) resolution: OutboundMentionResolution,
+}
+
 pub(crate) fn render_markdown(source: &str) -> Result<RenderedMessage> {
+    render_markdown_with_mentions(source, &[])
+}
+
+pub(crate) fn outbound_mention_references(source: &str) -> Result<Vec<String>> {
+    let mut parsed = parse_markdown(source)?;
+    let mut references = Vec::new();
+    let mut seen = HashSet::new();
+    let mut occurrences = 0_usize;
+    collect_outbound_mention_references(&parsed, &mut references, &mut seen, &mut occurrences)?;
+    let placeholders = references
+        .iter()
+        .map(|reference| ResolvedOutboundUser {
+            reference: reference.clone(),
+            // Use the longest supported identifier so the credential-free
+            // preflight cannot underestimate the rendered block size.
+            user_id: "U".repeat(64),
+            resolution: OutboundMentionResolution::UserId,
+        })
+        .collect::<Vec<_>>();
+    let resolved_by_reference = placeholders
+        .iter()
+        .map(|resolved| (resolved.reference.as_str(), resolved))
+        .collect::<HashMap<_, _>>();
+    let mut proof = Vec::new();
+    resolve_outbound_mentions(&mut parsed, &resolved_by_reference, &mut proof)?;
+    render_parsed_markdown(parsed, proof)?;
+    Ok(references)
+}
+
+pub(crate) fn render_markdown_with_mentions(
+    source: &str,
+    resolved_users: &[ResolvedOutboundUser],
+) -> Result<RenderedMessage> {
+    let mut parsed = parse_markdown(source)?;
+    let mut resolved_by_reference = HashMap::new();
+    for resolved in resolved_users {
+        if resolved_by_reference
+            .insert(resolved.reference.as_str(), resolved)
+            .is_some()
+        {
+            return Err(Error::Output);
+        }
+    }
+    let mut outbound_mentions = Vec::new();
+    resolve_outbound_mentions(&mut parsed, &resolved_by_reference, &mut outbound_mentions)?;
+
+    render_parsed_markdown(parsed, outbound_mentions)
+}
+
+fn parse_markdown(source: &str) -> Result<Vec<Block>> {
     validate_source(source)?;
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     validate_slack_native_links(source, options)?;
     validate_parse_depth(source, options)?;
     let mut events = Parser::new_ext(source, options).peekable();
-    let parsed = parse_blocks(&mut events, None);
+    parse_blocks(&mut events, None)
+}
+
+fn render_parsed_markdown(
+    parsed: Vec<Block>,
+    outbound_mentions: Vec<OutboundMention>,
+) -> Result<RenderedMessage> {
     let mut rich_elements = Vec::new();
     emit_blocks(&parsed, 0, &mut rich_elements)?;
     if rich_elements.is_empty() {
@@ -103,7 +173,11 @@ pub(crate) fn render_markdown(source: &str) -> Result<RenderedMessage> {
         ));
     }
 
-    Ok(RenderedMessage { text, blocks })
+    Ok(RenderedMessage {
+        text,
+        blocks,
+        outbound_mentions,
+    })
 }
 
 fn validate_slack_native_links(source: &str, options: Options) -> Result<()> {
@@ -358,7 +432,7 @@ fn validate_source(source: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_blocks(events: &mut Events<'_>, expected_end: Option<TagEnd>) -> Vec<Block> {
+fn parse_blocks(events: &mut Events<'_>, expected_end: Option<TagEnd>) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
     while let Some(event) = events.next() {
         match event {
@@ -370,42 +444,91 @@ fn parse_blocks(events: &mut Events<'_>, expected_end: Option<TagEnd>) -> Vec<Bl
                 events,
                 TagEnd::Paragraph,
                 InlineContext::default(),
-            ))),
+            )?)),
             Event::Start(Tag::Heading { level, .. }) => blocks.push(Block::Heading(parse_inlines(
                 events,
                 TagEnd::Heading(level),
                 InlineContext::default(),
-            ))),
+            )?)),
             Event::Start(Tag::BlockQuote(kind)) => blocks.push(Block::Quote(parse_blocks(
                 events,
                 Some(TagEnd::BlockQuote(kind)),
-            ))),
+            )?)),
             Event::Start(Tag::CodeBlock(_)) => {
                 blocks.push(Block::Code(collect_literal(events, TagEnd::CodeBlock)));
             }
-            Event::Start(Tag::List(start)) => blocks.push(parse_list(events, start)),
-            Event::Start(tag) => blocks.push(Block::Section(parse_inlines(
-                events,
-                tag.to_end(),
-                InlineContext::default(),
-            ))),
+            Event::Start(Tag::List(start)) => blocks.push(parse_list(events, start)?),
+            Event::Start(Tag::Emphasis) => {
+                let mut context = InlineContext::default();
+                context.style.italic = true;
+                let inlines = parse_inlines(events, TagEnd::Emphasis, context)?;
+                push_unwrapped_inlines(&mut blocks, inlines, expected_end == Some(TagEnd::Item));
+            }
+            Event::Start(Tag::Strong) => {
+                let mut context = InlineContext::default();
+                context.style.bold = true;
+                let inlines = parse_inlines(events, TagEnd::Strong, context)?;
+                push_unwrapped_inlines(&mut blocks, inlines, expected_end == Some(TagEnd::Item));
+            }
+            Event::Start(Tag::Strikethrough) => {
+                let mut context = InlineContext::default();
+                context.style.strike = true;
+                let inlines = parse_inlines(events, TagEnd::Strikethrough, context)?;
+                push_unwrapped_inlines(&mut blocks, inlines, expected_end == Some(TagEnd::Item));
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                let mut inlines = Vec::new();
+                parse_link_like(
+                    events,
+                    TagEnd::Link,
+                    true,
+                    dest_url.into_string(),
+                    &InlineContext::default(),
+                    &mut inlines,
+                )?;
+                push_unwrapped_inlines(&mut blocks, inlines, expected_end == Some(TagEnd::Item));
+            }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                let mut inlines = Vec::new();
+                parse_link_like(
+                    events,
+                    TagEnd::Image,
+                    false,
+                    dest_url.into_string(),
+                    &InlineContext::default(),
+                    &mut inlines,
+                )?;
+                push_unwrapped_inlines(&mut blocks, inlines, expected_end == Some(TagEnd::Item));
+            }
+            Event::Start(tag) => {
+                let inlines = parse_inlines(events, tag.to_end(), InlineContext::default())?;
+                push_unwrapped_inlines(&mut blocks, inlines, expected_end == Some(TagEnd::Item));
+            }
             Event::Rule => blocks.push(Block::Rule),
             event => {
                 let mut inlines = Vec::new();
                 append_inline_event(&mut inlines, event, &InlineContext::default());
-                blocks.push(Block::Section(inlines));
+                push_unwrapped_inlines(&mut blocks, inlines, expected_end == Some(TagEnd::Item));
             }
         }
     }
-    blocks
+    Ok(blocks)
 }
 
-fn parse_list(events: &mut Events<'_>, start: Option<u64>) -> Block {
+fn push_unwrapped_inlines(blocks: &mut Vec<Block>, inlines: Vec<Inline>, merge_tight_item: bool) {
+    if merge_tight_item && let Some(Block::Section(previous)) = blocks.last_mut() {
+        extend_inlines(previous, inlines);
+    } else {
+        blocks.push(Block::Section(inlines));
+    }
+}
+
+fn parse_list(events: &mut Events<'_>, start: Option<u64>) -> Result<Block> {
     let mut items = Vec::new();
     while let Some(event) = events.next() {
         match event {
             Event::Start(Tag::Item) => {
-                items.push(parse_blocks(events, Some(TagEnd::Item)));
+                items.push(parse_blocks(events, Some(TagEnd::Item))?);
             }
             Event::End(TagEnd::List(_)) => break,
             Event::End(end) => {
@@ -415,14 +538,14 @@ fn parse_list(events: &mut Events<'_>, start: Option<u64>) -> Block {
             _ => {}
         }
     }
-    Block::List { start, items }
+    Ok(Block::List { start, items })
 }
 
 fn parse_inlines(
     events: &mut Events<'_>,
     expected_end: TagEnd,
     context: InlineContext,
-) -> Vec<Inline> {
+) -> Result<Vec<Inline>> {
     let mut inlines = Vec::new();
     while let Some(event) = events.next() {
         match event {
@@ -435,44 +558,46 @@ fn parse_inlines(
                 nested.style.italic = true;
                 extend_inlines(
                     &mut inlines,
-                    parse_inlines(events, TagEnd::Emphasis, nested),
+                    parse_inlines(events, TagEnd::Emphasis, nested)?,
                 );
             }
             Event::Start(Tag::Strong) => {
                 let mut nested = context.clone();
                 nested.style.bold = true;
-                extend_inlines(&mut inlines, parse_inlines(events, TagEnd::Strong, nested));
+                extend_inlines(&mut inlines, parse_inlines(events, TagEnd::Strong, nested)?);
             }
             Event::Start(Tag::Strikethrough) => {
                 let mut nested = context.clone();
                 nested.style.strike = true;
                 extend_inlines(
                     &mut inlines,
-                    parse_inlines(events, TagEnd::Strikethrough, nested),
+                    parse_inlines(events, TagEnd::Strikethrough, nested)?,
                 );
             }
             Event::Start(Tag::Link { dest_url, .. }) => parse_link_like(
                 events,
                 TagEnd::Link,
+                true,
                 dest_url.into_string(),
                 &context,
                 &mut inlines,
-            ),
+            )?,
             Event::Start(Tag::Image { dest_url, .. }) => parse_link_like(
                 events,
                 TagEnd::Image,
+                false,
                 dest_url.into_string(),
                 &context,
                 &mut inlines,
-            ),
+            )?,
             Event::Start(tag) => {
                 let end = tag.to_end();
-                extend_inlines(&mut inlines, parse_inlines(events, end, context.clone()));
+                extend_inlines(&mut inlines, parse_inlines(events, end, context.clone())?);
             }
             event => append_inline_event(&mut inlines, event, &context),
         }
     }
-    inlines
+    Ok(inlines)
 }
 
 fn collect_literal(events: &mut Events<'_>, expected_end: TagEnd) -> String {
@@ -508,16 +633,27 @@ fn collect_literal(events: &mut Events<'_>, expected_end: TagEnd) -> String {
 fn parse_link_like(
     events: &mut Events<'_>,
     end: TagEnd,
+    allow_outbound_mention: bool,
     destination: String,
     context: &InlineContext,
     target: &mut Vec<Inline>,
-) {
+) -> Result<()> {
+    if allow_outbound_mention && let Some(reference) = outbound_mention_reference(&destination)? {
+        let label = collect_outbound_mention_label(events, end)?;
+        push_inline(
+            target,
+            label,
+            context.style.clone(),
+            Some(format!("{OUTBOUND_MENTION_PREFIX}{reference}")),
+        );
+        return Ok(());
+    }
     if is_supported_link(&destination) {
         let mut nested = context.clone();
         nested.link = Some(destination);
-        extend_inlines(target, parse_inlines(events, end, nested));
+        extend_inlines(target, parse_inlines(events, end, nested)?);
     } else {
-        extend_inlines(target, parse_inlines(events, end, context.clone()));
+        extend_inlines(target, parse_inlines(events, end, context.clone())?);
         push_inline(
             target,
             format!(" ({destination})"),
@@ -525,6 +661,180 @@ fn parse_link_like(
             context.link.clone(),
         );
     }
+    Ok(())
+}
+
+fn outbound_mention_reference(destination: &str) -> Result<Option<String>> {
+    let Some(reference) = destination.strip_prefix(OUTBOUND_MENTION_PREFIX) else {
+        return Ok(None);
+    };
+    if reference.is_empty()
+        || reference.len() > 256
+        || reference.trim() != reference
+        || reference.chars().any(char::is_control)
+    {
+        return Err(Error::invalid_input(
+            "markdown",
+            "outbound mention references must contain 1 to 256 non-control characters",
+        ));
+    }
+    Ok(Some(reference.to_owned()))
+}
+
+fn collect_outbound_mention_label(events: &mut Events<'_>, expected_end: TagEnd) -> Result<String> {
+    let mut label = String::new();
+    for event in events.by_ref() {
+        match event {
+            Event::End(end) => {
+                debug_assert_eq!(end, expected_end);
+                break;
+            }
+            Event::Text(text) => label.push_str(&text),
+            _ => {
+                return Err(Error::invalid_input(
+                    "markdown",
+                    "outbound mention labels must be plain text beginning with @",
+                ));
+            }
+        }
+    }
+    if !(2..=256).contains(&label.len())
+        || label.trim() != label
+        || !label.starts_with('@')
+        || label[1..].trim().is_empty()
+        || label.chars().any(char::is_control)
+    {
+        return Err(Error::invalid_input(
+            "markdown",
+            "outbound mention labels must be 2 to 256 non-control characters beginning with @",
+        ));
+    }
+    Ok(label)
+}
+
+fn collect_outbound_mention_references(
+    blocks: &[Block],
+    references: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    occurrences: &mut usize,
+) -> Result<()> {
+    for block in blocks {
+        match block {
+            Block::Section(inlines) | Block::Heading(inlines) => {
+                collect_inline_outbound_mention_references(inlines, references, seen, occurrences)?;
+            }
+            Block::Quote(blocks) => {
+                collect_outbound_mention_references(blocks, references, seen, occurrences)?;
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    collect_outbound_mention_references(item, references, seen, occurrences)?;
+                }
+            }
+            Block::Code(_) | Block::Rule => {}
+        }
+    }
+    Ok(())
+}
+
+fn collect_inline_outbound_mention_references(
+    inlines: &[Inline],
+    references: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    occurrences: &mut usize,
+) -> Result<()> {
+    for inline in inlines {
+        let Some(reference) = inline
+            .link
+            .as_deref()
+            .and_then(|link| link.strip_prefix(OUTBOUND_MENTION_PREFIX))
+        else {
+            continue;
+        };
+        *occurrences = occurrences.saturating_add(1);
+        if *occurrences > MAX_OUTBOUND_MENTIONS {
+            return Err(Error::invalid_input(
+                "markdown",
+                "contains more than 256 explicit outbound mentions",
+            ));
+        }
+        if seen.insert(reference.to_owned()) {
+            references.push(reference.to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn resolve_outbound_mentions(
+    blocks: &mut [Block],
+    resolved_by_reference: &HashMap<&str, &ResolvedOutboundUser>,
+    outbound_mentions: &mut Vec<OutboundMention>,
+) -> Result<()> {
+    for block in blocks {
+        match block {
+            Block::Section(inlines) | Block::Heading(inlines) => {
+                resolve_inline_outbound_mentions(
+                    inlines,
+                    resolved_by_reference,
+                    outbound_mentions,
+                )?;
+            }
+            Block::Quote(blocks) => {
+                resolve_outbound_mentions(blocks, resolved_by_reference, outbound_mentions)?;
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    resolve_outbound_mentions(item, resolved_by_reference, outbound_mentions)?;
+                }
+            }
+            Block::Code(_) | Block::Rule => {}
+        }
+    }
+    Ok(())
+}
+
+fn resolve_inline_outbound_mentions(
+    inlines: &mut [Inline],
+    resolved_by_reference: &HashMap<&str, &ResolvedOutboundUser>,
+    outbound_mentions: &mut Vec<OutboundMention>,
+) -> Result<()> {
+    for inline in inlines {
+        let Some(reference) = inline
+            .link
+            .as_deref()
+            .and_then(|link| link.strip_prefix(OUTBOUND_MENTION_PREFIX))
+        else {
+            continue;
+        };
+        let Some(resolved) = resolved_by_reference.get(reference) else {
+            return Err(Error::invalid_input(
+                "markdown",
+                "explicit outbound mentions require workspace user resolution",
+            ));
+        };
+        if !(2..=64).contains(&resolved.user_id.len())
+            || !resolved
+                .user_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(Error::Output);
+        }
+        if outbound_mentions.len() == MAX_OUTBOUND_MENTIONS {
+            return Err(Error::invalid_input(
+                "markdown",
+                "contains more than 256 explicit outbound mentions",
+            ));
+        }
+        outbound_mentions.push(OutboundMention {
+            label: inline.text.clone(),
+            reference: reference.to_owned(),
+            user_id: resolved.user_id.clone(),
+            resolution: resolved.resolution,
+        });
+        inline.link = Some(format!("{RESOLVED_USER_PREFIX}{}", resolved.user_id));
+    }
+    Ok(())
 }
 
 fn append_inline_event(target: &mut Vec<Inline>, event: Event<'_>, context: &InlineContext) {
@@ -582,10 +892,11 @@ fn push_inline(target: &mut Vec<Inline>, text: String, style: InlineStyle, link:
     if text.is_empty() {
         return;
     }
-    if let Some(previous) = target
-        .last_mut()
-        .filter(|previous| previous.style == style && previous.link == link)
-    {
+    if let Some(previous) = target.last_mut().filter(|previous| {
+        previous.style == style
+            && previous.link == link
+            && !link.as_deref().is_some_and(is_outbound_mention_target)
+    }) {
         previous.text.push_str(&text);
     } else {
         target.push(Inline { text, style, link });
@@ -868,6 +1179,15 @@ fn section_value(inlines: Vec<Inline>) -> Value {
 
 fn text_value(inline: Inline) -> Value {
     let mut value = Map::new();
+    if let Some(user_id) = inline
+        .link
+        .as_deref()
+        .and_then(|link| link.strip_prefix(RESOLVED_USER_PREFIX))
+    {
+        value.insert("type".into(), Value::String("user".into()));
+        value.insert("user_id".into(), Value::String(user_id.to_owned()));
+        return Value::Object(value);
+    }
     if let Some(link) = inline.link {
         value.insert("type".into(), Value::String("link".into()));
         value.insert("url".into(), Value::String(link));
@@ -1009,6 +1329,7 @@ fn inlines_plain(inlines: &[Inline]) -> String {
         }
         text.push_str(&label);
         if let Some(destination) = link
+            && !is_outbound_mention_target(destination)
             && label != destination
         {
             text.push_str(" (");
@@ -1017,6 +1338,10 @@ fn inlines_plain(inlines: &[Inline]) -> String {
         }
     }
     text
+}
+
+fn is_outbound_mention_target(target: &str) -> bool {
+    target.starts_with(OUTBOUND_MENTION_PREFIX) || target.starts_with(RESOLVED_USER_PREFIX)
 }
 
 fn count_typed_elements(values: &[Value]) -> usize {
@@ -1269,6 +1594,129 @@ mod tests {
             nested_first.blocks[0]["elements"][2]["type"],
             "rich_text_section"
         );
+    }
+
+    #[test]
+    fn explicit_outbound_mentions_emit_user_elements_and_ordered_proof() {
+        let source = concat!(
+            "Hello [@Alice](slack-user:alice) and ",
+            "[@Operations](<slack-user:Operations Team>).\n\n",
+            "- Again [@Alice](slack-user:alice)\n",
+        );
+        assert_eq!(
+            outbound_mention_references(source).unwrap(),
+            ["alice", "Operations Team"]
+        );
+        assert!(matches!(
+            render_markdown(source),
+            Err(Error::InvalidInput {
+                field: "markdown",
+                reason: "explicit outbound mentions require workspace user resolution",
+            })
+        ));
+
+        let rendered = render_markdown_with_mentions(
+            source,
+            &[
+                ResolvedOutboundUser {
+                    reference: "alice".into(),
+                    user_id: "UALICE".into(),
+                    resolution: OutboundMentionResolution::Username,
+                },
+                ResolvedOutboundUser {
+                    reference: "Operations Team".into(),
+                    user_id: "UOPS".into(),
+                    resolution: OutboundMentionResolution::DisplayName,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            rendered.text,
+            "Hello @Alice and @Operations.\n\n- Again @Alice"
+        );
+        assert_eq!(
+            rendered.outbound_mentions,
+            [
+                OutboundMention {
+                    label: "@Alice".into(),
+                    reference: "alice".into(),
+                    user_id: "UALICE".into(),
+                    resolution: OutboundMentionResolution::Username,
+                },
+                OutboundMention {
+                    label: "@Operations".into(),
+                    reference: "Operations Team".into(),
+                    user_id: "UOPS".into(),
+                    resolution: OutboundMentionResolution::DisplayName,
+                },
+                OutboundMention {
+                    label: "@Alice".into(),
+                    reference: "alice".into(),
+                    user_id: "UALICE".into(),
+                    resolution: OutboundMentionResolution::Username,
+                },
+            ]
+        );
+        let encoded = serde_json::to_string(&rendered.blocks).unwrap();
+        assert_eq!(encoded.matches("\"type\":\"user\"").count(), 3);
+        assert_eq!(encoded.matches("\"user_id\":\"UALICE\"").count(), 2);
+        assert!(encoded.contains("\"user_id\":\"UOPS\""));
+        assert!(!encoded.contains(OUTBOUND_MENTION_PREFIX));
+    }
+
+    #[test]
+    fn mention_looking_literals_and_code_never_request_resolution() {
+        let source = concat!(
+            "Literal @alice, alice@example.com, and <@UALICE>.\n\n",
+            "`[@Alice](slack-user:alice)`\n\n",
+            "```text\n[@Alice](slack-user:alice)\n```\n\n",
+            "    [@Alice](slack-user:alice)\n",
+        );
+        assert!(outbound_mention_references(source).unwrap().is_empty());
+        let rendered = render_markdown(source).unwrap();
+        assert!(rendered.outbound_mentions.is_empty());
+        assert!(rendered.text.contains("Literal @alice"));
+        assert!(rendered.text.contains("alice@example.com"));
+        assert!(rendered.text.contains("<@UALICE>"));
+        assert!(rendered.text.contains("[@Alice](slack-user:alice)"));
+        assert!(
+            !serde_json::to_string(&rendered.blocks)
+                .unwrap()
+                .contains("\"type\":\"user\"")
+        );
+    }
+
+    #[test]
+    fn outbound_mention_syntax_rejects_misleading_labels_and_references() {
+        for source in [
+            "[Alice](slack-user:alice)",
+            "[@**Alice**](slack-user:alice)",
+            "[@Alice](slack-user:)",
+            "[@Alice](<slack-user: alice>)",
+        ] {
+            assert!(
+                matches!(
+                    outbound_mention_references(source),
+                    Err(Error::InvalidInput {
+                        field: "markdown",
+                        ..
+                    })
+                ),
+                "accepted invalid outbound mention syntax: {source}"
+            );
+        }
+
+        let too_many = std::iter::repeat_n("[@Alice](slack-user:alice)", 257)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(matches!(
+            outbound_mention_references(&too_many),
+            Err(Error::InvalidInput {
+                field: "markdown",
+                reason: "contains more than 256 explicit outbound mentions",
+            })
+        ));
     }
 
     #[test]

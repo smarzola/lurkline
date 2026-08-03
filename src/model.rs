@@ -588,6 +588,28 @@ pub struct RenderedMessage {
     pub text: String,
     /// Slack `rich_text` blocks generated from the Markdown source.
     pub blocks: Vec<Value>,
+    /// Explicit notifying user mentions, in source order. Ordinary `@text` is omitted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outbound_mentions: Vec<OutboundMention>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct OutboundMention {
+    /// Human-readable Markdown label retained in the plain-text fallback.
+    pub label: String,
+    /// Exact user reference supplied by the `slack-user:` Markdown destination.
+    pub reference: String,
+    /// Slack user ID emitted in the rich-text `user` element.
+    pub user_id: String,
+    pub resolution: OutboundMentionResolution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundMentionResolution {
+    UserId,
+    Username,
+    DisplayName,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

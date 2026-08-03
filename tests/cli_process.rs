@@ -56,6 +56,25 @@ fn run_with_credentials(args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn run_with_credentials_and_stdin(args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lurkline"))
+        .args(args)
+        .env("HOME", isolated_home())
+        .env("SLACK_BASE_URL", "https://example.slack.com")
+        .env("SLACK_TEAM_ID", "T000TEST")
+        .env("SLACK_TOKEN", "xoxc-cli-test-secret")
+        .env("SLACK_COOKIE", "d=xoxd-cli-test-secret")
+        .env("LURKLINE_TIMEOUT_MS", "500")
+        .env_remove("LURKLINE_PROFILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn stdout(args: &[&str]) -> String {
     let output = run(args);
     assert!(
@@ -315,6 +334,37 @@ fn file_draft_creation_rejects_root_broadcast_before_stdin_or_file_io() {
 }
 
 #[test]
+fn file_draft_cli_accepts_explicit_mention_syntax_before_file_preflight() {
+    let missing = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "lurkline-missing-mention-draft-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    let missing = missing.to_str().unwrap();
+    let output = run_with_credentials_and_stdin(
+        &[
+            "drafts",
+            "create-file",
+            "C123",
+            "--path",
+            missing,
+            "--confirm",
+        ],
+        b"Review with [@Alice](slack-user:alice).",
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("open upload source"), "{stderr}");
+    assert!(!stderr.contains("explicit outbound mentions require workspace user resolution"));
+}
+
+#[test]
 fn markdown_render_is_local_bounded_and_emits_stable_rich_text() {
     let output = run_with_stdin(
         &["message", "render", "--json"],
@@ -332,6 +382,7 @@ fn markdown_render_is_local_bounded_and_emits_stable_rich_text() {
         "Hello world from docs (https://example.com)."
     );
     assert_eq!(rendered["blocks"][0]["type"], "rich_text");
+    assert!(rendered.get("outbound_mentions").is_none());
     assert_eq!(
         rendered["blocks"][0]["elements"][0]["elements"][1]["style"]["bold"],
         true
@@ -374,6 +425,25 @@ fn markdown_render_is_local_bounded_and_emits_stable_rich_text() {
             "error: invalid markdown: Slack-native <URL|label> link syntax is unsupported; ",
             "use standard Markdown: [label](URL)\n"
         )
+    );
+
+    let literal_mentions = run_with_stdin(
+        &["message", "render", "--json"],
+        b"Literal @alice and `[@Alice](slack-user:alice)`.",
+    );
+    assert!(literal_mentions.status.success());
+    let literal: serde_json::Value = serde_json::from_slice(&literal_mentions.stdout).unwrap();
+    assert!(literal.get("outbound_mentions").is_none());
+
+    let explicit = run_with_stdin(
+        &["message", "render", "--json"],
+        b"Hello [@Alice](slack-user:alice).",
+    );
+    assert_eq!(explicit.status.code(), Some(1));
+    assert!(explicit.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(explicit.stderr).unwrap(),
+        "error: missing required environment variable SLACK_BASE_URL\n"
     );
 }
 

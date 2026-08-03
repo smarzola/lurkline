@@ -15,7 +15,7 @@ Use Lurkline to:
 - Download private Slack files to explicit, non-existing local paths.
 - Upload one local regular file to a conversation root or thread.
 - Add or remove confirmed emoji reactions idempotently.
-- Render bounded Markdown as Slack `rich_text`.
+- Render bounded Markdown as Slack `rich_text`, with explicit, verifiable user mentions.
 - Create, update, inspect, delete, and publish text or one-file Slack drafts.
 - Send confirmed root messages and thread replies.
 
@@ -749,7 +749,7 @@ file deletion, or scheduled uploads. Legacy attachments remain read-only.
 
 ## Render Markdown
 
-Render Markdown locally without Slack credentials:
+Render ordinary Markdown locally without Slack credentials:
 
 ```sh
 printf '%s\n' '**Deploy** after reviewing [the runbook](https://example.com).' \
@@ -781,6 +781,38 @@ indented code.
 
 Empty input, control characters, excessive nesting, and over-limit input fail
 before a Slack request.
+
+### Mention a user deliberately
+
+Ordinary `@text`, email addresses, Slack-looking `<@U123>` text, and anything in
+inline or fenced code remain literal and never notify anyone. To create a real
+Slack user mention, make that intent explicit in the Markdown link destination:
+
+```md
+Hello [@Alice](slack-user:alice).
+Please ask [@Operations](<slack-user:Operations Team>) to review.
+```
+
+The reference may be an exact Slack user ID, username, or display name. IDs are
+matched exactly; names are matched case-insensitively with username before
+display name. References containing spaces use CommonMark's angle-bracket
+destination form. Lurkline accepts active people and bots, rejects deleted
+users, and fails on missing or ambiguous names with guidance to use an exact
+ID. A name also fails closed if the bounded user-directory scan is incomplete;
+an exact active ID already verified in that scan can still succeed.
+
+Only this explicit syntax makes `message render` consult the configured Slack
+profile. JSON output includes an ordered `outbound_mentions` proof containing
+the label, supplied reference, resolved user ID, and resolution method. Human
+output prints the same fields on `mention` rows after the fallback text. The
+Slack blocks contain structured `user` elements, so the result can notify the
+intended users instead of merely displaying `@` text.
+
+The same resolution and fail-before-write behavior applies to root messages,
+thread replies, text drafts, one-file drafts, draft updates, and their MCP
+tools. Lurkline resolves every distinct reference in one bounded directory scan
+and rejects the complete operation before destination lookup or publication if
+any explicit mention cannot be proven.
 
 ## Manage drafts
 
@@ -1049,7 +1081,7 @@ The following table maps common tasks to CLI commands and MCP tools:
 | Task | CLI command | MCP tool |
 | --- | --- | --- |
 | Validate the browser session | `lurkline doctor` | `slack_doctor` |
-| Render Markdown locally | `lurkline message render` | `slack_render_markdown` |
+| Render Markdown and resolve explicit mentions | `lurkline message render` | `slack_render_markdown` |
 | List explicit unread state | `lurkline unreads` | `slack_list_unreads` |
 | Read an unread inbox snapshot | `lurkline inbox` | `slack_read_inbox` |
 | Read bounded recent activity | `lurkline activity` | `slack_read_activity` |
@@ -1081,7 +1113,7 @@ The following table lists primary and auxiliary bounds:
 
 | Operation | Primary bound | Auxiliary discovery bound |
 | --- | ---: | --- |
-| Markdown input | 40,000 bytes | Local operation |
+| Markdown input | 40,000 bytes | One user-directory scan only when explicit `slack-user:` mentions are present |
 | Draft list | One page of 100 | No conversation discovery |
 | One-file draft proof | One file and one destination | 10 active-draft pages of 100; six bounded reads per reconciliation phase, with at most 7.75 seconds of draft-state delay |
 | Conversation list | One page of 200 | Up to 20 user pages of 200 for DMs |

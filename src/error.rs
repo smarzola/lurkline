@@ -13,6 +13,11 @@ pub enum Error {
         field: &'static str,
         reason: &'static str,
     },
+    #[error("cannot resolve outbound mention {reference:?}: {reason}")]
+    OutboundMention {
+        reference: String,
+        reason: &'static str,
+    },
     #[error(
         "no credential profile is selected; pass --profile, set LURKLINE_PROFILE, or import a profile"
     )]
