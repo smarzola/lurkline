@@ -8137,6 +8137,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn invalid_explicit_mention_documents_fail_before_a_user_scan() {
+        let api = fake_api();
+        let user_calls = api.user_calls.clone();
+        let service = service(api);
+
+        let mut deeply_nested = "[@Alice](slack-user:alice)\n\n".to_owned();
+        for depth in 0..=10 {
+            deeply_nested.push_str(&"  ".repeat(depth));
+            deeply_nested.push_str("- nested\n");
+        }
+        assert!(matches!(
+            service.render_markdown(&deeply_nested).await,
+            Err(Error::InvalidInput {
+                field: "markdown",
+                reason: "list nesting exceeds 8 levels",
+            })
+        ));
+
+        let fragmented = std::iter::repeat_n("**fragment**", 1_001)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fragmented = format!("[@Alice](slack-user:alice) {fragmented}");
+        assert!(matches!(
+            service.render_markdown(&fragmented).await,
+            Err(Error::InvalidInput {
+                field: "markdown",
+                reason: "renders too many rich-text elements",
+            })
+        ));
+
+        assert!(user_calls.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn outbound_mention_resolution_is_exact_deterministic_and_fail_closed() {
         let alice = normalize_user(raw_user("UALICE", "alice", "Shared"));

@@ -72,11 +72,28 @@ pub(crate) fn render_markdown(source: &str) -> Result<RenderedMessage> {
 }
 
 pub(crate) fn outbound_mention_references(source: &str) -> Result<Vec<String>> {
-    let parsed = parse_markdown(source)?;
+    let mut parsed = parse_markdown(source)?;
     let mut references = Vec::new();
     let mut seen = HashSet::new();
     let mut occurrences = 0_usize;
     collect_outbound_mention_references(&parsed, &mut references, &mut seen, &mut occurrences)?;
+    let placeholders = references
+        .iter()
+        .map(|reference| ResolvedOutboundUser {
+            reference: reference.clone(),
+            // Use the longest supported identifier so the credential-free
+            // preflight cannot underestimate the rendered block size.
+            user_id: "U".repeat(64),
+            resolution: OutboundMentionResolution::UserId,
+        })
+        .collect::<Vec<_>>();
+    let resolved_by_reference = placeholders
+        .iter()
+        .map(|resolved| (resolved.reference.as_str(), resolved))
+        .collect::<HashMap<_, _>>();
+    let mut proof = Vec::new();
+    resolve_outbound_mentions(&mut parsed, &resolved_by_reference, &mut proof)?;
+    render_parsed_markdown(parsed, proof)?;
     Ok(references)
 }
 

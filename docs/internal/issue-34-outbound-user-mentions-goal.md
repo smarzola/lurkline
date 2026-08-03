@@ -86,10 +86,10 @@ Follow `AGENTS.md`.
 - Never commit, log, snapshot, or print real Slack credentials, messages,
   identities, conversation names, URLs, or file contents. Use synthetic
   fixtures in tests, documentation, reviews, and commits.
-- Live smoke may use the signed-in `sfera` profile to read any workspace scope,
-  but emit only aggregate or boolean evidence. Slack writes are authorized only
-  in `smarzola`'s self-DM and must use minimum uniquely labeled synthetic
-  content with truthful residue reporting.
+- Live smoke may use the configured signed-in profile to read any workspace
+  scope, but emit only aggregate or boolean evidence. Slack writes are
+  authorized only in the verified current-user self-DM and must use minimum
+  uniquely labeled synthetic content with truthful residue reporting.
 - Implement the smallest coherent complete design using existing parser,
   directory, model, service, CLI, and MCP patterns. Do not add dependencies,
   configuration, generalized templating, persistent caches, background work,
