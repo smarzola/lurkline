@@ -18,7 +18,10 @@ use crate::{
     config::Config,
     error::{Error, Result},
     local_file::{BoundedDownload, DownloadDurability, UploadPass, UploadSource},
-    markdown::{MAX_MARKDOWN_BYTES, render_markdown},
+    markdown::{
+        MAX_MARKDOWN_BYTES, ResolvedOutboundUser, outbound_mention_references, render_markdown,
+        render_markdown_with_mentions,
+    },
     model::{
         ActivityContinuationKind, ActivityConversationResult, ActivityConversationStatus,
         ActivityItem, ActivityOrder, ActivityReport, AuthorResolution, ClientCountsPayload,
@@ -28,15 +31,15 @@ use crate::{
         DraftDestination, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
         FileDraftCreateReport, FileReference, FileShare, FileShareVisibility, FileUploadReport,
         InboxConversation, InboxReport, InboxTruncationReason, MentionResolution, Message,
-        MessageMention, MessagePage, MessageSearchMatch, MessageSearchPage, PermalinkResolution,
-        RawAuthTestResponse, RawConversation, RawConversationsPage, RawDraft, RawDraftResponse,
-        RawDraftRevision, RawDraftsPage, RawEmojiResponse, RawFile, RawFileResponse,
-        RawFileUploadAllocation, RawFileUploadCompletion, RawMessage, RawMessagePage,
-        RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList, RawMutationResponse,
-        RawPostMessageResponse, RawReaction, RawReactionItemResponse, RawUnread, RawUser,
-        RawUsersPage, Reaction, ReactionMutationReport, SentMessage, ThreadPage,
-        UnreadConversation, UnreadReport, UnreadThreads, User, UserSearchReport,
-        UserSearchTruncationReason,
+        MessageMention, MessagePage, MessageSearchMatch, MessageSearchPage,
+        OutboundMentionResolution, PermalinkResolution, RawAuthTestResponse, RawConversation,
+        RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision, RawDraftsPage,
+        RawEmojiResponse, RawFile, RawFileResponse, RawFileUploadAllocation,
+        RawFileUploadCompletion, RawMessage, RawMessagePage, RawMessageSearchMatch,
+        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
+        RawReaction, RawReactionItemResponse, RawUnread, RawUser, RawUsersPage, Reaction,
+        ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage, UnreadConversation,
+        UnreadReport, UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
     },
 };
 
@@ -633,6 +636,33 @@ impl SlackService {
             team_id: self.team_id.clone(),
             workspace_url: self.workspace_url.origin().ascii_serialization(),
         })
+    }
+
+    pub(crate) async fn render_markdown(&self, source: &str) -> Result<RenderedMessage> {
+        let references = outbound_mention_references(source)?;
+        if references.is_empty() {
+            return render_markdown(source);
+        }
+        let resolved = match self.scan_user_directory().await {
+            UserDirectoryScan::Finished(directory) => {
+                resolve_outbound_users(&references, &directory)?
+            }
+            UserDirectoryScan::Interrupted { directory, error } => {
+                match resolve_outbound_users(&references, &directory) {
+                    Ok(resolved) => resolved,
+                    Err(resolution_error)
+                        if interrupted_outbound_error_is_definitive(
+                            &resolution_error,
+                            &directory,
+                        ) =>
+                    {
+                        return Err(resolution_error);
+                    }
+                    Err(_) => return Err(error),
+                }
+            }
+        };
+        render_markdown_with_mentions(source, &resolved)
     }
 
     pub(crate) async fn list_custom_emoji(&self) -> Result<CustomEmojiList> {
@@ -1384,7 +1414,7 @@ impl SlackService {
         broadcast: bool,
         markdown: &str,
     ) -> Result<Draft> {
-        let rendered = render_markdown(markdown)?;
+        let rendered = self.render_markdown(markdown).await?;
         validate_draft_destination(thread_ts, broadcast)?;
         let channel_id = self.resolve_conversation_id(conversation).await?;
         let destination = DraftDestination {
@@ -1438,7 +1468,7 @@ impl SlackService {
             confirmed,
         } = request;
         require_confirmation("file draft creation", confirmed)?;
-        let rendered = render_markdown(markdown)?;
+        let rendered = self.render_markdown(markdown).await?;
         Self::validate_file_draft_request(
             conversation,
             thread_ts,
@@ -1583,7 +1613,7 @@ impl SlackService {
 
     pub(crate) async fn update_draft(&self, draft_id: &str, markdown: &str) -> Result<Draft> {
         validate_draft_id(draft_id)?;
-        let rendered = render_markdown(markdown)?;
+        let rendered = self.render_markdown(markdown).await?;
         let current = self.get_draft(draft_id).await?;
         require_supported_draft(&current)?;
         let current_destination = current.destinations.first().ok_or(Error::InvalidResponse {
@@ -1685,7 +1715,7 @@ impl SlackService {
     ) -> Result<SentMessage> {
         require_confirmation("message publication", confirmed)?;
         validate_draft_destination(thread_ts, broadcast)?;
-        let rendered = render_markdown(markdown)?;
+        let rendered = self.render_markdown(markdown).await?;
         let channel_id = self.resolve_conversation_id(conversation).await?;
         self.post_rich_message(
             &channel_id,
@@ -5776,6 +5806,136 @@ fn normalize_user(raw: RawUser) -> User {
     }
 }
 
+fn resolve_outbound_users(
+    references: &[String],
+    directory: &UserDirectory,
+) -> Result<Vec<ResolvedOutboundUser>> {
+    references
+        .iter()
+        .map(|reference| resolve_outbound_user(reference, directory))
+        .collect()
+}
+
+fn resolve_outbound_user(
+    reference: &str,
+    directory: &UserDirectory,
+) -> Result<ResolvedOutboundUser> {
+    if directory.conflicting_ids.contains(reference) {
+        return Err(Error::OutboundMention {
+            reference: reference.to_owned(),
+            reason: "Slack returned conflicting records for this ID; inspect the user directory and retry",
+        });
+    }
+    if let Some(user) = directory.users.get(reference) {
+        if user.deleted {
+            return Err(Error::OutboundMention {
+                reference: reference.to_owned(),
+                reason: "the user is deleted; choose an active Slack user",
+            });
+        }
+        return Ok(ResolvedOutboundUser {
+            reference: reference.to_owned(),
+            user_id: user.id.clone(),
+            resolution: OutboundMentionResolution::UserId,
+        });
+    }
+
+    if !directory.complete {
+        return Err(Error::OutboundMention {
+            reference: reference.to_owned(),
+            reason: if is_slack_shaped_user_reference(reference) {
+                "the bounded user directory ended before this ID could be verified; retry with a verified active ID"
+            } else {
+                "name resolution requires a complete bounded user directory; use an exact verified user ID"
+            },
+        });
+    }
+    if !directory.conflicting_ids.is_empty() {
+        return Err(Error::OutboundMention {
+            reference: reference.to_owned(),
+            reason: "Slack returned conflicting user records; use an exact non-conflicting user ID",
+        });
+    }
+
+    if let Some(resolved) = resolve_outbound_user_by_label(
+        reference,
+        directory,
+        |user| user.name.as_deref(),
+        OutboundMentionResolution::Username,
+    )? {
+        return Ok(resolved);
+    }
+    if let Some(resolved) = resolve_outbound_user_by_label(
+        reference,
+        directory,
+        |user| user.display_name.as_deref(),
+        OutboundMentionResolution::DisplayName,
+    )? {
+        return Ok(resolved);
+    }
+
+    Err(Error::OutboundMention {
+        reference: reference.to_owned(),
+        reason: if is_slack_shaped_user_reference(reference) {
+            "no active user has this exact ID, username, or display name; use `lurkline users find`"
+        } else {
+            "no active user has this exact username or display name; use `lurkline users find` or an exact user ID"
+        },
+    })
+}
+
+fn interrupted_outbound_error_is_definitive(error: &Error, directory: &UserDirectory) -> bool {
+    let Error::OutboundMention { reference, .. } = error else {
+        return false;
+    };
+    directory.users.contains_key(reference) || directory.conflicting_ids.contains(reference)
+}
+
+fn resolve_outbound_user_by_label(
+    reference: &str,
+    directory: &UserDirectory,
+    label: impl Fn(&User) -> Option<&str>,
+    resolution: OutboundMentionResolution,
+) -> Result<Option<ResolvedOutboundUser>> {
+    let folded_reference = reference.to_lowercase();
+    let mut active = directory.users.values().filter(|user| {
+        !user.deleted
+            && label(user).is_some_and(|candidate| candidate.to_lowercase() == folded_reference)
+    });
+    let first = active.next();
+    if active.next().is_some() {
+        return Err(Error::OutboundMention {
+            reference: reference.to_owned(),
+            reason: "multiple active users match; use an exact Slack user ID",
+        });
+    }
+    if let Some(user) = first {
+        return Ok(Some(ResolvedOutboundUser {
+            reference: reference.to_owned(),
+            user_id: user.id.clone(),
+            resolution,
+        }));
+    }
+    if directory.users.values().any(|user| {
+        user.deleted
+            && label(user).is_some_and(|candidate| candidate.to_lowercase() == folded_reference)
+    }) {
+        return Err(Error::OutboundMention {
+            reference: reference.to_owned(),
+            reason: "the matching user is deleted; choose an active Slack user",
+        });
+    }
+    Ok(None)
+}
+
+fn is_slack_shaped_user_reference(reference: &str) -> bool {
+    matches!(reference.as_bytes().first(), Some(b'U' | b'W'))
+        && (2..=64).contains(&reference.len())
+        && reference
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
 fn user_matches(user: &RawUser, needle: &str) -> bool {
     [
         Some(user.id.as_str()),
@@ -7861,6 +8021,237 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn outbound_mentions_resolve_id_username_and_display_name_in_one_scan() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![
+                raw_user("UALICE", "alice", "Alice Example"),
+                raw_user("UOPS", "", "Operations Team"),
+            ],
+            ..RawUsersPage::default()
+        }]));
+        let user_calls = api.user_calls.clone();
+        let rendered = service(api)
+            .render_markdown(concat!(
+                "Hello [@Alice](slack-user:alice), ",
+                "[@Operations](<slack-user:Operations Team>), and ",
+                "[@Alice by ID](slack-user:UALICE).",
+            ))
+            .await
+            .unwrap();
+
+        assert_single_user_directory_call(&user_calls);
+        assert_eq!(
+            rendered
+                .outbound_mentions
+                .iter()
+                .map(|mention| (
+                    mention.user_id.as_str(),
+                    mention.resolution,
+                    mention.label.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("UALICE", OutboundMentionResolution::Username, "@Alice"),
+                (
+                    "UOPS",
+                    OutboundMentionResolution::DisplayName,
+                    "@Operations"
+                ),
+                ("UALICE", OutboundMentionResolution::UserId, "@Alice by ID"),
+            ]
+        );
+        let encoded = serde_json::to_string(&rendered.blocks).unwrap();
+        assert_eq!(encoded.matches("\"type\":\"user\"").count(), 3);
+        assert_eq!(encoded.matches("\"user_id\":\"UALICE\"").count(), 2);
+        assert!(encoded.contains("\"user_id\":\"UOPS\""));
+    }
+
+    #[tokio::test]
+    async fn verified_user_ids_survive_an_interrupted_directory_scan() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("UALICE", "alice", "Alice Example")],
+            response_metadata: RawResponseMetadata {
+                next_cursor: "next-page".into(),
+            },
+        }]));
+        api.user_list_error_after = Some(1);
+        let rendered = service(api)
+            .render_markdown("Hello [@Alice](slack-user:UALICE).")
+            .await
+            .unwrap();
+        assert_eq!(
+            rendered.outbound_mentions[0].resolution,
+            OutboundMentionResolution::UserId
+        );
+        assert_eq!(
+            rendered.blocks[0]["elements"][0]["elements"][1],
+            json!({"type": "user", "user_id": "UALICE"})
+        );
+
+        let mut unresolved = fake_api();
+        unresolved.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("UALICE", "alice", "Alice Example")],
+            response_metadata: RawResponseMetadata {
+                next_cursor: "next-page".into(),
+            },
+        }]));
+        unresolved.user_list_error_after = Some(1);
+        assert!(matches!(
+            service(unresolved)
+                .render_markdown("Hello [@Alice](slack-user:alice).")
+                .await,
+            Err(Error::Authentication)
+        ));
+
+        let mut unavailable = fake_api();
+        unavailable.user_list_error = true;
+        assert!(matches!(
+            service(unavailable)
+                .render_markdown("Hello [@Alice](slack-user:alice).")
+                .await,
+            Err(Error::Authentication)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mention_looking_text_and_code_render_without_a_user_scan() {
+        let api = fake_api();
+        let user_calls = api.user_calls.clone();
+        let rendered = service(api)
+            .render_markdown(concat!(
+                "Literal @alice, alice@example.com, and <@UALICE>.\n\n",
+                "`[@Alice](slack-user:alice)`\n\n",
+                "```text\n[@Alice](slack-user:alice)\n```",
+            ))
+            .await
+            .unwrap();
+        assert!(user_calls.lock().unwrap().is_empty());
+        assert!(rendered.outbound_mentions.is_empty());
+        assert!(
+            !serde_json::to_string(&rendered.blocks)
+                .unwrap()
+                .contains("\"type\":\"user\"")
+        );
+    }
+
+    #[test]
+    fn outbound_mention_resolution_is_exact_deterministic_and_fail_closed() {
+        let alice = normalize_user(raw_user("UALICE", "alice", "Shared"));
+        let display_only = normalize_user(raw_user("UDISPLAY", "", "Display Only"));
+        let shadow = normalize_user(raw_user("USHADOW", "shadow", "alice"));
+        let complete = UserDirectory {
+            users: [alice.clone(), display_only.clone(), shadow]
+                .into_iter()
+                .map(|user| (user.id.clone(), user))
+                .collect(),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        };
+        assert_eq!(
+            resolve_outbound_user("alice", &complete)
+                .unwrap()
+                .resolution,
+            OutboundMentionResolution::Username
+        );
+        assert_eq!(
+            resolve_outbound_user("display only", &complete)
+                .unwrap()
+                .resolution,
+            OutboundMentionResolution::DisplayName
+        );
+
+        let id_shaped_labels = UserDirectory {
+            users: [
+                raw_user("UUSERNAME", "WALLACE", "Other"),
+                raw_user("UDISPLAY2", "someone_else", "UPPERDISPLAY"),
+            ]
+            .into_iter()
+            .map(normalize_user)
+            .map(|user| (user.id.clone(), user))
+            .collect(),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        };
+        assert_eq!(
+            resolve_outbound_user("WALLACE", &id_shaped_labels)
+                .unwrap()
+                .resolution,
+            OutboundMentionResolution::Username
+        );
+        assert_eq!(
+            resolve_outbound_user("UPPERDISPLAY", &id_shaped_labels)
+                .unwrap()
+                .resolution,
+            OutboundMentionResolution::DisplayName
+        );
+
+        let mut duplicate = raw_user("UOTHER", "ALICE", "Other");
+        duplicate.profile.display_name = Some("Other".into());
+        let ambiguous = UserDirectory {
+            users: [alice.clone(), normalize_user(duplicate)]
+                .into_iter()
+                .map(|user| (user.id.clone(), user))
+                .collect(),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        };
+        assert!(matches!(
+            resolve_outbound_user("alice", &ambiguous),
+            Err(Error::OutboundMention {
+                reason: "multiple active users match; use an exact Slack user ID",
+                ..
+            })
+        ));
+
+        let incomplete = UserDirectory {
+            users: [(alice.id.clone(), alice.clone())].into(),
+            conflicting_ids: HashSet::new(),
+            complete: false,
+        };
+        assert_eq!(
+            resolve_outbound_user("UALICE", &incomplete)
+                .unwrap()
+                .resolution,
+            OutboundMentionResolution::UserId
+        );
+        assert!(matches!(
+            resolve_outbound_user("alice", &incomplete),
+            Err(Error::OutboundMention {
+                reason: "name resolution requires a complete bounded user directory; use an exact verified user ID",
+                ..
+            })
+        ));
+        assert!(resolve_outbound_user("UUNKNOWN", &incomplete).is_err());
+
+        let mut deleted = raw_user("UDELETED", "former", "Former User");
+        deleted.deleted = true;
+        let deleted = normalize_user(deleted);
+        let deleted_directory = UserDirectory {
+            users: [(deleted.id.clone(), deleted)].into(),
+            conflicting_ids: HashSet::new(),
+            complete: true,
+        };
+        assert!(matches!(
+            resolve_outbound_user("former", &deleted_directory),
+            Err(Error::OutboundMention {
+                reason: "the matching user is deleted; choose an active Slack user",
+                ..
+            })
+        ));
+        assert!(resolve_outbound_user("missing", &complete).is_err());
+
+        let conflict = UserDirectory {
+            users: HashMap::new(),
+            conflicting_ids: HashSet::from(["UCONFLICT".into()]),
+            complete: true,
+        };
+        assert!(resolve_outbound_user("UCONFLICT", &conflict).is_err());
+        assert!(resolve_outbound_user("conflict", &conflict).is_err());
+    }
+
     #[test]
     fn nullable_user_identity_normalization_preserves_a_literal_null_string() {
         let overlong = "x".repeat(257);
@@ -8899,11 +9290,23 @@ mod tests {
 
     #[tokio::test]
     async fn creates_one_file_draft_only_after_private_cross_process_proof() {
+        const MARKDOWN: &str = "Review with [@Alice](slack-user:alice).";
         let fixture = UploadFixture::new(b"synthetic");
         let mut api = fake_api();
         let mut draft = raw_file_draft("DR-created-file", "700", "C123", "body", "FUPLOAD");
         draft.client_msg_id = Some(REQUEST_CLIENT_MSG_ID.into());
-        draft.blocks = Some(render_markdown("**body**").unwrap().blocks);
+        draft.blocks = Some(
+            render_markdown_with_mentions(
+                MARKDOWN,
+                &[ResolvedOutboundUser {
+                    reference: "alice".into(),
+                    user_id: "UALICE".into(),
+                    resolution: OutboundMentionResolution::Username,
+                }],
+            )
+            .unwrap()
+            .blocks,
+        );
         draft.blocks.as_mut().unwrap()[0]["block_id"] = json!("B1234");
         api.draft_create = RawDraftResponse {
             draft: draft.clone(),
@@ -8922,6 +9325,10 @@ mod tests {
                 file: enriched_file,
             },
         ]));
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage {
+            members: vec![raw_user("UALICE", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        }]));
         let upload_calls = api.upload_calls.clone();
         let draft_calls = api.draft_calls.clone();
         let service = service(api);
@@ -8932,7 +9339,7 @@ mod tests {
                     conversation: "C123",
                     thread_ts: None,
                     broadcast: false,
-                    markdown: "**body**",
+                    markdown: MARKDOWN,
                     title: None,
                     alt_text: Some("Synthetic test file"),
                     confirmed: true,
@@ -8955,6 +9362,10 @@ mod tests {
         assert_eq!(file.title.as_deref(), Some("Asynchronously enriched title"));
         assert_eq!(file.mimetype.as_deref(), Some("text/plain"));
         assert!(!reconciled);
+        assert_eq!(
+            draft.blocks.as_ref().unwrap()[0]["elements"][0]["elements"][1],
+            json!({"type": "user", "user_id": "UALICE"})
+        );
         assert_eq!(
             upload_calls.lock().unwrap().as_slice(),
             ["allocate", "transfer", "complete"]
@@ -9828,6 +10239,105 @@ mod tests {
         assert_eq!(calls[0].blocks[0]["type"], "rich_text");
         assert_eq!(calls[1].thread_ts.as_deref(), Some("6000.000001"));
         assert!(calls[1].broadcast);
+    }
+
+    #[tokio::test]
+    async fn root_and_reply_publication_preserve_resolved_user_elements() {
+        let users = RawUsersPage {
+            members: vec![raw_user("UALICE", "alice", "Alice Example")],
+            ..RawUsersPage::default()
+        };
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([users.clone(), users]));
+        let user_calls = api.user_calls.clone();
+        let post_calls = api.post_calls.clone();
+        let service = service(api);
+        let markdown = "Hello [@Alice](slack-user:alice).";
+
+        let root = service
+            .send_message("C123", None, false, markdown, true)
+            .await
+            .unwrap();
+        let reply = service
+            .send_message("C123", Some("6000.000001"), false, markdown, true)
+            .await
+            .unwrap();
+
+        assert_eq!(user_calls.lock().unwrap().len(), 2);
+        let calls = post_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for call in calls.iter() {
+            assert_eq!(call.text, "Hello @Alice.");
+            assert_eq!(
+                call.blocks[0]["elements"][0]["elements"][1],
+                json!({"type": "user", "user_id": "UALICE"})
+            );
+        }
+        for sent in [&root, &reply] {
+            assert_eq!(
+                sent.message.mention_resolution,
+                MentionResolution::NotAttempted
+            );
+            assert_eq!(sent.message.mentions.len(), 1);
+            assert_eq!(sent.message.mentions[0].id, "UALICE");
+            assert_eq!(
+                sent.message.blocks.as_ref().unwrap()[0]["elements"][0]["elements"][1],
+                json!({"type": "user", "user_id": "UALICE"})
+            );
+        }
+        assert_eq!(root.message.thread_ts, None);
+        assert_eq!(reply.message.thread_ts.as_deref(), Some("6000.000001"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_outbound_mentions_fail_before_conversation_or_publication() {
+        let mut api = fake_api();
+        api.user_pages = Mutex::new(VecDeque::from([RawUsersPage::default()]));
+        let user_calls = api.user_calls.clone();
+        let conversation_calls = api.conversation_calls.clone();
+        let post_calls = api.post_calls.clone();
+        let error = service(api)
+            .send_message(
+                "unresolved-conversation",
+                None,
+                false,
+                "Hello [@Missing](slack-user:missing).",
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::OutboundMention { .. }));
+        assert_single_user_directory_call(&user_calls);
+        assert!(conversation_calls.lock().unwrap().is_empty());
+        assert!(post_calls.lock().unwrap().is_empty());
+
+        let mut file_api = fake_api();
+        file_api.user_pages = Mutex::new(VecDeque::from([RawUsersPage::default()]));
+        let file_user_calls = file_api.user_calls.clone();
+        let file_conversation_calls = file_api.conversation_calls.clone();
+        let file_upload_calls = file_api.upload_calls.clone();
+        let file_draft_calls = file_api.draft_calls.clone();
+        let fixture = UploadFixture::new(b"synthetic");
+        let file_error = service(file_api)
+            .create_file_draft(
+                FileDraftCreateRequest {
+                    conversation: "unresolved-conversation",
+                    thread_ts: None,
+                    broadcast: false,
+                    markdown: "Hello [@Missing](slack-user:missing).",
+                    title: None,
+                    alt_text: None,
+                    confirmed: true,
+                },
+                fixture.source(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(file_error, Error::OutboundMention { .. }));
+        assert_single_user_directory_call(&file_user_calls);
+        assert!(file_conversation_calls.lock().unwrap().is_empty());
+        assert!(file_upload_calls.lock().unwrap().is_empty());
+        assert!(file_draft_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

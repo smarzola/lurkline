@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::Error,
     local_file::{McpFileRoot, validate_mcp_download_path, validate_mcp_upload_path},
-    markdown::render_markdown,
+    markdown::outbound_mention_references,
     model::{
         ActivityOrder, ActivityReport, ConversationKind, ConversationPage,
         ConversationSearchReport, CustomEmojiList, DoctorReport, Draft, DraftDeleteReport,
@@ -194,7 +194,7 @@ struct SearchMessagesRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RenderMarkdownRequest {
-    /// Bounded CommonMark source to convert to Slack rich text.
+    /// Bounded CommonMark source. `[@label](slack-user:reference)` resolves a notifying user mention.
     markdown: String,
 }
 
@@ -393,7 +393,7 @@ fn error_code(error: &Error) -> &'static str {
     match error {
         Error::MissingConfig(_) => "missing_config",
         Error::InvalidConfig { .. } => "invalid_config",
-        Error::InvalidInput { .. } => "invalid_input",
+        Error::InvalidInput { .. } | Error::OutboundMention { .. } => "invalid_input",
         Error::MissingProfile => "missing_profile",
         Error::ProfileNotFound { .. }
         | Error::MissingProfileCredential { .. }
@@ -506,7 +506,7 @@ impl McpServer {
         tool_result(self.service.doctor().await)
     }
 
-    /// Convert bounded CommonMark to Slack rich-text blocks without contacting Slack.
+    /// Convert bounded CommonMark to Slack rich text, resolving only explicit user mentions.
     #[tool(
         name = "slack_render_markdown",
         output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<RenderedMessage>>(),
@@ -515,14 +515,14 @@ impl McpServer {
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
     async fn render_markdown(
         &self,
         Parameters(request): Parameters<RenderMarkdownRequest>,
     ) -> CallToolResult {
-        tool_result(render_markdown(&request.markdown))
+        tool_result(self.service.render_markdown(&request.markdown).await)
     }
 
     /// List a bounded timestamp-paginated page of active Slack drafts.
@@ -642,7 +642,7 @@ impl McpServer {
         ) {
             return tool_result::<FileDraftCreateReport>(Err(error));
         }
-        if let Err(error) = render_markdown(&request.markdown) {
+        if let Err(error) = outbound_mention_references(&request.markdown) {
             return tool_result::<FileDraftCreateReport>(Err(error));
         }
         let source =
@@ -1279,7 +1279,8 @@ mod tests {
         error::Result,
         model::{
             ClientCountsPayload, RawConversationsPage, RawMessagePage, RawMessageSearchMatches,
-            RawMessageSearchResponse, RawMessagesList, RawThreadCounts, RawUsersPage,
+            RawMessageSearchResponse, RawMessagesList, RawThreadCounts, RawUser, RawUserProfile,
+            RawUsersPage,
         },
         service::SlackApi,
     };
@@ -1349,7 +1350,18 @@ mod tests {
         }
 
         async fn users_list(&self, _cursor: Option<&str>, _limit: usize) -> Result<RawUsersPage> {
-            Ok(RawUsersPage::default())
+            Ok(RawUsersPage {
+                members: vec![RawUser {
+                    id: "UALICE".into(),
+                    name: Some("alice".into()),
+                    profile: RawUserProfile {
+                        display_name: Some("Alice Example".into()),
+                        ..RawUserProfile::default()
+                    },
+                    ..RawUser::default()
+                }],
+                ..RawUsersPage::default()
+            })
         }
     }
 
@@ -1408,6 +1420,28 @@ mod tests {
             ])
         );
         assert!(tools.tools.iter().all(|tool| tool.output_schema.is_some()));
+        let render_schema = serde_json::to_string(
+            tools
+                .tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == "slack_render_markdown")
+                .and_then(|tool| tool.output_schema.as_ref())
+                .expect("render output schema"),
+        )
+        .unwrap();
+        for required in [
+            "outbound_mentions",
+            "reference",
+            "user_id",
+            "resolution",
+            "username",
+            "display_name",
+        ] {
+            assert!(
+                render_schema.contains(required),
+                "render output schema should contain {required}"
+            );
+        }
         let read_channel_schema = serde_json::to_value(
             tools
                 .tools
@@ -1532,6 +1566,37 @@ mod tests {
                 "has_more": false,
                 "next_cursor": null
             }))
+        );
+
+        let render_arguments = json!({
+            "markdown": "Hello [@Alice](slack-user:alice)."
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let rendered = client
+            .peer()
+            .call_tool(
+                CallToolRequestParams::new("slack_render_markdown")
+                    .with_arguments(render_arguments),
+            )
+            .await
+            .expect("explicit mention render call");
+        assert_eq!(rendered.is_error, Some(false));
+        let content = rendered.structured_content.expect("structured render");
+        assert_eq!(content["text"], "Hello @Alice.");
+        assert_eq!(
+            content["blocks"][0]["elements"][0]["elements"][1],
+            json!({"type": "user", "user_id": "UALICE"})
+        );
+        assert_eq!(
+            content["outbound_mentions"][0],
+            json!({
+                "label": "@Alice",
+                "reference": "alice",
+                "user_id": "UALICE",
+                "resolution": "username"
+            })
         );
 
         let search_arguments = json!({"query": "", "limit": 20})
