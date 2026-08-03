@@ -191,8 +191,41 @@ cargo test --locked --test mcp_raw_stdio
   destination, content, root placement, blocks, one structured self mention,
   complete mention resolution, and absence of files or attachments. That one
   self-DM message is the only unavoidable Slack residue.
-- Pull-request, merge, tag, workflow, release-asset, and final queue evidence
-  remain delivery checkpoints and are not claimed by this local milestone.
+- At that local checkpoint, pull-request, merge, tag, workflow, release-asset,
+  and final queue evidence remained pending and was not claimed.
+
+### External Delivery Evidence
+
+- Ready PR [#35](https://github.com/smarzola/lurkline/pull/35) linked #34,
+  contained audited head `0d8260dcbb43a4d0a67fafec4918c2c775fec280`,
+  passed both triggered copies of all three CI jobs, had no review comments,
+  and squash-merged as product commit
+  `0d315d169db57ed503c26330974d08e740ee0cbf`. GitHub closed issue #34.
+- Post-merge main CI run
+  [30857856458](https://github.com/smarzola/lurkline/actions/runs/30857856458)
+  passed on the product commit. Annotated tag `v0.16.0` peels exactly to that
+  commit, whose tree matches the independently audited branch tree.
+- Tag CI run
+  [30858139011](https://github.com/smarzola/lurkline/actions/runs/30858139011)
+  and release run
+  [30858139279](https://github.com/smarzola/lurkline/actions/runs/30858139279)
+  passed. The release workflow revalidated version agreement, format, strict
+  lint, all tests, release build, credential scan, package smoke, Rust 1.88,
+  and macOS ARM64 before building all three targets.
+- Published release
+  [`v0.16.0`](https://github.com/smarzola/lurkline/releases/tag/v0.16.0) is
+  neither draft nor prerelease and contains exactly three platform archives
+  plus their three checksum files. Independent downloads matched both GitHub
+  asset digests and companion checksums. Every archive had the exact versioned
+  directory plus `lurkline`/`README.md`/`LICENSE`, epoch timestamps, `0755` and
+  `0644` modes, matching source documentation, and the declared Linux x86_64,
+  Linux ARM64, or macOS ARM64 architecture. The native linker-signed binary
+  reported `lurkline 0.16.0`; the temporary download directory was removed.
+- At the product-release checkpoint, local `main`, `origin/main`, and the
+  peeled tag all resolved to the product commit; the worktree was clean and
+  GitHub reported zero open issues and zero open pull requests. This
+  documentation-only finalization intentionally leaves the release tag on the
+  product commit.
 
 ### Checkpoint And Delivery Protocol
 
