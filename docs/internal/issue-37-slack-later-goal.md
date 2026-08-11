@@ -98,6 +98,9 @@ Each `saved.list` item requires string `item_id`, `item_type`, `ts`, `state`, an
 `item_type=message` is supported. The five required numeric counts are
 `total_count`, `uncompleted_count`, `completed_count`, `archived_count`, and
 `uncompleted_overdue_count`. Zero date values normalize to absent metadata.
+The verified state triples are `in_progress`/`saved`/not archived,
+`completed`/`completed`/not archived, and `archived`/`saved`/archived for the
+respective list filters.
 
 The service validates state/filter consistency, supported identity syntax,
 unique item identities, page limit, cursor progress, response bounds, mutation
