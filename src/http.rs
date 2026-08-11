@@ -21,9 +21,10 @@ use crate::{
     model::{
         ClientCountsPayload, DraftDestination, LaterState, RawAuthTestResponse,
         RawConversationsPage, RawDraftResponse, RawDraftsPage, RawEmojiResponse, RawFileResponse,
-        RawFileUploadAllocation, RawFileUploadCompletion, RawLaterMutationResponse, RawLaterPage,
-        RawMessagePage, RawMessageSearchResponse, RawMessagesList, RawMutationResponse,
-        RawPostMessageResponse, RawReactionItemResponse, RawUsersPage,
+        RawFileUploadAllocation, RawFileUploadCompletion, RawLaterMessagesList,
+        RawLaterMutationResponse, RawLaterPage, RawMessagePage, RawMessageSearchResponse,
+        RawMessagesList, RawMutationResponse, RawPostMessageResponse, RawReactionItemResponse,
+        RawUsersPage,
     },
     service::SlackApi,
 };
@@ -314,30 +315,36 @@ impl SlackApi for SlackHttpClient {
     }
 
     async fn messages_list(&self, channel: &str, message_ts: &str) -> Result<RawMessagesList> {
-        self.messages_list_batch(&[(channel.to_owned(), vec![message_ts.to_owned()])])
-            .await
+        let message_ids =
+            encode_message_targets(&[(channel.to_owned(), vec![message_ts.to_owned()])])?;
+        self.post_form(
+            "messages.list",
+            "messages-ufm",
+            &[
+                ("message_ids", message_ids),
+                ("org_wide_aware", "true".into()),
+                ("cached_latest_updates", "{}".into()),
+            ],
+        )
+        .await
     }
 
     async fn messages_list_batch(
         &self,
         targets: &[(String, Vec<String>)],
     ) -> Result<RawMessagesList> {
-        let message_ids = targets
-            .iter()
-            .map(|(channel, timestamps)| {
-                serde_json::json!({"channel": channel, "timestamps": timestamps})
-            })
-            .collect::<Vec<_>>();
-        self.post_form(
-            "messages.list",
-            "messages-ufm",
-            &[
-                ("message_ids", encode_json(&message_ids)?),
-                ("org_wide_aware", "true".into()),
-                ("cached_latest_updates", "{}".into()),
-            ],
-        )
-        .await
+        let response: RawLaterMessagesList = self
+            .post_form(
+                "messages.list",
+                "messages-ufm",
+                &[
+                    ("message_ids", encode_message_targets(targets)?),
+                    ("org_wide_aware", "true".into()),
+                    ("cached_latest_updates", "{}".into()),
+                ],
+            )
+            .await?;
+        Ok(response.into())
     }
 
     async fn saved_list(
@@ -1029,6 +1036,16 @@ fn encode_json(value: &(impl serde::Serialize + ?Sized)) -> Result<String> {
     serde_json::to_string(value).map_err(|_| Error::Output)
 }
 
+fn encode_message_targets(targets: &[(String, Vec<String>)]) -> Result<String> {
+    let message_ids = targets
+        .iter()
+        .map(|(channel, timestamps)| {
+            serde_json::json!({"channel": channel, "timestamps": timestamps})
+        })
+        .collect::<Vec<_>>();
+    encode_json(&message_ids)
+}
+
 fn browser_headers(config: &Config) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1112,6 +1129,7 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::service::SlackService;
 
     type CapturedRequest = Arc<Mutex<Option<(Uri, HeaderMap, Vec<u8>)>>>;
     #[derive(Clone)]
@@ -2174,6 +2192,21 @@ mod tests {
                 method: "saved.add"
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn single_target_top_level_messages_reach_exact_normalization() {
+        let (client, _) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"messages":{"target":{"ts":"100.000001","text":"target"}}}"#.to_vec(),
+            64 * 1024,
+        )
+        .await;
+        let service = SlackService::new(client.clone(), client.config());
+        let message = service.get_message("C123", "100.000001").await.unwrap();
+        assert_eq!(message.channel_id, "C123");
+        assert_eq!(message.ts, "100.000001");
+        assert_eq!(message.text, "target");
     }
 
     #[tokio::test]

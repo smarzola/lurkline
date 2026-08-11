@@ -52,7 +52,24 @@ pub(crate) struct RawMessagePage {
 pub(crate) struct RawMessagesList {
     #[serde(default)]
     pub messages: BTreeMap<String, RawMessage>,
+    #[serde(default)]
     pub messages_data: BTreeMap<String, RawChannelMessages>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RawLaterMessagesList {
+    #[serde(default)]
+    pub messages: BTreeMap<String, RawMessage>,
+    pub messages_data: BTreeMap<String, RawChannelMessages>,
+}
+
+impl From<RawLaterMessagesList> for RawMessagesList {
+    fn from(value: RawLaterMessagesList) -> Self {
+        Self {
+            messages: value.messages,
+            messages_data: value.messages_data,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
