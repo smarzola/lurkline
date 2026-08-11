@@ -1368,36 +1368,44 @@ fn print_later_page(page: LaterPage, json: bool) -> Result<()> {
     if json {
         return print_json(&page);
     }
+    for line in format_later_page(&page) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn format_later_page(page: &LaterPage) -> Vec<String> {
+    let mut lines = Vec::new();
     if page.items.is_empty() {
-        println!("No {} Later items.", later_state_label(page.state));
+        lines.push(format!("No {} Later items.", later_state_label(page.state)));
     } else {
         for item in &page.items {
-            print_later_item(item);
+            lines.extend(format_later_item(item));
         }
     }
-    println!(
+    lines.push(format!(
         "counts\tin_progress={}\tcompleted={}\tarchived={}\toverdue={}\ttotal={}",
         page.counts.in_progress,
         page.counts.completed,
         page.counts.archived,
         page.counts.overdue,
         page.counts.total
-    );
+    ));
     if page.has_more {
-        println!(
+        lines.push(format!(
             "more\t{}",
-            page.next_cursor.as_deref().unwrap_or("available")
-        );
+            escape_human(page.next_cursor.as_deref().unwrap_or("available"))
+        ));
     }
-    Ok(())
+    lines
 }
 
-fn print_later_item(item: &LaterItem) {
+fn format_later_item(item: &LaterItem) -> Vec<String> {
     let conversation = item
         .conversation
         .as_ref()
         .map(|conversation| conversation.display_name.as_str())
-        .unwrap_or(&item.conversation_id);
+        .unwrap_or("[name unavailable]");
     let (author, text) = item
         .message
         .as_ref()
@@ -1426,34 +1434,41 @@ fn print_later_item(item: &LaterItem) {
         .snoozed_until
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".into());
-    println!(
-        "{}\t{}\t{}\t{}\tupdated={}\tdue={}\tsnoozed_until={}\t{}",
+    let mut lines = vec![format!(
+        "{}\t{}\t{}\t{}\t{}\tupdated={}\tdue={}\tsnoozed_until={}\t{}",
         later_state_label(item.state),
         escape_human(conversation),
+        escape_human(&item.conversation_id),
         escape_human(&item.message_ts),
         author,
         item.updated_at,
         due,
         snoozed_until,
         text
-    );
+    )];
     if let Some(message) = &item.message
         && let Some(permalink) = &message.permalink
     {
-        println!("link\t{}", escape_human(permalink));
+        lines.push(format!("link\t{}", escape_human(permalink)));
     }
     if let Some(root) = &item.thread_root {
-        println!("root\t{}", format_message_line(root));
+        lines.push(format!("root\t{}", format_message_line(root)));
     } else if item.thread_root_resolution == crate::model::LaterContextResolution::Unavailable {
-        println!("root\t[unavailable]");
+        lines.push("root\t[unavailable]".into());
     }
+    lines
 }
 
 fn print_later_mutation(report: LaterMutationReport, json: bool) -> Result<()> {
     if json {
         return print_json(&report);
     }
-    println!(
+    println!("{}", format_later_mutation(&report));
+    Ok(())
+}
+
+fn format_later_mutation(report: &LaterMutationReport) -> String {
+    format!(
         "{}\t{}\t{}\tbefore={}\tafter={}\tchanged={}\treconciled={}",
         match report.action {
             LaterMutationAction::Save => "save",
@@ -1472,8 +1487,7 @@ fn print_later_mutation(report: LaterMutationReport, json: bool) -> Result<()> {
             .unwrap_or("absent"),
         report.changed,
         report.reconciled
-    );
-    Ok(())
+    )
 }
 
 fn later_state_label(state: LaterState) -> &'static str {
@@ -3070,6 +3084,135 @@ mod tests {
             .to_string(),
             "Slack draft creation outcome is unknown for client message 00000000-0000-4000-8000-000000000001; do not retry automatically; reread active drafts before deciding whether to retry"
         );
+    }
+
+    #[test]
+    fn later_human_and_json_output_keep_exact_identity_and_partial_context() {
+        let message = Message {
+            channel_id: "C123".into(),
+            ts: "100.000002".into(),
+            thread_ts: Some("90.000001".into()),
+            permalink: Some("https://example.slack.com/saved\nlink".into()),
+            thread_root_permalink: Some("https://example.slack.com/root".into()),
+            permalink_resolution: crate::model::PermalinkResolution::Complete,
+            author_id: Some("U123".into()),
+            author_name: Some("ali\tce".into()),
+            author_display_name: Some("Alice Example".into()),
+            author_resolution: AuthorResolution::Directory,
+            text: "saved text".into(),
+            rendered_text: "saved\ntext".into(),
+            mention_resolution: crate::model::MentionResolution::NotNeeded,
+            mentions: Vec::new(),
+            blocks: None,
+            attachments: None,
+            reply_count: 0,
+            latest_reply: None,
+            reactions: Vec::new(),
+            files: Vec::new(),
+        };
+        let mut root = message.clone();
+        root.ts = "90.000001".into();
+        root.thread_ts = None;
+        root.rendered_text = "root".into();
+        root.permalink = None;
+        root.thread_root_permalink = None;
+        let populated = LaterItem {
+            conversation_id: "C123".into(),
+            message_ts: "100.000002".into(),
+            state: LaterState::InProgress,
+            created_at: 1,
+            updated_at: 2,
+            due_at: None,
+            snoozed_until: None,
+            completed_at: None,
+            conversation: Some(Conversation {
+                id: "C123".into(),
+                name: "display-name".into(),
+                display_name: "Display\tName".into(),
+                name_is_fallback: false,
+                metadata_is_complete: true,
+                kind: ConversationKind::Channel,
+                is_private: false,
+                is_archived: false,
+                is_member: true,
+                member_count: Some(3),
+                user_id: None,
+            }),
+            conversation_resolution: crate::model::LaterContextResolution::Complete,
+            message: Some(message),
+            message_resolution: crate::model::LaterContextResolution::Complete,
+            thread_root: Some(root),
+            thread_root_resolution: crate::model::LaterContextResolution::Complete,
+        };
+        let unavailable = LaterItem {
+            conversation_id: "C999".into(),
+            message_ts: "999.000001".into(),
+            state: LaterState::InProgress,
+            created_at: 3,
+            updated_at: 4,
+            due_at: Some(5),
+            snoozed_until: Some(6),
+            completed_at: None,
+            conversation: None,
+            conversation_resolution: crate::model::LaterContextResolution::Unavailable,
+            message: None,
+            message_resolution: crate::model::LaterContextResolution::Unavailable,
+            thread_root: None,
+            thread_root_resolution: crate::model::LaterContextResolution::Unavailable,
+        };
+        let page = LaterPage {
+            team_id: "T000TEST".into(),
+            state: LaterState::InProgress,
+            items: vec![populated, unavailable],
+            counts: crate::model::LaterCounts {
+                total: 2,
+                in_progress: 2,
+                completed: 0,
+                archived: 0,
+                overdue: 0,
+            },
+            limit: 2,
+            has_more: true,
+            next_cursor: Some("cursor\nunsafe".into()),
+        };
+        let lines = format_later_page(&page);
+        assert_eq!(
+            lines[0],
+            "in-progress\tDisplay\\tName\tC123\t100.000002\t@ali\\tce\tupdated=2\tdue=-\tsnoozed_until=-\tsaved\\ntext"
+        );
+        assert_eq!(lines[1], "link\thttps://example.slack.com/saved\\nlink");
+        assert_eq!(lines[2], "root\t90.000001\t@ali\\tce\troot\treplies=0");
+        assert_eq!(
+            lines[3],
+            "in-progress\t[name unavailable]\tC999\t999.000001\t[author unavailable]\tupdated=4\tdue=5\tsnoozed_until=6\t[message unavailable]"
+        );
+        assert_eq!(lines[4], "root\t[unavailable]");
+        assert_eq!(
+            lines[5],
+            "counts\tin_progress=2\tcompleted=0\tarchived=0\toverdue=0\ttotal=2"
+        );
+        assert_eq!(lines[6], "more\tcursor\\nunsafe");
+
+        let mutation = LaterMutationReport {
+            conversation_id: "C123".into(),
+            message_ts: "100.000002".into(),
+            action: LaterMutationAction::Complete,
+            before_state: Some(LaterState::InProgress),
+            after_state: Some(LaterState::Completed),
+            changed: true,
+            reconciled: true,
+        };
+        assert_eq!(
+            format_later_mutation(&mutation),
+            "complete\tC123\t100.000002\tbefore=in-progress\tafter=completed\tchanged=true\treconciled=true"
+        );
+
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["items"][0]["conversation_id"], "C123");
+        assert_eq!(json["items"][0]["message_ts"], "100.000002");
+        assert_eq!(json["items"][0]["thread_root_resolution"], "complete");
+        assert_eq!(json["items"][1]["conversation_resolution"], "unavailable");
+        assert_eq!(json["next_cursor"], "cursor\nunsafe");
     }
 
     #[test]

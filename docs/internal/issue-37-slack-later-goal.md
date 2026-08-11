@@ -118,9 +118,11 @@ duplicate, or changed semantic state is `InvalidResponse` for that method.
   `archived`; API-specific `saved` naming is not exposed as the human concept.
 - The list limit applies to Later items and remains bounded. A versioned
   Lurkline cursor carries the workspace, selected state, limit, upstream
-  cursor, counts snapshot, and previous-page identities. A continuation is
-  used by itself; malformed, cross-workspace, selector-mismatched, repeated,
-  duplicate, immediately overlapping, or count-drifted state fails as stale.
+  cursor history, counts snapshot, and previous-page identities. A continuation
+  is used by itself; malformed, cross-workspace, selector-mismatched, repeated,
+  duplicate, overlapping, or count-drifted state fails. A terminal page must
+  account for the selected state count, a non-terminal page must leave items
+  outstanding, and count relationships must remain internally consistent.
 - Deterministic, non-overlapping pagination is guaranteed while the selected
   Later list is unchanged. Slack exposes no immutable snapshot revision, so
   any concurrent Later mutation invalidates continuation; not every same-count
@@ -133,7 +135,9 @@ duplicate, or changed semantic state is `InvalidResponse` for that method.
   available and an optional `thread_root` only when the saved message is a
   reply; full reply expansion is never performed. Message, root, and
   conversation resolution are reported independently as complete, unavailable,
-  or not needed, with no one-request-per-item path.
+  or not needed, with no one-request-per-item path. Bounded access, transport,
+  timeout, and discovery-cap failures degrade only the affected context;
+  authentication failure and malformed verified shapes fail the whole list.
 - Preserve a useful Later row when source context is deleted or unavailable:
   return its stable identity and metadata with explicit context-resolution
   state. Unknown response shapes and unknown resource kinds fail clearly
@@ -156,9 +160,10 @@ duplicate, or changed semantic state is `InvalidResponse` for that method.
   all three views. A scan cap, repeated cursor, ambiguous mutation transport,
   conflicting view state, or incomplete proof returns a dedicated uncertain or
   not-applied error rather than a success report.
-- Human output is an inbox-oriented summary with state, conversation, author,
-  time/reminder, message preview, and permalink. Stable `--json` and MCP output
-  retain the complete structured item and continuation data.
+- Human output is an inbox-oriented summary with state, display name, canonical
+  conversation ID, author, time/reminder, message preview, and permalink.
+  Stable `--json` and MCP output retain the complete structured item and
+  continuation data.
 
 ## Constraints And Non-Goals
 

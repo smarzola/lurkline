@@ -686,6 +686,11 @@ Later rows with explicit unavailable context. A file saved in Slack appears as
 an attachment on its containing message; there is no separate file-level Later
 identity.
 
+Human rows always show both the display name and canonical conversation ID.
+Conversation, saved-message, and optional root enrichment degrade independently
+on bounded access or transport failures; authentication failures and malformed
+verified response shapes still fail the list instead of being hidden.
+
 When `has_more` is true, continue with the returned opaque cursor by itself:
 
 ```sh
@@ -693,11 +698,13 @@ lurkline later list --cursor '<next-cursor>'
 ```
 
 The cursor retains the selected state and page size and rejects count drift or
-an identity repeated from any earlier page. This gives deterministic,
-non-overlapping pages while that Later list is unchanged. Slack doesn't expose
-an immutable Later snapshot, so any concurrent Later change invalidates the
-continuation; restart from the first page after a mutation. Same-count
-replacement isn't always detectable.
+an identity or upstream cursor repeated from any earlier page. A terminal page
+must account for the selected state count, while a non-terminal page must leave
+items outstanding; contradictory counts or premature termination fail closed.
+This gives deterministic, non-overlapping pages while that Later list is
+unchanged. Slack doesn't expose an immutable Later snapshot, so any concurrent
+Later change invalidates the continuation; restart from the first page after a
+mutation. Same-count replacement isn't always detectable.
 
 Save, complete, or remove one exact message deliberately:
 
