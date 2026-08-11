@@ -56,6 +56,11 @@ Verified before implementation:
 - A bounded signed-in browser spike observed `saved.list` with a server cursor,
   state filters, counts, and saved-item metadata; `messages.list` hydrates a
   batch of conversation/message identities for the Later view.
+- A follow-up credential-safe live probe verified all three exact list filters:
+  `saved`, `completed`, and `archived`. Every response returned numeric
+  `archived_count`, `completed_count`, `total_count`, `uncompleted_count`, and
+  `uncompleted_overdue_count`; a string `response_metadata.next_cursor`; and
+  `saved_items` with the same typed field set described below.
 - The same spike observed `saved.add`, `saved.update`, and `saved.delete` for a
   self-DM message. Exact list readback proved save and complete, then removal
   restored the original Later state. No conversation message was created.
@@ -66,33 +71,84 @@ Verified before implementation:
   views; active rows expose complete, reminder, archive, and remove controls.
   Issue #37 requires list, save, complete, and remove, so archive/reminder
   mutation is outside this smallest complete release.
+- A four-target live `messages.list` batch verified the existing grouped array
+  encoding and returned two available source messages. Partial hydration is
+  therefore an expected first-class result, not a whole-page failure.
 - CI and release workflows gate format, strict locked Clippy, all-target tests,
   release build, credential scanning, Rust 1.88, macOS ARM64, version alignment,
   and three native archives plus their checksum files.
+
+## Verified Provisional Route Contract
+
+Every route is a multipart `POST /api/{method}` with browser credentials plus
+`token`, `_x_app_name=client`, `_x_mode=online`, `_x_sonic=true`, and a bounded
+non-secret `_x_reason`. Lurkline never logs or returns these transport fields.
+
+| Method | Additional form fields | Required success shape |
+| --- | --- | --- |
+| `saved.list` | `filter=saved|completed|archived`, `include_tombstones=true`, decimal `limit`, optional opaque `cursor` | `saved_items` array, `counts` object, string `response_metadata.next_cursor` |
+| `messages.list` | `message_ids` JSON array grouped as `[{"channel":"C...","timestamps":["..."]}]`, `org_wide_aware=true`, `cached_latest_updates={}` | `messages_data` keyed by requested conversation; each entry may supply `messages`, `latest_updates`, and `unchanged_messages`; requested messages may be unavailable |
+| `saved.add` | `item_type=message`, `item_id` canonical conversation ID, exact `ts` | `item` object matching the requested identity |
+| `saved.update` | the same identity, `mark=completed`, `todo_state=completed`, `date_due=0` | `item` object matching the identity and completed state |
+| `saved.delete` | the same identity | successful envelope; exact absence comes only from subsequent list proof |
+
+Each `saved.list` item requires string `item_id`, `item_type`, `ts`, `state`, and
+`todo_state`; boolean `is_archived`; and numeric `date_created`, `date_updated`,
+`date_due`, `date_snoozed_until`, and `date_completed`. Only
+`item_type=message` is supported. The five required numeric counts are
+`total_count`, `uncompleted_count`, `completed_count`, `archived_count`, and
+`uncompleted_overdue_count`. Zero date values normalize to absent metadata.
+
+The service validates state/filter consistency, supported identity syntax,
+unique item identities, page limit, cursor progress, response bounds, mutation
+acknowledgement identity, and exact readback. Additive unknown fields are
+ignored; a missing/wrong required field, unsupported item kind, conflicting
+duplicate, or changed semantic state is `InvalidResponse` for that method.
 
 ## User Experience And Design Decisions
 
 - The default list is the in-progress inbox. Callers opt into `completed` or
   `archived`; API-specific `saved` naming is not exposed as the human concept.
-- The list limit applies to Later items and remains bounded. The continuation
-  cursor is opaque, tied to the chosen state, and rejected when malformed or
-  reused with incompatible selection so pages cannot silently overlap.
-- Hydrate each page in bounded batches, then use existing shared conversation,
-  user, thread, permalink, and file normalization. Do not issue one network
-  lookup per item when Slack supplies a batch route or a bounded directory can
-  be shared.
+- The list limit applies to Later items and remains bounded. A versioned
+  Lurkline cursor carries the workspace, selected state, limit, upstream
+  cursor, counts snapshot, and previous-page identities. A continuation is
+  used by itself; malformed, cross-workspace, selector-mismatched, repeated,
+  duplicate, immediately overlapping, or count-drifted state fails as stale.
+- Deterministic, non-overlapping pagination is guaranteed while the selected
+  Later list is unchanged. Slack exposes no immutable snapshot revision, so
+  any concurrent Later mutation invalidates continuation; not every same-count
+  replacement is detectable, and callers must restart from page one after a
+  mutation. Help and docs state this boundary instead of promising snapshot
+  isolation that the observed API cannot prove.
+- Hydrate each page in one grouped message batch and at most one grouped root
+  batch for replies, then use existing shared conversation, user, permalink,
+  and file normalization. Each row contains the exact saved `message` when
+  available and an optional `thread_root` only when the saved message is a
+  reply; full reply expansion is never performed. Message, root, and
+  conversation resolution are reported independently as complete, unavailable,
+  or not needed, with no one-request-per-item path.
 - Preserve a useful Later row when source context is deleted or unavailable:
   return its stable identity and metadata with explicit context-resolution
   state. Unknown response shapes and unknown resource kinds fail clearly
   rather than being silently dropped.
 - Save accepts a conversation reference plus exact message timestamp, matching
-  other message-targeting commands. The service resolves the conversation once,
-  verifies the source message before mutation, and reports the canonical target.
-- Complete is idempotent when the exact item is already completed. Remove is
-  idempotent when the exact target is provably absent. Every successful mutation
-  reports requested action, observed before/after state, and whether readback
-  reconciled; incomplete bounded proof fails actionably instead of overstating
-  success.
+  other message-targeting commands. Identity is the tuple `message` plus
+  canonical conversation ID plus exact timestamp. The service resolves the
+  conversation once, verifies the source message before mutation, and reports
+  the canonical target.
+- Confirmation is checked before every Slack read. A complete bounded scan of
+  all three views establishes exactly one before-state: save changes absent to
+  in-progress and is idempotent in-progress; completed/archived targets fail
+  with recovery guidance rather than invoking unproved reopen behavior.
+  Complete changes in-progress to completed and is idempotent completed;
+  archived or absent targets fail actionably. Remove changes one item in any
+  single state to absent and is idempotent only after complete absence proof.
+  Cross-view duplicates fail as contract drift.
+- Every successful mutation reports requested action, exact before/after state,
+  changed, and reconciled. Readback scans the relevant view and, for removal,
+  all three views. A scan cap, repeated cursor, ambiguous mutation transport,
+  conflicting view state, or incomplete proof returns a dedicated uncertain or
+  not-applied error rather than a success report.
 - Human output is an inbox-oriented summary with state, conversation, author,
   time/reminder, message preview, and permalink. Stable `--json` and MCP output
   retain the complete structured item and continuation data.
@@ -150,15 +206,18 @@ The goal is complete only when:
 
 1. CLI and MCP list in-progress, completed, and archived Later items with a
    useful default, validated limits, exact aggregate counts, deterministic
-   ordering, opaque state-bound cursors, and truthful continuation state.
+   unchanged-list ordering, opaque state-bound cursors, overlap/drift checks,
+   and an explicit concurrent-mutation restart boundary.
 2. Every supported row preserves stable Later identity and metadata and, when
-   available, exposes bounded hydrated source message, thread context, author,
-   conversation, attachments/files, and canonical permalink. Missing context is
-   explicit and unknown contract shapes fail actionably.
+   available, exposes the exact saved message, optional reply root, author,
+   conversation, attachments/files, and canonical permalink. Message, root,
+   and conversation resolution are independent; missing context is explicit and
+   unknown contract shapes fail actionably.
 3. Save, complete, and remove share typed service behavior, require both the
-   global write opt-in and exact confirmation, verify source/target identity,
-   handle already-satisfied state safely, and return exact bounded readback
-   reconciliation.
+   global write opt-in and exact confirmation before any read, implement the
+   recorded cross-view state machine, verify source/target identity, handle only
+   proved idempotent state safely, and return exact bounded readback
+   reconciliation or a dedicated uncertain/not-applied error.
 4. A Slack-saved file appears through its containing message and file metadata;
    no unsupported standalone file identity or undocumented API guarantee is
    presented.
