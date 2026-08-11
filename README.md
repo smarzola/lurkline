@@ -24,8 +24,8 @@ Use Lurkline to:
 Lurkline reads by default. CLI publication, deletion, Later, reaction,
 file-upload, and file-draft creation mutations require `--confirm`.
 The MCP server rejects every write unless you start it with
-`--allow-write`; publication, deletion, reactions, file uploads, and file-draft
-creation then also require `confirm: true`.
+`--allow-write`; publication, deletion, Later, reactions, file uploads, and
+file-draft creation then also require `confirm: true`.
 
 > [!WARNING]
 > Slack's browser-session APIs are unsupported and can change without notice.

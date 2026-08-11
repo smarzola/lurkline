@@ -118,8 +118,9 @@ duplicate, or changed semantic state is `InvalidResponse` for that method.
   `archived`; API-specific `saved` naming is not exposed as the human concept.
 - The list limit applies to Later items and remains bounded. A versioned
   Lurkline cursor carries the workspace, selected state, limit, upstream
-  cursor history, counts snapshot, and previous-page identities. A continuation
-  is used by itself; malformed, cross-workspace, selector-mismatched, repeated,
+  cursor history, counts snapshot, and previous-page identities (which can be
+  empty after an empty non-terminal page). A continuation is used by itself;
+  malformed, cross-workspace, selector-mismatched, repeated,
   duplicate, overlapping, or count-drifted state fails. A terminal page must
   account for the selected state count, a non-terminal page must leave items
   outstanding, and count relationships must remain internally consistent.

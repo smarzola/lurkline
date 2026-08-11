@@ -1692,7 +1692,10 @@ impl SlackService {
             .iter()
             .map(|identity| identity.conversation_id.clone())
             .collect::<HashSet<_>>();
-        let mut loaded = match self.load_conversations_by_id(&conversation_ids).await {
+        let mut loaded = match self
+            .load_conversations_by_id_with_policy(&conversation_ids, true)
+            .await
+        {
             Ok(loaded) => loaded,
             Err(error) if later_context_can_degrade(&error) => LoadedInboxConversations {
                 conversations: HashMap::new(),
@@ -4002,6 +4005,14 @@ impl SlackService {
         &self,
         ids: &HashSet<String>,
     ) -> Result<LoadedInboxConversations> {
+        self.load_conversations_by_id_with_policy(ids, false).await
+    }
+
+    async fn load_conversations_by_id_with_policy(
+        &self,
+        ids: &HashSet<String>,
+        preserve_on_degradable_interruption: bool,
+    ) -> Result<LoadedInboxConversations> {
         if ids.is_empty() {
             return Ok(LoadedInboxConversations {
                 conversations: HashMap::new(),
@@ -4017,10 +4028,19 @@ impl SlackService {
         let mut conversation_scan_complete = false;
 
         for page_index in 0..MAX_CONVERSATION_PAGES {
-            let page = self
+            let page = match self
                 .api
                 .conversations_list(cursor.as_deref(), CONVERSATIONS_PAGE_SIZE)
-                .await?;
+                .await
+            {
+                Ok(page) => page,
+                Err(error)
+                    if preserve_on_degradable_interruption && later_context_can_degrade(&error) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
             if page.channels.len() > CONVERSATIONS_PAGE_SIZE {
                 return Err(Error::InvalidResponse {
                     method: "conversations.list",
@@ -6545,7 +6565,6 @@ fn validate_later_cursor(cursor: &LaterCursor, team_id: &str) -> Result<()> {
     if cursor.version != LATER_CURSOR_VERSION
         || cursor.team_id != team_id
         || !(1..=MAX_LATER_ITEMS).contains(&cursor.limit)
-        || cursor.seen.is_empty()
         || cursor.seen.len() > MAX_LATER_ITEMS * MAX_LATER_SCAN_PAGES
         || cursor.seen.windows(2).any(|pair| pair[0] >= pair[1])
         || cursor.seen.iter().any(|identity| {
@@ -7805,6 +7824,7 @@ mod tests {
         reply_calls: Arc<Mutex<Vec<ReplyCall>>>,
         conversation_calls: Arc<Mutex<Vec<ConversationCall>>>,
         conversation_pages: Mutex<VecDeque<RawConversationsPage>>,
+        conversation_list_error_after: Option<usize>,
         conversation_list_error: Option<&'static str>,
         user_pages: Mutex<VecDeque<RawUsersPage>>,
         user_calls: Arc<Mutex<Vec<UserCall>>>,
@@ -8278,14 +8298,20 @@ mod tests {
             cursor: Option<&str>,
             limit: usize,
         ) -> Result<RawConversationsPage> {
-            self.conversation_calls
-                .lock()
-                .unwrap()
-                .push(ConversationCall {
+            let call_index = {
+                let mut calls = self.conversation_calls.lock().unwrap();
+                let call_index = calls.len();
+                calls.push(ConversationCall {
                     cursor: cursor.map(str::to_owned),
                     limit,
                 });
-            if let Some(error) = self.conversation_list_error {
+                call_index
+            };
+            if self
+                .conversation_list_error_after
+                .is_none_or(|after| after == call_index)
+                && let Some(error) = self.conversation_list_error
+            {
                 return match error {
                     "authentication" => Err(Error::Authentication),
                     "invalid_response" => Err(Error::InvalidResponse {
@@ -8858,6 +8884,7 @@ mod tests {
             reply_calls: Arc::new(Mutex::new(Vec::new())),
             conversation_calls: Arc::new(Mutex::new(Vec::new())),
             conversation_pages: Mutex::new(VecDeque::new()),
+            conversation_list_error_after: None,
             conversation_list_error: None,
             user_pages: Mutex::new(VecDeque::new()),
             user_calls: Arc::new(Mutex::new(Vec::new())),
@@ -16120,6 +16147,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn later_cursor_from_empty_nonterminal_page_is_usable() {
+        let counts = RawLaterCounts {
+            total_count: 1,
+            uncompleted_count: 1,
+            ..RawLaterCounts::default()
+        };
+        let api = fake_api();
+        api.later_pages.lock().unwrap().extend([
+            raw_later_page(Vec::new(), counts.clone(), "populated-page"),
+            raw_later_page(
+                vec![raw_later_item("C123", "100.000001", LaterState::InProgress)],
+                counts,
+                "",
+            ),
+        ]);
+        let slack = service(api);
+        let first = slack
+            .list_later(LaterRequest {
+                state: Some(LaterState::InProgress),
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(first.items.is_empty());
+        assert!(first.has_more);
+
+        let second = slack
+            .list_later(LaterRequest {
+                state: None,
+                limit: None,
+                cursor: first.next_cursor.as_deref(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].conversation_id, "C123");
+        assert!(!second.has_more);
+    }
+
+    #[tokio::test]
     async fn later_list_rejects_terminal_truncation_exhausted_cursors_and_bad_counts() {
         for page in [
             raw_later_page(
@@ -16404,6 +16472,85 @@ mod tests {
             page.items[0].message_resolution,
             LaterContextResolution::Complete
         );
+
+        let mut conversation_prefix_preserved = fake_api();
+        conversation_prefix_preserved
+            .later_items
+            .lock()
+            .unwrap()
+            .extend([
+                later_item(),
+                (
+                    LaterState::InProgress,
+                    raw_later_item("C456", "200.000001", LaterState::InProgress),
+                ),
+            ]);
+        conversation_prefix_preserved
+            .conversation_pages
+            .lock()
+            .unwrap()
+            .push_back(RawConversationsPage {
+                channels: vec![raw_conversation("C123", "resolved")],
+                response_metadata: RawResponseMetadata {
+                    next_cursor: "second-conversation-page".into(),
+                },
+            });
+        conversation_prefix_preserved.conversation_list_error_after = Some(1);
+        conversation_prefix_preserved.conversation_list_error = Some("timeout");
+        let page = service(conversation_prefix_preserved)
+            .list_later(LaterRequest {
+                state: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let resolved = page
+            .items
+            .iter()
+            .find(|item| item.conversation_id == "C123")
+            .unwrap();
+        let unresolved = page
+            .items
+            .iter()
+            .find(|item| item.conversation_id == "C456")
+            .unwrap();
+        assert_eq!(
+            resolved.conversation.as_ref().unwrap().display_name,
+            "resolved"
+        );
+        assert_eq!(
+            resolved.conversation_resolution,
+            LaterContextResolution::Complete
+        );
+        assert_eq!(unresolved.conversation, None);
+        assert_eq!(
+            unresolved.conversation_resolution,
+            LaterContextResolution::Unavailable
+        );
+
+        for error in ["authentication", "invalid_response"] {
+            let mut api = fake_api();
+            api.later_items.lock().unwrap().push(later_item());
+            api.conversation_list_error = Some(error);
+            let result = service(api)
+                .list_later(LaterRequest {
+                    state: None,
+                    limit: None,
+                    cursor: None,
+                })
+                .await;
+            assert!(matches!(
+                (error, result),
+                ("authentication", Err(Error::Authentication))
+                    | (
+                        "invalid_response",
+                        Err(Error::InvalidResponse {
+                            method: "conversations.list"
+                        })
+                    )
+            ));
+        }
 
         let mut source_unavailable = fake_api();
         source_unavailable
