@@ -46,13 +46,13 @@ use crate::{
 };
 
 const MAX_MESSAGES: usize = 200;
-pub(crate) const MAX_LATER_ITEMS: usize = 100;
+pub(crate) const MAX_LATER_ITEMS: usize = 50;
 const DEFAULT_LATER_ITEMS: usize = 25;
 const MAX_LATER_SCAN_PAGES: usize = 20;
 const LATER_CURSOR_VERSION: u8 = 1;
 const LATER_CURSOR_PREFIX: &str = "later-v1";
 const LATER_CURSOR_DOMAIN: &[u8] = b"lurkline-later-cursor-v1\0";
-const MAX_LATER_CURSOR_LENGTH: usize = 512 * 1024;
+const MAX_LATER_CURSOR_LENGTH: usize = 256 * 1024;
 pub(crate) const MAX_INBOX_CONVERSATIONS: usize = 50;
 pub(crate) const MAX_ACTIVITY_CONVERSATIONS: usize = 50;
 pub(crate) const MAX_ACTIVITY_MESSAGES: usize = 100;
@@ -15883,16 +15883,16 @@ mod tests {
             limit: MAX_LATER_ITEMS,
             slack_cursor: "upstream-cursor".into(),
             counts: LaterCounts {
-                total: 2_000,
-                in_progress: 2_000,
+                total: 1_000,
+                in_progress: 1_000,
                 completed: 0,
                 archived: 0,
                 overdue: 0,
             },
             seen: (0..MAX_LATER_ITEMS * MAX_LATER_SCAN_PAGES)
                 .map(|index| LaterIdentity {
-                    conversation_id: format!("C{index:04}"),
-                    message_ts: format!("{index}.000001"),
+                    conversation_id: format!("C{index:063}"),
+                    message_ts: format!("{index:025}.000001"),
                 })
                 .collect(),
         };
@@ -15900,7 +15900,7 @@ mod tests {
         assert!(encoded.len() <= MAX_LATER_CURSOR_LENGTH);
         let decoded = decode_later_cursor(&encoded).unwrap();
         validate_later_cursor(&decoded, "T123").unwrap();
-        assert_eq!(decoded.seen.len(), 2_000);
+        assert_eq!(decoded.seen.len(), 1_000);
 
         let mut tampered = encoded.into_bytes();
         let last = tampered.last_mut().unwrap();

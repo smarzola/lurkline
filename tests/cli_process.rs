@@ -285,6 +285,7 @@ fn version_and_help_expose_the_complete_cli_without_configuration() {
             "Later list help omitted {option}"
         );
     }
+    assert!(later_list.contains("from 1 through 50"));
     for command in ["save", "complete", "remove"] {
         let help = stdout(&["later", command, "--help"]);
         for option in ["--confirm", "--json"] {

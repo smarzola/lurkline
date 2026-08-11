@@ -95,7 +95,7 @@ struct ReadActivityRequest {
 struct ListLaterRequest {
     /// Later state to list. Defaults to in_progress.
     state: Option<LaterState>,
-    /// Maximum items to return, from 1 through 100. Defaults to 25.
+    /// Maximum items to return, from 1 through 50. Defaults to 25.
     limit: Option<usize>,
     /// Opaque continuation from a prior response; use without state or limit.
     cursor: Option<String>,

@@ -1180,8 +1180,8 @@ The following table lists primary and auxiliary bounds:
 | --- | ---: | --- |
 | Markdown input | 40,000 bytes | One user-directory scan only when explicit `slack-user:` mentions are present |
 | Draft list | One page of 100 | No conversation discovery |
-| Slack Later list | One page of 100; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages, one shared user scan when needed, one grouped source-message request, and at most one grouped thread-root request |
-| Slack Later mutation proof | One exact message identity | 20 pages of 100 per non-empty Later state before and after the write |
+| Slack Later list | One page of 50; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages, one shared user scan when needed, one grouped source-message request, and at most one grouped thread-root request |
+| Slack Later mutation proof | One exact message identity | 20 pages of 50 per non-empty Later state before and after the write |
 | One-file draft proof | One file and one destination | 10 active-draft pages of 100; six bounded reads per reconciliation phase, with at most 7.75 seconds of draft-state delay |
 | Conversation list | One page of 200 | Up to 20 user pages of 200 for DMs |
 | Conversation find | 100 | 20 conversation pages and 20 user pages of 200 |
@@ -1201,8 +1201,8 @@ The following table lists primary and auxiliary bounds:
 
 Slack-provided opaque cursors are limited to 2,048 non-control characters.
 Locally issued activity continuation cursors are limited to 8,192 bytes.
-Slack Later continuation cursors are limited to 512 KiB and retain at most
-2,000 prior identities so overlap checks cover every earlier page within the
+Slack Later continuation cursors are limited to 256 KiB and retain at most
+1,000 prior identities so overlap checks cover every earlier page within the
 mutation scan bound. Repeated response cursors fail instead of creating
 pagination loops. Result JSON reports continuation or scan truncation when the
 operation supports it.

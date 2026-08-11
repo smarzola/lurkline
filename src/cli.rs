@@ -229,7 +229,7 @@ pub enum LaterCommand {
         /// Later state to list; defaults to in-progress.
         #[arg(long, value_enum, conflicts_with = "cursor")]
         state: Option<LaterStateArg>,
-        /// Maximum items to return, from 1 through 100; defaults to 25.
+        /// Maximum items to return, from 1 through 50; defaults to 25.
         #[arg(long, conflicts_with = "cursor")]
         limit: Option<usize>,
         /// Opaque cursor from a previous Later response; use by itself.

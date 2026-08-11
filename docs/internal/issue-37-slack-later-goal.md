@@ -74,6 +74,10 @@ Verified before implementation:
 - A four-target live `messages.list` batch verified the existing grouped array
   encoding and returned two available source messages. Partial hydration is
   therefore an expected first-class result, not a whole-page failure.
+- Exact-candidate read-only limit probing found Slack accepts `saved.list`
+  `limit=50` and rejects `limit=51` with `invalid_arguments`. Public CLI/MCP
+  limits and bounded mutation scans therefore use 50 rather than borrowing the
+  unrelated 100-item bounds of other Slack methods.
 - CI and release workflows gate format, strict locked Clippy, all-target tests,
   release build, credential scanning, Rust 1.88, macOS ARM64, version alignment,
   and three native archives plus their checksum files.
@@ -86,7 +90,7 @@ non-secret `_x_reason`. Lurkline never logs or returns these transport fields.
 
 | Method | Additional form fields | Required success shape |
 | --- | --- | --- |
-| `saved.list` | `filter=saved|completed|archived`, `include_tombstones=true`, decimal `limit`, optional opaque `cursor` | `saved_items` array, `counts` object, string `response_metadata.next_cursor` |
+| `saved.list` | `filter=saved|completed|archived`, `include_tombstones=true`, decimal `limit` from 1 through 50, optional opaque `cursor` | `saved_items` array, `counts` object, string `response_metadata.next_cursor` |
 | `messages.list` | `message_ids` JSON array grouped as `[{"channel":"C...","timestamps":["..."]}]`, `org_wide_aware=true`, `cached_latest_updates={}` | `messages_data` keyed by requested conversation; each entry may supply `messages`, `latest_updates`, and `unchanged_messages`; requested messages may be unavailable |
 | `saved.add` | `item_type=message`, `item_id` canonical conversation ID, exact `ts` | `item` object matching the requested identity |
 | `saved.update` | the same identity, `mark=completed`, `todo_state=completed`, `date_due=0` | `item` object matching the identity and completed state |
