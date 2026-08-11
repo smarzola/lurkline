@@ -274,6 +274,27 @@ fn version_and_help_expose_the_complete_cli_without_configuration() {
     }
     assert!(stdout(&["emoji", "list", "--help"]).contains("--json"));
 
+    let later = stdout(&["later", "--help"]);
+    for command in ["list", "save", "complete", "remove"] {
+        assert!(later.contains(command), "Later help omitted {command}");
+    }
+    let later_list = stdout(&["later", "list", "--help"]);
+    for option in ["--state", "--limit", "--cursor", "--json"] {
+        assert!(
+            later_list.contains(option),
+            "Later list help omitted {option}"
+        );
+    }
+    for command in ["save", "complete", "remove"] {
+        let help = stdout(&["later", command, "--help"]);
+        for option in ["--confirm", "--json"] {
+            assert!(
+                help.contains(option),
+                "Later {command} help omitted {option}"
+            );
+        }
+    }
+
     let mcp = stdout(&["mcp", "--help"]);
     assert!(mcp.contains("--allow-write"));
     assert!(mcp.contains("--file-root"));
@@ -582,6 +603,16 @@ fn invalid_search_query_fails_before_a_slack_request() {
 
 #[test]
 fn file_and_reaction_process_guards_fail_before_network_access() {
+    for action in ["save", "complete", "remove"] {
+        let output = run_with_credentials(&["later", action, "C123", "100.000001"]);
+        assert!(!output.status.success(), "{action}");
+        assert!(output.stdout.is_empty(), "{action}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "error: confirmation is required for Slack Later mutation\n",
+            "{action}"
+        );
+    }
     for action in ["add", "remove"] {
         let output = run_with_credentials(&["reactions", action, "C123", "100.000001", "eyes"]);
         assert!(!output.status.success(), "{action}");

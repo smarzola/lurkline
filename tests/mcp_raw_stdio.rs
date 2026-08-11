@@ -161,17 +161,21 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             "slack_list_conversations",
             "slack_list_custom_emoji",
             "slack_list_drafts",
+            "slack_list_later",
             "slack_list_unreads",
             "slack_read_activity",
             "slack_read_channel",
             "slack_read_inbox",
             "slack_read_thread",
+            "slack_remove_from_later",
             "slack_remove_reaction",
             "slack_render_markdown",
+            "slack_save_for_later",
             "slack_search_messages",
             "slack_send_draft",
             "slack_send_message",
             "slack_update_draft",
+            "slack_complete_later",
         ])
     );
     for tool_name in [
@@ -374,6 +378,40 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
             );
         }
     }
+    let later_tool = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "slack_list_later")
+        .expect("Later list tool");
+    let later_input_schema = serde_json::to_string(&later_tool["inputSchema"]).unwrap();
+    let later_output_schema = serde_json::to_string(&later_tool["outputSchema"]).unwrap();
+    for expected in [
+        "state",
+        "in_progress",
+        "completed",
+        "archived",
+        "limit",
+        "cursor",
+    ] {
+        assert!(
+            later_input_schema.contains(expected),
+            "Later input schema omits {expected}"
+        );
+    }
+    for expected in [
+        "items",
+        "counts",
+        "message_resolution",
+        "thread_root",
+        "thread_root_resolution",
+        "next_cursor",
+    ] {
+        assert!(
+            later_output_schema.contains(expected),
+            "Later output schema omits {expected}"
+        );
+    }
 
     send(
         &mut stdin,
@@ -491,6 +529,20 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
         "invalid_input"
     );
 
+    let invalid_later = call_tool(
+        &mut stdin,
+        &mut stdout,
+        20041,
+        "slack_list_later",
+        json!({"limit": 0}),
+    )
+    .await;
+    assert_eq!(invalid_later["result"]["isError"], true);
+    assert_eq!(
+        invalid_later["result"]["structuredContent"]["error"]["code"],
+        "invalid_input"
+    );
+
     send(
         &mut stdin,
         json!({
@@ -546,6 +598,24 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
                 "message": "Slack writes are disabled; start the MCP server with --allow-write"
             }
         })
+    );
+
+    let later_write_disabled = call_tool(
+        &mut stdin,
+        &mut stdout,
+        20042,
+        "slack_save_for_later",
+        json!({
+            "conversation": "C123",
+            "message_ts": "100.000001",
+            "confirm": true
+        }),
+    )
+    .await;
+    assert_eq!(later_write_disabled["result"]["isError"], true);
+    assert_eq!(
+        later_write_disabled["result"]["structuredContent"]["error"]["code"],
+        "write_not_allowed"
     );
 
     for (id, name) in [(25, "slack_add_reaction"), (26, "slack_remove_reaction")] {
@@ -929,6 +999,23 @@ async fn raw_json_rpc_exposes_and_guards_enabled_file_uploads() {
     assert_eq!(unconfirmed["result"]["isError"], true);
     assert_eq!(
         unconfirmed["result"]["structuredContent"]["error"]["code"],
+        "confirmation_required"
+    );
+    let unconfirmed_later = call_tool(
+        &mut stdin,
+        &mut stdout,
+        108,
+        "slack_complete_later",
+        json!({
+            "conversation": "C123",
+            "message_ts": "100.000001",
+            "confirm": false
+        }),
+    )
+    .await;
+    assert_eq!(unconfirmed_later["result"]["isError"], true);
+    assert_eq!(
+        unconfirmed_later["result"]["structuredContent"]["error"]["code"],
         "confirmation_required"
     );
     let unconfirmed = call_tool(

@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     io::{self, Write},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -30,20 +30,29 @@ use crate::{
         CustomEmojiList, DoctorReport, Draft, DraftCleanupWarning, DraftDeleteReport,
         DraftDestination, DraftPage, DraftSendReport, FileDownloadReport, FileDraftAssociation,
         FileDraftCreateReport, FileReference, FileShare, FileShareVisibility, FileUploadReport,
-        InboxConversation, InboxReport, InboxTruncationReason, MentionResolution, Message,
-        MessageMention, MessagePage, MessageSearchMatch, MessageSearchPage,
-        OutboundMentionResolution, PermalinkResolution, RawAuthTestResponse, RawConversation,
-        RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision, RawDraftsPage,
-        RawEmojiResponse, RawFile, RawFileResponse, RawFileUploadAllocation,
-        RawFileUploadCompletion, RawMessage, RawMessagePage, RawMessageSearchMatch,
-        RawMessageSearchResponse, RawMessagesList, RawMutationResponse, RawPostMessageResponse,
-        RawReaction, RawReactionItemResponse, RawUnread, RawUser, RawUsersPage, Reaction,
-        ReactionMutationReport, RenderedMessage, SentMessage, ThreadPage, UnreadConversation,
-        UnreadReport, UnreadThreads, User, UserSearchReport, UserSearchTruncationReason,
+        InboxConversation, InboxReport, InboxTruncationReason, LaterContextResolution, LaterCounts,
+        LaterItem, LaterMutationAction, LaterMutationReport, LaterPage, LaterState,
+        MentionResolution, Message, MessageMention, MessagePage, MessageSearchMatch,
+        MessageSearchPage, OutboundMentionResolution, PermalinkResolution, RawAuthTestResponse,
+        RawConversation, RawConversationsPage, RawDraft, RawDraftResponse, RawDraftRevision,
+        RawDraftsPage, RawEmojiResponse, RawFile, RawFileResponse, RawFileUploadAllocation,
+        RawFileUploadCompletion, RawLaterItem, RawLaterMutationResponse, RawLaterPage, RawMessage,
+        RawMessagePage, RawMessageSearchMatch, RawMessageSearchResponse, RawMessagesList,
+        RawMutationResponse, RawPostMessageResponse, RawReaction, RawReactionItemResponse,
+        RawUnread, RawUser, RawUsersPage, Reaction, ReactionMutationReport, RenderedMessage,
+        SentMessage, ThreadPage, UnreadConversation, UnreadReport, UnreadThreads, User,
+        UserSearchReport, UserSearchTruncationReason,
     },
 };
 
 const MAX_MESSAGES: usize = 200;
+pub(crate) const MAX_LATER_ITEMS: usize = 100;
+const DEFAULT_LATER_ITEMS: usize = 25;
+const MAX_LATER_SCAN_PAGES: usize = 20;
+const LATER_CURSOR_VERSION: u8 = 1;
+const LATER_CURSOR_PREFIX: &str = "later-v1";
+const LATER_CURSOR_DOMAIN: &[u8] = b"lurkline-later-cursor-v1\0";
+const MAX_LATER_CURSOR_LENGTH: usize = 512 * 1024;
 pub(crate) const MAX_INBOX_CONVERSATIONS: usize = 50;
 pub(crate) const MAX_ACTIVITY_CONVERSATIONS: usize = 50;
 pub(crate) const MAX_ACTIVITY_MESSAGES: usize = 100;
@@ -112,6 +121,12 @@ pub(crate) struct ActivityRequest<'a> {
     pub(crate) cursor: Option<&'a str>,
 }
 
+pub(crate) struct LaterRequest<'a> {
+    pub(crate) state: Option<LaterState>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) cursor: Option<&'a str>,
+}
+
 pub(crate) struct ChatPostMessageRequest<'a> {
     pub(crate) channel: &'a str,
     pub(crate) thread_ts: Option<&'a str>,
@@ -158,6 +173,52 @@ pub(crate) trait SlackApi: Send + Sync {
         limit: usize,
     ) -> Result<RawMessagePage>;
     async fn messages_list(&self, channel: &str, message_ts: &str) -> Result<RawMessagesList>;
+    async fn messages_list_batch(
+        &self,
+        targets: &[(String, Vec<String>)],
+    ) -> Result<RawMessagesList> {
+        if let [(channel, timestamps)] = targets
+            && let [message_ts] = timestamps.as_slice()
+        {
+            return self.messages_list(channel, message_ts).await;
+        }
+        Err(Error::InvalidResponse {
+            method: "messages.list",
+        })
+    }
+    async fn saved_list(
+        &self,
+        state: LaterState,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawLaterPage> {
+        let _ = (state, cursor, limit);
+        Err(Error::InvalidResponse {
+            method: "saved.list",
+        })
+    }
+    async fn saved_add(&self, channel: &str, message_ts: &str) -> Result<RawLaterMutationResponse> {
+        let _ = (channel, message_ts);
+        Err(Error::InvalidResponse {
+            method: "saved.add",
+        })
+    }
+    async fn saved_complete(
+        &self,
+        channel: &str,
+        message_ts: &str,
+    ) -> Result<RawLaterMutationResponse> {
+        let _ = (channel, message_ts);
+        Err(Error::InvalidResponse {
+            method: "saved.update",
+        })
+    }
+    async fn saved_delete(&self, channel: &str, message_ts: &str) -> Result<RawMutationResponse> {
+        let _ = (channel, message_ts);
+        Err(Error::InvalidResponse {
+            method: "saved.delete",
+        })
+    }
     async fn conversations_list(
         &self,
         cursor: Option<&str>,
@@ -614,6 +675,27 @@ struct ActivityConversationDirectory {
     candidates: Vec<ActivityConversationCandidate>,
     scanned_conversations: usize,
     scan_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+struct LaterIdentity {
+    conversation_id: String,
+    message_ts: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct LaterCursor {
+    version: u8,
+    team_id: String,
+    state: LaterState,
+    limit: usize,
+    slack_cursor: String,
+    counts: LaterCounts,
+    seen: Vec<LaterIdentity>,
+}
+
+struct LaterTargetSnapshot {
+    state: LaterState,
 }
 
 impl SlackService {
@@ -1193,6 +1275,519 @@ impl SlackService {
     ) -> Result<()> {
         validate_draft_destination(thread_ts, broadcast)?;
         Self::validate_upload_request(conversation, thread_ts, title, alt_text, file_name)
+    }
+
+    pub(crate) async fn list_later(&self, request: LaterRequest<'_>) -> Result<LaterPage> {
+        let cursor = match request.cursor {
+            Some(value) => {
+                if request.state.is_some() || request.limit.is_some() {
+                    return Err(Error::invalid_input(
+                        "cursor",
+                        "must be used without state or limit options",
+                    ));
+                }
+                let cursor = decode_later_cursor(value)?;
+                validate_later_cursor(&cursor, &self.team_id)?;
+                Some(cursor)
+            }
+            None => None,
+        };
+        let state = cursor
+            .as_ref()
+            .map(|cursor| cursor.state)
+            .or(request.state)
+            .unwrap_or(LaterState::InProgress);
+        let limit = cursor
+            .as_ref()
+            .map(|cursor| cursor.limit)
+            .or(request.limit)
+            .unwrap_or(DEFAULT_LATER_ITEMS);
+        validate_limit("limit", limit, MAX_LATER_ITEMS)?;
+
+        let upstream_cursor = cursor.as_ref().map(|cursor| cursor.slack_cursor.as_str());
+        let raw = self.api.saved_list(state, upstream_cursor, limit).await?;
+        let (raw_items, counts, next_upstream) =
+            validate_later_page(raw, state, upstream_cursor, limit)?;
+        let identities = raw_items
+            .iter()
+            .map(later_identity)
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(cursor) = &cursor
+            && (cursor.counts != counts
+                || identities
+                    .iter()
+                    .any(|identity| cursor.seen.binary_search(identity).is_ok()))
+        {
+            return Err(stale_later_cursor());
+        }
+
+        let items = self.hydrate_later_items(state, raw_items).await?;
+        let next_cursor = if let Some(next_upstream) = next_upstream {
+            let mut seen = cursor
+                .as_ref()
+                .map(|cursor| cursor.seen.clone())
+                .unwrap_or_default();
+            seen.extend(identities);
+            seen.sort();
+            seen.dedup();
+            if seen.len() > MAX_LATER_ITEMS * MAX_LATER_SCAN_PAGES {
+                return Err(Error::ScanLimit {
+                    resource: "Slack Later items",
+                    limit: MAX_LATER_ITEMS * MAX_LATER_SCAN_PAGES,
+                });
+            }
+            Some(encode_later_cursor(&LaterCursor {
+                version: LATER_CURSOR_VERSION,
+                team_id: self.team_id.clone(),
+                state,
+                limit,
+                slack_cursor: next_upstream,
+                counts: counts.clone(),
+                seen,
+            })?)
+        } else {
+            None
+        };
+        let page = LaterPage {
+            team_id: self.team_id.clone(),
+            state,
+            items,
+            counts,
+            limit,
+            has_more: next_cursor.is_some(),
+            next_cursor,
+        };
+        if !serialized_json_fits(&page, self.max_response_bytes) {
+            return Err(Error::ResponseTooLarge {
+                method: "saved.list",
+                limit: self.max_response_bytes,
+            });
+        }
+        Ok(page)
+    }
+
+    pub(crate) async fn save_for_later(
+        &self,
+        conversation: &str,
+        message_ts: &str,
+        confirmed: bool,
+    ) -> Result<LaterMutationReport> {
+        self.mutate_later(
+            conversation,
+            message_ts,
+            LaterMutationAction::Save,
+            confirmed,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_later(
+        &self,
+        conversation: &str,
+        message_ts: &str,
+        confirmed: bool,
+    ) -> Result<LaterMutationReport> {
+        self.mutate_later(
+            conversation,
+            message_ts,
+            LaterMutationAction::Complete,
+            confirmed,
+        )
+        .await
+    }
+
+    pub(crate) async fn remove_from_later(
+        &self,
+        conversation: &str,
+        message_ts: &str,
+        confirmed: bool,
+    ) -> Result<LaterMutationReport> {
+        self.mutate_later(
+            conversation,
+            message_ts,
+            LaterMutationAction::Remove,
+            confirmed,
+        )
+        .await
+    }
+
+    async fn mutate_later(
+        &self,
+        conversation: &str,
+        message_ts: &str,
+        action: LaterMutationAction,
+        confirmed: bool,
+    ) -> Result<LaterMutationReport> {
+        require_confirmation("Slack Later mutation", confirmed)?;
+        validate_timestamp("message_ts", message_ts)?;
+        let channel_id = self.resolve_conversation_id(conversation).await?;
+        if action == LaterMutationAction::Save {
+            self.get_message_by_id(&channel_id, message_ts).await?;
+        }
+        let before = self.scan_later_target(&channel_id, message_ts).await?;
+        let before_state = before.as_ref().map(|snapshot| snapshot.state);
+        match (action, before_state) {
+            (LaterMutationAction::Save, Some(LaterState::InProgress))
+            | (LaterMutationAction::Complete, Some(LaterState::Completed)) => {
+                return Ok(LaterMutationReport {
+                    conversation_id: channel_id,
+                    message_ts: message_ts.to_owned(),
+                    action,
+                    before_state,
+                    after_state: before_state,
+                    changed: false,
+                    reconciled: false,
+                });
+            }
+            (LaterMutationAction::Remove, None) => {
+                return Ok(LaterMutationReport {
+                    conversation_id: channel_id,
+                    message_ts: message_ts.to_owned(),
+                    action,
+                    before_state: None,
+                    after_state: None,
+                    changed: false,
+                    reconciled: false,
+                });
+            }
+            (LaterMutationAction::Save, Some(_)) => {
+                return Err(Error::invalid_input(
+                    "state",
+                    "the item is completed or archived; reopen or remove it in Slack before saving it again",
+                ));
+            }
+            (LaterMutationAction::Complete, Some(LaterState::Archived)) => {
+                return Err(Error::invalid_input(
+                    "state",
+                    "the item is archived; restore it in Slack before marking it complete",
+                ));
+            }
+            (LaterMutationAction::Complete, None) => {
+                return Err(Error::NotFound {
+                    resource: "Slack Later item",
+                });
+            }
+            _ => {}
+        }
+
+        let mutation = match action {
+            LaterMutationAction::Save => self.api.saved_add(&channel_id, message_ts).await,
+            LaterMutationAction::Complete => self.api.saved_complete(&channel_id, message_ts).await,
+            LaterMutationAction::Remove => self
+                .api
+                .saved_delete(&channel_id, message_ts)
+                .await
+                .map(|_| RawLaterMutationResponse {
+                    item: RawLaterItem::default(),
+                }),
+        };
+        let expected_state = match action {
+            LaterMutationAction::Save => Some(LaterState::InProgress),
+            LaterMutationAction::Complete => Some(LaterState::Completed),
+            LaterMutationAction::Remove => None,
+        };
+        let (mutation_was_ambiguous, acknowledgement_error) = match mutation {
+            Ok(_) if action == LaterMutationAction::Remove => (false, None),
+            Ok(response) => (
+                false,
+                validate_later_ack(
+                    &response.item,
+                    &channel_id,
+                    message_ts,
+                    expected_state.expect("non-remove mutation has a target state"),
+                )
+                .err(),
+            ),
+            Err(error) if mutation_error_is_ambiguous(&error) => (true, None),
+            Err(error) => return Err(error),
+        };
+
+        let after = self
+            .scan_later_target(&channel_id, message_ts)
+            .await
+            .map_err(|_| Error::LaterMutationUncertain {
+                channel_id: channel_id.clone(),
+                message_ts: message_ts.to_owned(),
+                action: later_action_name(action),
+            })?;
+        let after_state = after.as_ref().map(|snapshot| snapshot.state);
+        if let Some(error) = acknowledgement_error {
+            return Err(error);
+        }
+        if after_state == expected_state {
+            return Ok(LaterMutationReport {
+                conversation_id: channel_id,
+                message_ts: message_ts.to_owned(),
+                action,
+                before_state,
+                after_state,
+                changed: true,
+                reconciled: true,
+            });
+        }
+        if mutation_was_ambiguous {
+            Err(Error::LaterMutationUncertain {
+                channel_id,
+                message_ts: message_ts.to_owned(),
+                action: later_action_name(action),
+            })
+        } else {
+            Err(Error::LaterMutationNotApplied {
+                channel_id,
+                message_ts: message_ts.to_owned(),
+                action: later_action_name(action),
+            })
+        }
+    }
+
+    async fn scan_later_target(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+    ) -> Result<Option<LaterTargetSnapshot>> {
+        let mut found = None;
+        let mut expected_counts = None;
+        for state in [
+            LaterState::InProgress,
+            LaterState::Completed,
+            LaterState::Archived,
+        ] {
+            if let Some(counts) = &expected_counts
+                && later_count_for_state(counts, state) == 0
+            {
+                continue;
+            }
+            let mut cursor = None;
+            let mut seen_cursors = HashSet::new();
+            for page_index in 0..MAX_LATER_SCAN_PAGES {
+                let raw = self
+                    .api
+                    .saved_list(state, cursor.as_deref(), MAX_LATER_ITEMS)
+                    .await?;
+                let (items, counts, next) =
+                    validate_later_page(raw, state, cursor.as_deref(), MAX_LATER_ITEMS)?;
+                if let Some(expected) = &expected_counts {
+                    if expected != &counts {
+                        return Err(Error::InvalidResponse {
+                            method: "saved.list",
+                        });
+                    }
+                } else {
+                    expected_counts = Some(counts);
+                }
+                for item in items {
+                    if item.item_id == channel_id && item.ts == message_ts {
+                        if found.is_some() {
+                            return Err(Error::InvalidResponse {
+                                method: "saved.list",
+                            });
+                        }
+                        found = Some(LaterTargetSnapshot { state });
+                    }
+                }
+                let Some(next) = next else {
+                    break;
+                };
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(Error::InvalidResponse {
+                        method: "saved.list",
+                    });
+                }
+                cursor = Some(next);
+                if page_index + 1 == MAX_LATER_SCAN_PAGES {
+                    return Err(Error::ScanLimit {
+                        resource: "Slack Later items",
+                        limit: MAX_LATER_ITEMS * MAX_LATER_SCAN_PAGES,
+                    });
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    async fn hydrate_later_items(
+        &self,
+        state: LaterState,
+        raw_items: Vec<RawLaterItem>,
+    ) -> Result<Vec<LaterItem>> {
+        let identities = raw_items
+            .iter()
+            .map(later_identity)
+            .collect::<Result<Vec<_>>>()?;
+        let conversation_ids = identities
+            .iter()
+            .map(|identity| identity.conversation_id.clone())
+            .collect::<HashSet<_>>();
+        let mut loaded = self.load_conversations_by_id(&conversation_ids).await?;
+        let mut messages = self.load_later_messages(&identities).await?;
+        let root_identities = messages
+            .values()
+            .filter_map(|message| {
+                message
+                    .thread_ts
+                    .as_deref()
+                    .filter(|thread_ts| *thread_ts != message.ts)
+                    .map(|thread_ts| LaterIdentity {
+                        conversation_id: message.channel_id.clone(),
+                        message_ts: thread_ts.to_owned(),
+                    })
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut roots = self.load_later_messages(&root_identities).await?;
+        if messages.values().any(message_needs_directory)
+            || roots.values().any(message_needs_directory)
+        {
+            if loaded.author_directory.is_none() {
+                loaded.author_directory = Some(self.author_directory(None).await);
+            }
+            if let Some(directory) = &loaded.author_directory {
+                for message in messages.values_mut().chain(roots.values_mut()) {
+                    enrich_messages_from_directory(std::slice::from_mut(message), directory);
+                }
+            }
+        }
+
+        raw_items
+            .into_iter()
+            .map(|raw| {
+                let identity = later_identity(&raw)?;
+                let message = messages.remove(&identity);
+                let root_identity = message.as_ref().and_then(|message| {
+                    message
+                        .thread_ts
+                        .as_deref()
+                        .filter(|thread_ts| *thread_ts != message.ts)
+                        .map(|thread_ts| LaterIdentity {
+                            conversation_id: identity.conversation_id.clone(),
+                            message_ts: thread_ts.to_owned(),
+                        })
+                });
+                let thread_root = root_identity
+                    .as_ref()
+                    .and_then(|identity| roots.remove(identity));
+                let thread_root_resolution = match (message.as_ref(), root_identity.as_ref()) {
+                    (None, _) => LaterContextResolution::Unavailable,
+                    (Some(_), None) => LaterContextResolution::NotNeeded,
+                    (Some(_), Some(_)) if thread_root.is_some() => LaterContextResolution::Complete,
+                    (Some(_), Some(_)) => LaterContextResolution::Unavailable,
+                };
+                let conversation = loaded.conversations.get(&identity.conversation_id).cloned();
+                Ok(LaterItem {
+                    conversation_id: identity.conversation_id,
+                    message_ts: identity.message_ts,
+                    state,
+                    created_at: raw.date_created,
+                    updated_at: raw.date_updated,
+                    due_at: nonzero_timestamp(raw.date_due),
+                    snoozed_until: nonzero_timestamp(raw.date_snoozed_until),
+                    completed_at: nonzero_timestamp(raw.date_completed),
+                    conversation_resolution: if conversation.is_some() {
+                        LaterContextResolution::Complete
+                    } else {
+                        LaterContextResolution::Unavailable
+                    },
+                    conversation,
+                    message_resolution: if message.is_some() {
+                        LaterContextResolution::Complete
+                    } else {
+                        LaterContextResolution::Unavailable
+                    },
+                    message,
+                    thread_root,
+                    thread_root_resolution,
+                })
+            })
+            .collect()
+    }
+
+    async fn load_later_messages(
+        &self,
+        identities: &[LaterIdentity],
+    ) -> Result<HashMap<LaterIdentity, Message>> {
+        if identities.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut grouped = BTreeMap::<String, Vec<String>>::new();
+        for identity in identities {
+            grouped
+                .entry(identity.conversation_id.clone())
+                .or_default()
+                .push(identity.message_ts.clone());
+        }
+        for timestamps in grouped.values_mut() {
+            timestamps.sort();
+            timestamps.dedup();
+        }
+        let targets = grouped.into_iter().collect::<Vec<_>>();
+        let raw = self.api.messages_list_batch(&targets).await?;
+        let wanted = identities.iter().cloned().collect::<HashSet<_>>();
+        let response_bound = identities.len().saturating_mul(4);
+        let response_messages = raw.messages.len().saturating_add(
+            raw.messages_data
+                .values()
+                .map(|messages| messages.messages.len())
+                .sum::<usize>(),
+        );
+        if response_messages > response_bound {
+            return Err(Error::InvalidResponse {
+                method: "messages.list",
+            });
+        }
+        let requested_channels = targets
+            .iter()
+            .map(|(channel, _)| channel.as_str())
+            .collect::<HashSet<_>>();
+        if raw
+            .messages_data
+            .keys()
+            .any(|channel| !requested_channels.contains(channel.as_str()))
+        {
+            return Err(Error::InvalidResponse {
+                method: "messages.list",
+            });
+        }
+
+        let mut found = HashMap::new();
+        for (channel, channel_messages) in raw.messages_data {
+            for raw_message in channel_messages.messages {
+                validate_later_message_identity(&raw_message)?;
+                let identity = LaterIdentity {
+                    conversation_id: channel.clone(),
+                    message_ts: raw_message.ts.clone(),
+                };
+                if wanted.contains(&identity) {
+                    let message = normalize_message(
+                        &self.workspace_url,
+                        &channel,
+                        raw_message,
+                        "messages.list",
+                    )?;
+                    insert_later_message(&mut found, identity, message)?;
+                }
+            }
+        }
+        for raw_message in raw.messages.into_values() {
+            validate_later_message_identity(&raw_message)?;
+            let mut matching = wanted
+                .iter()
+                .filter(|identity| identity.message_ts == raw_message.ts);
+            let Some(identity) = matching.next().cloned() else {
+                continue;
+            };
+            if matching.next().is_some() {
+                continue;
+            }
+            let message = normalize_message(
+                &self.workspace_url,
+                &identity.conversation_id,
+                raw_message,
+                "messages.list",
+            )?;
+            insert_later_message(&mut found, identity, message)?;
+        }
+        Ok(found)
     }
 
     pub(crate) async fn add_reaction(
@@ -5647,6 +6242,227 @@ fn normalize_message(
     })
 }
 
+fn validate_later_page(
+    raw: RawLaterPage,
+    state: LaterState,
+    current_cursor: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<RawLaterItem>, LaterCounts, Option<String>)> {
+    if raw.saved_items.len() > limit {
+        return Err(Error::InvalidResponse {
+            method: "saved.list",
+        });
+    }
+    let mut seen = HashSet::with_capacity(raw.saved_items.len());
+    for item in &raw.saved_items {
+        validate_later_raw_item(item, state, "saved.list")?;
+        if !seen.insert(later_identity(item)?) {
+            return Err(Error::InvalidResponse {
+                method: "saved.list",
+            });
+        }
+    }
+    let next = response_cursor("saved.list", raw.response_metadata.next_cursor)?;
+    reject_repeated_cursor("saved.list", current_cursor, next.as_deref())?;
+    Ok((raw.saved_items, normalize_later_counts(raw.counts), next))
+}
+
+fn validate_later_raw_item(
+    item: &RawLaterItem,
+    state: LaterState,
+    method: &'static str,
+) -> Result<()> {
+    let state_matches = match state {
+        LaterState::InProgress => {
+            item.state == "in_progress" && item.todo_state == "saved" && !item.is_archived
+        }
+        LaterState::Completed => {
+            item.state == "completed" && item.todo_state == "completed" && !item.is_archived
+        }
+        LaterState::Archived => {
+            item.state == "archived" && item.todo_state == "saved" && item.is_archived
+        }
+    };
+    if item.item_type != "message"
+        || !is_valid_any_conversation_id(&item.item_id)
+        || !is_valid_timestamp(&item.ts)
+        || !state_matches
+    {
+        return Err(Error::InvalidResponse { method });
+    }
+    Ok(())
+}
+
+fn validate_later_ack(
+    item: &RawLaterItem,
+    channel_id: &str,
+    message_ts: &str,
+    state: LaterState,
+) -> Result<()> {
+    let method = match state {
+        LaterState::InProgress => "saved.add",
+        LaterState::Completed => "saved.update",
+        LaterState::Archived => "saved.update",
+    };
+    validate_later_raw_item(item, state, method)?;
+    if item.item_id != channel_id || item.ts != message_ts {
+        return Err(Error::InvalidResponse { method });
+    }
+    Ok(())
+}
+
+fn later_identity(item: &RawLaterItem) -> Result<LaterIdentity> {
+    if item.item_type != "message"
+        || !is_valid_any_conversation_id(&item.item_id)
+        || !is_valid_timestamp(&item.ts)
+    {
+        return Err(Error::InvalidResponse {
+            method: "saved.list",
+        });
+    }
+    Ok(LaterIdentity {
+        conversation_id: item.item_id.clone(),
+        message_ts: item.ts.clone(),
+    })
+}
+
+fn normalize_later_counts(raw: crate::model::RawLaterCounts) -> LaterCounts {
+    LaterCounts {
+        total: raw.total_count,
+        in_progress: raw.uncompleted_count,
+        completed: raw.completed_count,
+        archived: raw.archived_count,
+        overdue: raw.uncompleted_overdue_count,
+    }
+}
+
+fn later_count_for_state(counts: &LaterCounts, state: LaterState) -> u64 {
+    match state {
+        LaterState::InProgress => counts.in_progress,
+        LaterState::Completed => counts.completed,
+        LaterState::Archived => counts.archived,
+    }
+}
+
+fn nonzero_timestamp(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
+}
+
+fn insert_later_message(
+    messages: &mut HashMap<LaterIdentity, Message>,
+    identity: LaterIdentity,
+    message: Message,
+) -> Result<()> {
+    match messages.entry(identity) {
+        Entry::Vacant(entry) => {
+            entry.insert(message);
+            Ok(())
+        }
+        Entry::Occupied(entry) if entry.get() == &message => Ok(()),
+        Entry::Occupied(_) => Err(Error::InvalidResponse {
+            method: "messages.list",
+        }),
+    }
+}
+
+fn validate_later_message_identity(message: &RawMessage) -> Result<()> {
+    if !is_valid_timestamp(&message.ts)
+        || message
+            .thread_ts
+            .as_deref()
+            .is_some_and(|thread_ts| !is_valid_timestamp(thread_ts))
+    {
+        return Err(Error::InvalidResponse {
+            method: "messages.list",
+        });
+    }
+    Ok(())
+}
+
+fn later_action_name(action: LaterMutationAction) -> &'static str {
+    match action {
+        LaterMutationAction::Save => "save",
+        LaterMutationAction::Complete => "complete",
+        LaterMutationAction::Remove => "remove",
+    }
+}
+
+fn encode_later_cursor(cursor: &LaterCursor) -> Result<String> {
+    let payload = serde_json::to_vec(cursor).map_err(|_| Error::Output)?;
+    let mut checked = Vec::with_capacity(LATER_CURSOR_DOMAIN.len() + payload.len());
+    checked.extend_from_slice(LATER_CURSOR_DOMAIN);
+    checked.extend_from_slice(&payload);
+    let encoded = format!(
+        "{LATER_CURSOR_PREFIX}.{}.{}",
+        URL_SAFE_NO_PAD.encode(payload),
+        sha256_hex(&checked)
+    );
+    if encoded.len() > MAX_LATER_CURSOR_LENGTH {
+        return Err(Error::Output);
+    }
+    Ok(encoded)
+}
+
+fn decode_later_cursor(value: &str) -> Result<LaterCursor> {
+    if value.trim().is_empty()
+        || value.len() > MAX_LATER_CURSOR_LENGTH
+        || value.chars().any(char::is_control)
+    {
+        return Err(invalid_later_cursor());
+    }
+    let mut parts = value.split('.');
+    let prefix = parts.next();
+    let payload = parts.next();
+    let checksum = parts.next();
+    if prefix != Some(LATER_CURSOR_PREFIX)
+        || payload.is_none()
+        || checksum.is_none()
+        || parts.next().is_some()
+    {
+        return Err(invalid_later_cursor());
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload.unwrap_or_default())
+        .map_err(|_| invalid_later_cursor())?;
+    let mut checked = Vec::with_capacity(LATER_CURSOR_DOMAIN.len() + payload.len());
+    checked.extend_from_slice(LATER_CURSOR_DOMAIN);
+    checked.extend_from_slice(&payload);
+    let expected = sha256_hex(&checked);
+    if checksum != Some(expected.as_str()) {
+        return Err(invalid_later_cursor());
+    }
+    serde_json::from_slice(&payload).map_err(|_| invalid_later_cursor())
+}
+
+fn validate_later_cursor(cursor: &LaterCursor, team_id: &str) -> Result<()> {
+    if cursor.version != LATER_CURSOR_VERSION
+        || cursor.team_id != team_id
+        || !(1..=MAX_LATER_ITEMS).contains(&cursor.limit)
+        || cursor.seen.is_empty()
+        || cursor.seen.len() > MAX_LATER_ITEMS * MAX_LATER_SCAN_PAGES
+        || cursor.seen.windows(2).any(|pair| pair[0] >= pair[1])
+        || cursor.seen.iter().any(|identity| {
+            !is_valid_any_conversation_id(&identity.conversation_id)
+                || !is_valid_timestamp(&identity.message_ts)
+        })
+        || validate_cursor(Some(&cursor.slack_cursor)).is_err()
+    {
+        return Err(invalid_later_cursor());
+    }
+    Ok(())
+}
+
+fn invalid_later_cursor() -> Error {
+    Error::invalid_input("cursor", "is not a valid Slack Later continuation cursor")
+}
+
+fn stale_later_cursor() -> Error {
+    Error::invalid_input(
+        "cursor",
+        "is stale because Slack Later changed; start a new Later list",
+    )
+}
+
 fn mutation_error_is_ambiguous(error: &Error) -> bool {
     matches!(
         error,
@@ -6811,7 +7627,7 @@ mod tests {
 
     use super::*;
     use crate::model::{
-        RawChannelMessages, RawConversation, RawConversationsPage, RawFile,
+        RawChannelMessages, RawConversation, RawConversationsPage, RawFile, RawLaterCounts,
         RawMessageSearchChannel, RawMessageSearchMatch, RawMessageSearchMatches,
         RawMessageSearchPagination, RawMessageSearchResponse, RawReaction, RawResponseMetadata,
         RawThreadCounts, RawUnread, RawUserProfile,
@@ -6828,6 +7644,14 @@ mod tests {
         reply_pages: Mutex<VecDeque<RawMessagePage>>,
         message_list: RawMessagesList,
         message_list_calls: Arc<Mutex<Vec<(String, String)>>>,
+        message_batch_calls: Arc<Mutex<Vec<MessageBatchCall>>>,
+        later_items: Arc<Mutex<Vec<(LaterState, RawLaterItem)>>>,
+        later_pages: Mutex<VecDeque<RawLaterPage>>,
+        later_calls: Arc<Mutex<Vec<LaterCall>>>,
+        later_mutation_error: Option<&'static str>,
+        later_apply_before_error: bool,
+        later_apply_mutation: bool,
+        later_ack_override: Option<RawLaterItem>,
         search: RawMessageSearchResponse,
         search_calls: Arc<Mutex<Vec<SearchCall>>>,
         history_calls: Arc<Mutex<Vec<HistoryCall>>>,
@@ -6924,6 +7748,20 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
+    enum LaterCall {
+        List {
+            state: LaterState,
+            cursor: Option<String>,
+            limit: usize,
+        },
+        Add,
+        Complete,
+        Delete,
+    }
+
+    type MessageBatchCall = Vec<(String, Vec<String>)>;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
     enum DraftCall {
         List {
             next_ts: Option<String>,
@@ -6974,6 +7812,98 @@ mod tests {
     }
 
     const REQUEST_CLIENT_MSG_ID: &str = "__from_request__";
+
+    impl FakeApi {
+        fn fake_later_mutation(
+            &self,
+            channel: &str,
+            message_ts: &str,
+            state: LaterState,
+        ) -> Result<RawLaterMutationResponse> {
+            let item = raw_later_item(channel, message_ts, state);
+            if self.later_apply_mutation
+                && (self.later_mutation_error.is_none() || self.later_apply_before_error)
+            {
+                let mut items = self.later_items.lock().unwrap();
+                items.retain(|(_, existing)| {
+                    existing.item_id != channel || existing.ts != message_ts
+                });
+                items.push((state, item.clone()));
+            }
+            match self.later_mutation_error {
+                Some("timeout") => Err(Error::Timeout {
+                    method: match state {
+                        LaterState::InProgress => "saved.add",
+                        LaterState::Completed | LaterState::Archived => "saved.update",
+                    },
+                }),
+                Some(code) => Err(Error::SlackApi {
+                    method: match state {
+                        LaterState::InProgress => "saved.add",
+                        LaterState::Completed | LaterState::Archived => "saved.update",
+                    },
+                    code: code.into(),
+                }),
+                None => Ok(RawLaterMutationResponse {
+                    item: self.later_ack_override.clone().unwrap_or(item),
+                }),
+            }
+        }
+    }
+
+    fn raw_later_item(channel: &str, message_ts: &str, state: LaterState) -> RawLaterItem {
+        let (raw_state, todo_state, is_archived) = match state {
+            LaterState::InProgress => ("in_progress", "saved", false),
+            LaterState::Completed => ("completed", "completed", false),
+            LaterState::Archived => ("archived", "saved", true),
+        };
+        RawLaterItem {
+            item_id: channel.into(),
+            item_type: "message".into(),
+            ts: message_ts.into(),
+            state: raw_state.into(),
+            todo_state: todo_state.into(),
+            is_archived,
+            date_created: 1,
+            date_updated: 2,
+            date_due: 0,
+            date_snoozed_until: 0,
+            date_completed: if state == LaterState::Completed { 3 } else { 0 },
+        }
+    }
+
+    fn later_test_counts(items: &[(LaterState, RawLaterItem)]) -> RawLaterCounts {
+        RawLaterCounts {
+            total_count: items.len() as u64,
+            uncompleted_count: items
+                .iter()
+                .filter(|(state, _)| *state == LaterState::InProgress)
+                .count() as u64,
+            completed_count: items
+                .iter()
+                .filter(|(state, _)| *state == LaterState::Completed)
+                .count() as u64,
+            archived_count: items
+                .iter()
+                .filter(|(state, _)| *state == LaterState::Archived)
+                .count() as u64,
+            uncompleted_overdue_count: 0,
+        }
+    }
+
+    fn raw_later_page(
+        items: Vec<RawLaterItem>,
+        counts: RawLaterCounts,
+        next_cursor: &str,
+    ) -> RawLaterPage {
+        RawLaterPage {
+            saved_items: items,
+            counts,
+            response_metadata: RawResponseMetadata {
+                next_cursor: next_cursor.into(),
+            },
+        }
+    }
 
     fn hydrate_test_client_msg_id(draft: &mut RawDraft, client_msg_id: &str) {
         if draft.client_msg_id.as_deref() == Some(REQUEST_CLIENT_MSG_ID) {
@@ -7074,6 +8004,112 @@ mod tests {
                 .unwrap()
                 .push((channel.into(), message_ts.into()));
             Ok(self.message_list.clone())
+        }
+
+        async fn messages_list_batch(
+            &self,
+            targets: &[(String, Vec<String>)],
+        ) -> Result<RawMessagesList> {
+            self.message_batch_calls
+                .lock()
+                .unwrap()
+                .push(targets.to_vec());
+            let wanted = targets
+                .iter()
+                .map(|(channel, timestamps)| {
+                    (
+                        channel.clone(),
+                        timestamps.iter().cloned().collect::<HashSet<_>>(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let wanted_timestamps = wanted.values().flatten().cloned().collect::<HashSet<_>>();
+            let mut response = self.message_list.clone();
+            response
+                .messages
+                .retain(|_, message| wanted_timestamps.contains(&message.ts));
+            response.messages_data.retain(|channel, messages| {
+                let Some(timestamps) = wanted.get(channel) else {
+                    return false;
+                };
+                messages
+                    .messages
+                    .retain(|message| timestamps.contains(&message.ts));
+                true
+            });
+            Ok(response)
+        }
+
+        async fn saved_list(
+            &self,
+            state: LaterState,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> Result<RawLaterPage> {
+            self.later_calls.lock().unwrap().push(LaterCall::List {
+                state,
+                cursor: cursor.map(str::to_owned),
+                limit,
+            });
+            if let Some(page) = self.later_pages.lock().unwrap().pop_front() {
+                return Ok(page);
+            }
+            let items = self.later_items.lock().unwrap();
+            let counts = later_test_counts(&items);
+            Ok(RawLaterPage {
+                saved_items: items
+                    .iter()
+                    .filter(|(item_state, _)| *item_state == state)
+                    .take(limit)
+                    .map(|(_, item)| item.clone())
+                    .collect(),
+                counts,
+                response_metadata: RawResponseMetadata::default(),
+            })
+        }
+
+        async fn saved_add(
+            &self,
+            channel: &str,
+            message_ts: &str,
+        ) -> Result<RawLaterMutationResponse> {
+            self.later_calls.lock().unwrap().push(LaterCall::Add);
+            self.fake_later_mutation(channel, message_ts, LaterState::InProgress)
+        }
+
+        async fn saved_complete(
+            &self,
+            channel: &str,
+            message_ts: &str,
+        ) -> Result<RawLaterMutationResponse> {
+            self.later_calls.lock().unwrap().push(LaterCall::Complete);
+            self.fake_later_mutation(channel, message_ts, LaterState::Completed)
+        }
+
+        async fn saved_delete(
+            &self,
+            channel: &str,
+            message_ts: &str,
+        ) -> Result<RawMutationResponse> {
+            self.later_calls.lock().unwrap().push(LaterCall::Delete);
+            if self.later_apply_mutation
+                && (self.later_mutation_error.is_none() || self.later_apply_before_error)
+            {
+                self.later_items
+                    .lock()
+                    .unwrap()
+                    .retain(|(_, item)| item.item_id != channel || item.ts != message_ts);
+            }
+            match self.later_mutation_error {
+                Some("timeout") => Err(Error::Timeout {
+                    method: "saved.delete",
+                }),
+                Some(code) => Err(Error::SlackApi {
+                    method: "saved.delete",
+                    code: code.into(),
+                }),
+                None => Ok(RawMutationResponse::default()),
+            }
         }
 
         async fn conversations_list(
@@ -7627,6 +8663,14 @@ mod tests {
             reply_pages: Mutex::new(VecDeque::new()),
             message_list: RawMessagesList::default(),
             message_list_calls: Arc::new(Mutex::new(Vec::new())),
+            message_batch_calls: Arc::new(Mutex::new(Vec::new())),
+            later_items: Arc::new(Mutex::new(Vec::new())),
+            later_pages: Mutex::new(VecDeque::new()),
+            later_calls: Arc::new(Mutex::new(Vec::new())),
+            later_mutation_error: None,
+            later_apply_before_error: false,
+            later_apply_mutation: true,
+            later_ack_override: None,
             search: RawMessageSearchResponse {
                 messages: RawMessageSearchMatches {
                     matches: vec![],
@@ -14598,6 +15642,650 @@ mod tests {
                 matches!(result, Err(Error::InvalidInput { field: actual, .. }) if actual == field)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn later_list_batches_message_and_root_context_with_truthful_partial_rows() {
+        let mut api = fake_api();
+        api.later_items.lock().unwrap().extend([
+            (
+                LaterState::InProgress,
+                raw_later_item("C123", "100.000001", LaterState::InProgress),
+            ),
+            (
+                LaterState::InProgress,
+                raw_later_item("C456", "200.000002", LaterState::InProgress),
+            ),
+        ]);
+        api.conversation_pages
+            .lock()
+            .unwrap()
+            .push_back(RawConversationsPage {
+                channels: vec![
+                    RawConversation {
+                        id: "C123".into(),
+                        name: "alpha".into(),
+                        is_member: true,
+                        ..RawConversation::default()
+                    },
+                    RawConversation {
+                        id: "C456".into(),
+                        name: "beta".into(),
+                        is_member: true,
+                        ..RawConversation::default()
+                    },
+                ],
+                response_metadata: RawResponseMetadata::default(),
+            });
+        api.user_pages.lock().unwrap().push_back(RawUsersPage {
+            members: vec![RawUser {
+                id: "U123".into(),
+                name: Some("reader".into()),
+                ..RawUser::default()
+            }],
+            response_metadata: RawResponseMetadata::default(),
+        });
+        api.message_list.messages_data.insert(
+            "C123".into(),
+            RawChannelMessages {
+                messages: vec![RawMessage {
+                    ts: "100.000001".into(),
+                    user: Some("U123".into()),
+                    text: "saved root".into(),
+                    files: vec![RawFile {
+                        id: "F123".into(),
+                        name: Some("synthetic.txt".into()),
+                        ..RawFile::default()
+                    }],
+                    ..RawMessage::default()
+                }],
+            },
+        );
+        api.message_list.messages_data.insert(
+            "C456".into(),
+            RawChannelMessages {
+                messages: vec![
+                    RawMessage {
+                        ts: "200.000001".into(),
+                        user: Some("U123".into()),
+                        text: "thread root".into(),
+                        ..RawMessage::default()
+                    },
+                    RawMessage {
+                        ts: "200.000002".into(),
+                        thread_ts: Some("200.000001".into()),
+                        user: Some("U123".into()),
+                        text: "saved reply".into(),
+                        ..RawMessage::default()
+                    },
+                ],
+            },
+        );
+        let batch_calls = api.message_batch_calls.clone();
+
+        let page = service(api)
+            .list_later(LaterRequest {
+                state: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(page.state, LaterState::InProgress);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].conversation.as_ref().unwrap().name, "alpha");
+        assert_eq!(page.items[0].message.as_ref().unwrap().files.len(), 1);
+        assert_eq!(
+            page.items[0].thread_root_resolution,
+            LaterContextResolution::NotNeeded
+        );
+        assert_eq!(
+            page.items[1].thread_root.as_ref().unwrap().text,
+            "thread root"
+        );
+        assert_eq!(
+            page.items[1]
+                .message
+                .as_ref()
+                .unwrap()
+                .author_name
+                .as_deref(),
+            Some("reader")
+        );
+        {
+            let calls = batch_calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].len(), 2);
+            assert_eq!(calls[1], vec![("C456".into(), vec!["200.000001".into()])]);
+        }
+
+        let api = fake_api();
+        api.later_items.lock().unwrap().push((
+            LaterState::InProgress,
+            raw_later_item("C123", "100.000001", LaterState::InProgress),
+        ));
+        let page = service(api)
+            .list_later(LaterRequest {
+                state: Some(LaterState::InProgress),
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].message, None);
+        assert_eq!(
+            page.items[0].message_resolution,
+            LaterContextResolution::Unavailable
+        );
+        assert_eq!(
+            page.items[0].thread_root_resolution,
+            LaterContextResolution::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn later_cursor_is_state_bound_accumulates_identities_and_rejects_drift() {
+        let counts = RawLaterCounts {
+            total_count: 2,
+            uncompleted_count: 2,
+            ..RawLaterCounts::default()
+        };
+        let api = fake_api();
+        api.later_pages.lock().unwrap().extend([
+            raw_later_page(
+                vec![raw_later_item("C123", "100.000001", LaterState::InProgress)],
+                counts.clone(),
+                "next-page",
+            ),
+            raw_later_page(
+                vec![raw_later_item("C456", "200.000001", LaterState::InProgress)],
+                counts.clone(),
+                "",
+            ),
+        ]);
+        let slack = service(api);
+        let first = slack
+            .list_later(LaterRequest {
+                state: Some(LaterState::InProgress),
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let second = slack
+            .list_later(LaterRequest {
+                state: None,
+                limit: None,
+                cursor: first.next_cursor.as_deref(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.items[0].conversation_id, "C456");
+        assert!(!second.has_more);
+
+        let api = fake_api();
+        api.later_pages.lock().unwrap().extend([
+            raw_later_page(
+                vec![raw_later_item("C123", "100.000001", LaterState::InProgress)],
+                counts.clone(),
+                "next-page",
+            ),
+            raw_later_page(
+                vec![raw_later_item("C123", "100.000001", LaterState::InProgress)],
+                counts,
+                "",
+            ),
+        ]);
+        let slack = service(api);
+        let first = slack
+            .list_later(LaterRequest {
+                state: None,
+                limit: Some(1),
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            slack
+                .list_later(LaterRequest {
+                    state: None,
+                    limit: None,
+                    cursor: first.next_cursor.as_deref(),
+                })
+                .await,
+            Err(Error::InvalidInput {
+                field: "cursor",
+                ..
+            })
+        ));
+        assert!(matches!(
+            slack
+                .list_later(LaterRequest {
+                    state: Some(LaterState::Archived),
+                    limit: None,
+                    cursor: first.next_cursor.as_deref(),
+                })
+                .await,
+            Err(Error::InvalidInput {
+                field: "cursor",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn later_cursor_remains_bounded_at_the_full_scan_limit_and_rejects_tampering() {
+        let cursor = LaterCursor {
+            version: LATER_CURSOR_VERSION,
+            team_id: "T123".into(),
+            state: LaterState::InProgress,
+            limit: MAX_LATER_ITEMS,
+            slack_cursor: "upstream-cursor".into(),
+            counts: LaterCounts {
+                total: 2_000,
+                in_progress: 2_000,
+                completed: 0,
+                archived: 0,
+                overdue: 0,
+            },
+            seen: (0..MAX_LATER_ITEMS * MAX_LATER_SCAN_PAGES)
+                .map(|index| LaterIdentity {
+                    conversation_id: format!("C{index:04}"),
+                    message_ts: format!("{index}.000001"),
+                })
+                .collect(),
+        };
+        let encoded = encode_later_cursor(&cursor).unwrap();
+        assert!(encoded.len() <= MAX_LATER_CURSOR_LENGTH);
+        let decoded = decode_later_cursor(&encoded).unwrap();
+        validate_later_cursor(&decoded, "T123").unwrap();
+        assert_eq!(decoded.seen.len(), 2_000);
+
+        let mut tampered = encoded.into_bytes();
+        let last = tampered.last_mut().unwrap();
+        *last = if *last == b'a' { b'b' } else { b'a' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert!(matches!(
+            decode_later_cursor(&tampered),
+            Err(Error::InvalidInput {
+                field: "cursor",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn later_list_rejects_contract_drift_and_conflicting_hydration() {
+        let counts = RawLaterCounts {
+            total_count: 1,
+            uncompleted_count: 1,
+            ..RawLaterCounts::default()
+        };
+        let mut unsupported = raw_later_item("C123", "100.000001", LaterState::InProgress);
+        unsupported.item_type = "file".into();
+        let mut wrong_state = raw_later_item("C123", "100.000001", LaterState::InProgress);
+        wrong_state.state = "completed".into();
+        for items in [
+            vec![unsupported],
+            vec![wrong_state],
+            vec![
+                raw_later_item("C123", "100.000001", LaterState::InProgress),
+                raw_later_item("C123", "100.000001", LaterState::InProgress),
+            ],
+        ] {
+            let api = fake_api();
+            api.later_pages
+                .lock()
+                .unwrap()
+                .push_back(raw_later_page(items, counts.clone(), ""));
+            assert!(matches!(
+                service(api)
+                    .list_later(LaterRequest {
+                        state: None,
+                        limit: None,
+                        cursor: None,
+                    })
+                    .await,
+                Err(Error::InvalidResponse {
+                    method: "saved.list"
+                })
+            ));
+        }
+
+        let mut api = fake_api();
+        api.later_items.lock().unwrap().push((
+            LaterState::InProgress,
+            raw_later_item("C123", "100.000001", LaterState::InProgress),
+        ));
+        api.message_list.messages.insert(
+            "synthetic".into(),
+            RawMessage {
+                ts: "100.000001".into(),
+                text: "one shape".into(),
+                ..RawMessage::default()
+            },
+        );
+        api.message_list.messages_data.insert(
+            "C123".into(),
+            RawChannelMessages {
+                messages: vec![RawMessage {
+                    ts: "100.000001".into(),
+                    text: "conflicting shape".into(),
+                    ..RawMessage::default()
+                }],
+            },
+        );
+        assert!(matches!(
+            service(api)
+                .list_later(LaterRequest {
+                    state: None,
+                    limit: None,
+                    cursor: None,
+                })
+                .await,
+            Err(Error::InvalidResponse {
+                method: "messages.list"
+            })
+        ));
+
+        let mut api = fake_api();
+        api.later_items.lock().unwrap().push((
+            LaterState::InProgress,
+            raw_later_item("C123", "100.000001", LaterState::InProgress),
+        ));
+        api.message_list.messages_data.insert(
+            "C123".into(),
+            RawChannelMessages {
+                messages: vec![RawMessage {
+                    ts: "100.000001".into(),
+                    thread_ts: Some("invalid".into()),
+                    ..RawMessage::default()
+                }],
+            },
+        );
+        assert!(matches!(
+            service(api)
+                .list_later(LaterRequest {
+                    state: None,
+                    limit: None,
+                    cursor: None,
+                })
+                .await,
+            Err(Error::InvalidResponse {
+                method: "messages.list"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn later_reply_preserves_the_row_when_its_root_is_unavailable() {
+        let mut api = fake_api();
+        api.later_items.lock().unwrap().push((
+            LaterState::InProgress,
+            raw_later_item("C123", "100.000002", LaterState::InProgress),
+        ));
+        api.message_list.messages_data.insert(
+            "C123".into(),
+            RawChannelMessages {
+                messages: vec![RawMessage {
+                    ts: "100.000002".into(),
+                    thread_ts: Some("100.000001".into()),
+                    text: "saved reply".into(),
+                    ..RawMessage::default()
+                }],
+            },
+        );
+        let calls = api.message_batch_calls.clone();
+
+        let page = service(api)
+            .list_later(LaterRequest {
+                state: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            page.items[0].message_resolution,
+            LaterContextResolution::Complete
+        );
+        assert_eq!(page.items[0].thread_root, None);
+        assert_eq!(
+            page.items[0].thread_root_resolution,
+            LaterContextResolution::Unavailable
+        );
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn later_mutation_scans_fail_closed_before_writing() {
+        let api = fake_api();
+        api.later_items.lock().unwrap().extend([
+            (
+                LaterState::InProgress,
+                raw_later_item("C123", "100.000001", LaterState::InProgress),
+            ),
+            (
+                LaterState::Completed,
+                raw_later_item("C123", "100.000001", LaterState::Completed),
+            ),
+        ]);
+        let calls = api.later_calls.clone();
+        assert!(matches!(
+            service(api)
+                .remove_from_later("C123", "100.000001", true)
+                .await,
+            Err(Error::InvalidResponse {
+                method: "saved.list"
+            })
+        ));
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| matches!(call, LaterCall::Delete))
+        );
+
+        let api = fake_api();
+        let counts = RawLaterCounts {
+            total_count: 1,
+            uncompleted_count: 1,
+            ..RawLaterCounts::default()
+        };
+        for page in 0..MAX_LATER_SCAN_PAGES {
+            api.later_pages.lock().unwrap().push_back(raw_later_page(
+                Vec::new(),
+                counts.clone(),
+                &format!("next-{page}"),
+            ));
+        }
+        let calls = api.later_calls.clone();
+        assert!(matches!(
+            service(api)
+                .remove_from_later("C123", "100.000001", true)
+                .await,
+            Err(Error::ScanLimit {
+                resource: "Slack Later items",
+                ..
+            })
+        ));
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| matches!(call, LaterCall::Delete))
+        );
+    }
+
+    #[tokio::test]
+    async fn later_mutations_confirm_first_follow_state_machine_and_reconcile() {
+        let mut api = fake_api();
+        api.message_list.messages.insert(
+            "synthetic".into(),
+            RawMessage {
+                ts: "100.000001".into(),
+                user: Some("U123".into()),
+                text: "synthetic source".into(),
+                ..RawMessage::default()
+            },
+        );
+        let calls = api.later_calls.clone();
+        let message_calls = api.message_list_calls.clone();
+        let slack = service(api);
+
+        assert!(matches!(
+            slack.save_for_later("C123", "not-a-timestamp", false).await,
+            Err(Error::ConfirmationRequired { .. })
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(message_calls.lock().unwrap().is_empty());
+
+        let saved = slack
+            .save_for_later("C123", "100.000001", true)
+            .await
+            .unwrap();
+        assert_eq!(saved.before_state, None);
+        assert_eq!(saved.after_state, Some(LaterState::InProgress));
+        assert!(saved.changed && saved.reconciled);
+        let idempotent = slack
+            .save_for_later("C123", "100.000001", true)
+            .await
+            .unwrap();
+        assert!(!idempotent.changed && !idempotent.reconciled);
+
+        let completed = slack
+            .complete_later("C123", "100.000001", true)
+            .await
+            .unwrap();
+        assert_eq!(completed.before_state, Some(LaterState::InProgress));
+        assert_eq!(completed.after_state, Some(LaterState::Completed));
+        let completed_again = slack
+            .complete_later("C123", "100.000001", true)
+            .await
+            .unwrap();
+        assert!(!completed_again.changed);
+        assert!(matches!(
+            slack.save_for_later("C123", "100.000001", true).await,
+            Err(Error::InvalidInput { field: "state", .. })
+        ));
+        let removed = slack
+            .remove_from_later("C123", "100.000001", true)
+            .await
+            .unwrap();
+        assert_eq!(removed.before_state, Some(LaterState::Completed));
+        assert_eq!(removed.after_state, None);
+        let absent = slack
+            .remove_from_later("C123", "100.000001", true)
+            .await
+            .unwrap();
+        assert!(!absent.changed);
+        assert!(matches!(
+            slack.complete_later("C123", "100.000001", true).await,
+            Err(Error::NotFound {
+                resource: "Slack Later item"
+            })
+        ));
+
+        let mutation_calls = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    LaterCall::Add | LaterCall::Complete | LaterCall::Delete
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutation_calls,
+            vec![LaterCall::Add, LaterCall::Complete, LaterCall::Delete]
+        );
+
+        let archived_api = fake_api();
+        archived_api.later_items.lock().unwrap().push((
+            LaterState::Archived,
+            raw_later_item("C123", "100.000001", LaterState::Archived),
+        ));
+        assert!(matches!(
+            service(archived_api)
+                .complete_later("C123", "100.000001", true)
+                .await,
+            Err(Error::InvalidInput { field: "state", .. })
+        ));
+
+        let mut api = fake_api();
+        api.later_items.lock().unwrap().push((
+            LaterState::InProgress,
+            raw_later_item("C123", "100.000001", LaterState::InProgress),
+        ));
+        api.later_mutation_error = Some("timeout");
+        api.later_apply_before_error = true;
+        let report = service(api)
+            .complete_later("C123", "100.000001", true)
+            .await
+            .unwrap();
+        assert_eq!(report.after_state, Some(LaterState::Completed));
+        assert!(report.reconciled);
+
+        let mut not_applied = fake_api();
+        not_applied.message_list.messages.insert(
+            "synthetic".into(),
+            RawMessage {
+                ts: "100.000001".into(),
+                text: "synthetic source".into(),
+                ..RawMessage::default()
+            },
+        );
+        not_applied.later_apply_mutation = false;
+        assert!(matches!(
+            service(not_applied)
+                .save_for_later("C123", "100.000001", true)
+                .await,
+            Err(Error::LaterMutationNotApplied { action: "save", .. })
+        ));
+
+        let mut uncertain = fake_api();
+        uncertain.message_list.messages.insert(
+            "synthetic".into(),
+            RawMessage {
+                ts: "100.000001".into(),
+                text: "synthetic source".into(),
+                ..RawMessage::default()
+            },
+        );
+        uncertain.later_mutation_error = Some("timeout");
+        assert!(matches!(
+            service(uncertain)
+                .save_for_later("C123", "100.000001", true)
+                .await,
+            Err(Error::LaterMutationUncertain { action: "save", .. })
+        ));
+
+        let mut invalid_ack = fake_api();
+        invalid_ack.message_list.messages.insert(
+            "synthetic".into(),
+            RawMessage {
+                ts: "100.000001".into(),
+                text: "synthetic source".into(),
+                ..RawMessage::default()
+            },
+        );
+        invalid_ack.later_ack_override =
+            Some(raw_later_item("C999", "100.000001", LaterState::InProgress));
+        assert!(matches!(
+            service(invalid_ack)
+                .save_for_later("C123", "100.000001", true)
+                .await,
+            Err(Error::InvalidResponse {
+                method: "saved.add"
+            })
+        ));
     }
 
     #[tokio::test]

@@ -19,11 +19,11 @@ use crate::{
     error::{Error, Result},
     local_file::{BoundedDownload, UploadPass, UploadSource},
     model::{
-        ClientCountsPayload, DraftDestination, RawAuthTestResponse, RawConversationsPage,
-        RawDraftResponse, RawDraftsPage, RawEmojiResponse, RawFileResponse,
-        RawFileUploadAllocation, RawFileUploadCompletion, RawMessagePage, RawMessageSearchResponse,
-        RawMessagesList, RawMutationResponse, RawPostMessageResponse, RawReactionItemResponse,
-        RawUsersPage,
+        ClientCountsPayload, DraftDestination, LaterState, RawAuthTestResponse,
+        RawConversationsPage, RawDraftResponse, RawDraftsPage, RawEmojiResponse, RawFileResponse,
+        RawFileUploadAllocation, RawFileUploadCompletion, RawLaterMutationResponse, RawLaterPage,
+        RawMessagePage, RawMessageSearchResponse, RawMessagesList, RawMutationResponse,
+        RawPostMessageResponse, RawReactionItemResponse, RawUsersPage,
     },
     service::SlackApi,
 };
@@ -314,18 +314,96 @@ impl SlackApi for SlackHttpClient {
     }
 
     async fn messages_list(&self, channel: &str, message_ts: &str) -> Result<RawMessagesList> {
-        let message_ids = serde_json::json!([{
-            "channel": channel,
-            "timestamps": [message_ts],
-        }])
-        .to_string();
+        self.messages_list_batch(&[(channel.to_owned(), vec![message_ts.to_owned()])])
+            .await
+    }
+
+    async fn messages_list_batch(
+        &self,
+        targets: &[(String, Vec<String>)],
+    ) -> Result<RawMessagesList> {
+        let message_ids = targets
+            .iter()
+            .map(|(channel, timestamps)| {
+                serde_json::json!({"channel": channel, "timestamps": timestamps})
+            })
+            .collect::<Vec<_>>();
         self.post_form(
             "messages.list",
             "messages-ufm",
             &[
-                ("message_ids", message_ids),
+                ("message_ids", encode_json(&message_ids)?),
                 ("org_wide_aware", "true".into()),
                 ("cached_latest_updates", "{}".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn saved_list(
+        &self,
+        state: LaterState,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RawLaterPage> {
+        let filter = match state {
+            LaterState::InProgress => "saved",
+            LaterState::Completed => "completed",
+            LaterState::Archived => "archived",
+        };
+        let mut fields = vec![
+            ("filter", filter.into()),
+            ("include_tombstones", "true".into()),
+            ("limit", limit.to_string()),
+        ];
+        if let Some(cursor) = cursor {
+            fields.push(("cursor", cursor.into()));
+        }
+        self.post_form("saved.list", "lurkline-later-list", &fields)
+            .await
+    }
+
+    async fn saved_add(&self, channel: &str, message_ts: &str) -> Result<RawLaterMutationResponse> {
+        self.post_mutation_form(
+            "saved.add",
+            "lurkline-later-save",
+            &[
+                ("item_type", "message".into()),
+                ("item_id", channel.into()),
+                ("ts", message_ts.into()),
+            ],
+        )
+        .await
+    }
+
+    async fn saved_complete(
+        &self,
+        channel: &str,
+        message_ts: &str,
+    ) -> Result<RawLaterMutationResponse> {
+        self.post_mutation_form(
+            "saved.update",
+            "lurkline-later-complete",
+            &[
+                ("item_type", "message".into()),
+                ("item_id", channel.into()),
+                ("ts", message_ts.into()),
+                ("mark", "completed".into()),
+                ("todo_state", "completed".into()),
+                ("date_due", "0".into()),
+            ],
+        )
+        .await
+    }
+
+    async fn saved_delete(&self, channel: &str, message_ts: &str) -> Result<RawMutationResponse> {
+        self.post_mutation_form(
+            "saved.delete",
+            "lurkline-later-remove",
+            &[
+                ("item_type", "message".into()),
+                ("item_id", channel.into()),
+                ("ts", message_ts.into()),
             ],
         )
         .await
@@ -1937,6 +2015,123 @@ mod tests {
                 assert_eq!(multipart_text_field(&body, "ignore_replies"), Some("false"));
                 assert_eq!(multipart_text_field(&body, "inclusive"), Some("true"));
                 assert!(multipart_text_field(&body, "cursor").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_verified_later_list_batch_and_mutation_shapes() {
+        let (client, capture) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"saved_items":[],"counts":{"total_count":4,"uncompleted_count":0,"completed_count":0,"archived_count":4,"uncompleted_overdue_count":0},"response_metadata":{"next_cursor":"later-next"}}"#.to_vec(),
+            64 * 1024,
+        )
+        .await;
+        let page = client
+            .saved_list(LaterState::Archived, Some("later-current"), 15)
+            .await
+            .unwrap();
+        assert_eq!(page.counts.archived_count, 4);
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/saved.list");
+        assert_eq!(multipart_text_field(&body, "filter"), Some("archived"));
+        assert_eq!(multipart_text_field(&body, "limit"), Some("15"));
+        assert_eq!(multipart_text_field(&body, "cursor"), Some("later-current"));
+        assert_eq!(
+            multipart_text_field(&body, "include_tombstones"),
+            Some("true")
+        );
+
+        let (client, capture) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"messages":{},"messages_data":{"C123":{"unchanged_messages":[]}}}"#
+                .to_vec(),
+            64 * 1024,
+        )
+        .await;
+        let messages = client
+            .messages_list_batch(&[
+                (
+                    "C123".into(),
+                    vec!["100.000001".into(), "101.000001".into()],
+                ),
+                ("D456".into(), vec!["200.000001".into()]),
+            ])
+            .await
+            .unwrap();
+        assert!(messages.messages_data["C123"].messages.is_empty());
+        let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+        let body = String::from_utf8_lossy(&raw_body);
+        assert_eq!(uri.path(), "/api/messages.list");
+        assert_eq!(
+            serde_json::from_str::<Value>(multipart_text_field(&body, "message_ids").unwrap())
+                .unwrap(),
+            serde_json::json!([
+                {"channel":"C123","timestamps":["100.000001","101.000001"]},
+                {"channel":"D456","timestamps":["200.000001"]}
+            ])
+        );
+
+        let item = |state: &str, todo_state: &str| {
+            format!(
+                "{{\"ok\":true,\"item\":{{\"item_id\":\"C123\",\"item_type\":\"message\",\"ts\":\"100.000001\",\"state\":\"{state}\",\"todo_state\":\"{todo_state}\",\"is_archived\":false,\"date_created\":1,\"date_updated\":2,\"date_due\":0,\"date_snoozed_until\":0,\"date_completed\":0}}}}"
+            )
+            .into_bytes()
+        };
+        for (method, response, expected_path, expected_fields) in [
+            (
+                "add",
+                item("in_progress", "saved"),
+                "/api/saved.add",
+                vec![
+                    ("item_type", "message"),
+                    ("item_id", "C123"),
+                    ("ts", "100.000001"),
+                ],
+            ),
+            (
+                "complete",
+                item("completed", "completed"),
+                "/api/saved.update",
+                vec![
+                    ("item_type", "message"),
+                    ("item_id", "C123"),
+                    ("ts", "100.000001"),
+                    ("mark", "completed"),
+                    ("todo_state", "completed"),
+                    ("date_due", "0"),
+                ],
+            ),
+            (
+                "delete",
+                br#"{"ok":true}"#.to_vec(),
+                "/api/saved.delete",
+                vec![
+                    ("item_type", "message"),
+                    ("item_id", "C123"),
+                    ("ts", "100.000001"),
+                ],
+            ),
+        ] {
+            let (client, capture) = server(StatusCode::OK, response, 64 * 1024).await;
+            match method {
+                "add" => {
+                    client.saved_add("C123", "100.000001").await.unwrap();
+                }
+                "complete" => {
+                    client.saved_complete("C123", "100.000001").await.unwrap();
+                }
+                "delete" => {
+                    client.saved_delete("C123", "100.000001").await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let (uri, _, raw_body) = capture.request.lock().unwrap().clone().unwrap();
+            let body = String::from_utf8_lossy(&raw_body);
+            assert_eq!(uri.path(), expected_path);
+            for (field, expected) in expected_fields {
+                assert_eq!(multipart_text_field(&body, field), Some(expected));
             }
         }
     }
