@@ -253,7 +253,7 @@ The goal is complete only when:
 
 ## Milestone
 
-- [ ] Milestone 1: Deliver the complete Slack Later inbox and release `v0.17.0`
+- [x] Milestone 1: Deliver the complete Slack Later inbox and release `v0.17.0`
   for #37.
 
 Acceptance criteria are success criteria 1 through 6. Likely touchpoints are
@@ -319,6 +319,42 @@ sources. After tagging, verify exact tag/main ancestry, every workflow, the
 GitHub Release, all downloaded assets, each checksum, archive layout, platform
 architecture, executable mode, and native binary version in a removed
 ephemeral directory.
+
+## Completion Evidence
+
+- The retained adversarial reviewer and fresh context-independent auditor were
+  both clean on exact product candidate
+  `449706c468e1d085ba5a6127cb6b18ea81d99e70` after the repair loops.
+- Formatting, strict locked all-target Clippy, 312 library tests, 13 CLI
+  process tests, two raw MCP tests, one metadata test, locked release build,
+  Rust 1.88 compatibility, package verification, credential scan,
+  deterministic packaging, and native `lurkline 0.17.0` readback all passed.
+- The privacy-filtered live read returned seven unique Later items across three
+  pages and exactly matched the selected-state count. The authorized self-DM
+  smoke reconciled absent to in-progress, in-progress to completed, and
+  completed to absent, with zero residue in every Later view and no Slack
+  message write.
+- [PR #38](https://github.com/smarzola/lurkline/pull/38) squash-merged the
+  reviewed candidate as
+  `abd44450803c8083605ae819ddecf883c9b63cf1`, closing
+  [issue #37](https://github.com/smarzola/lurkline/issues/37). Main workflow
+  run `31544794480` passed.
+- Annotated tag `v0.17.0` peels to that exact product merge. Tag workflow run
+  `31545211866` and release workflow run `31545212006` passed, publishing a
+  non-draft, non-prerelease GitHub Release with the three expected native
+  archives and three checksum files.
+- All downloaded release checksums passed. Each archive contains only its
+  versioned directory, executable `lurkline`, `README.md`, and `LICENSE`, with
+  normalized timestamps and expected modes. The binaries identify as Linux
+  AArch64, Linux x86-64, and macOS ARM64; embedded documents match `main`; and
+  the macOS artifact reports `lurkline 0.17.0`. The ephemeral verification
+  directory was removed.
+- The live post-release queue contained no open issue and no open pull request;
+  the complete goal-start queue is closed.
+- The remaining compatibility risk is explicit: these are unsupported Slack
+  browser APIs, and Slack supplies no immutable Later snapshot revision.
+  Required shape drift fails closed, while callers must restart pagination
+  after concurrent Later mutation.
 
 ## Resume And Final Report
 
