@@ -25,15 +25,16 @@ use crate::{
         ConversationPage, ConversationSearchReport, ConversationSearchTruncationReason,
         CustomEmojiKind, CustomEmojiList, DoctorReport, Draft, DraftDeleteReport, DraftPage,
         DraftSendReport, FileDownloadReport, FileDraftAssociation, FileDraftCreateReport,
-        FileReference, FileUploadReport, InboxReport, InboxTruncationReason, Message, MessagePage,
+        FileReference, FileUploadReport, InboxReport, InboxTruncationReason, LaterItem,
+        LaterMutationAction, LaterMutationReport, LaterPage, LaterState, Message, MessagePage,
         MessageSearchPage, OutboundMentionResolution, ReactionMutationReport, RenderedMessage,
         SentMessage, ThreadPage, UnreadConversation, UnreadReport, UserSearchReport,
         UserSearchTruncationReason,
     },
     service::{
         ActivityRequest, DEFAULT_FILE_DOWNLOAD_BYTES, DEFAULT_FILE_UPLOAD_BYTES,
-        FileDraftCreateRequest, MAX_CONVERSATIONS, MAX_FILE_DOWNLOAD_BYTES, MAX_FILE_UPLOAD_BYTES,
-        MAX_USERS, SlackService,
+        FileDraftCreateRequest, LaterRequest, MAX_CONVERSATIONS, MAX_FILE_DOWNLOAD_BYTES,
+        MAX_FILE_UPLOAD_BYTES, MAX_USERS, SlackService,
     },
 };
 
@@ -64,6 +65,23 @@ impl From<ActivityKindArg> for ConversationKind {
             ActivityKindArg::Channel => Self::Channel,
             ActivityKindArg::DirectMessage => Self::DirectMessage,
             ActivityKindArg::GroupDirectMessage => Self::GroupDirectMessage,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LaterStateArg {
+    InProgress,
+    Completed,
+    Archived,
+}
+
+impl From<LaterStateArg> for LaterState {
+    fn from(value: LaterStateArg) -> Self {
+        match value {
+            LaterStateArg::InProgress => Self::InProgress,
+            LaterStateArg::Completed => Self::Completed,
+            LaterStateArg::Archived => Self::Archived,
         }
     }
 }
@@ -138,6 +156,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Review and process the signed-in user's personal Slack Later inbox.
+    Later {
+        #[command(subcommand)]
+        command: LaterCommand,
+    },
     /// Discover channels, DMs, and group DMs by human-readable name.
     Conversations {
         #[command(subcommand)]
@@ -196,6 +219,64 @@ pub enum Command {
         /// Absolute local directory exposed to file tools.
         #[arg(long)]
         file_root: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LaterCommand {
+    /// List one bounded Later page; defaults to in-progress items.
+    List {
+        /// Later state to list; defaults to in-progress.
+        #[arg(long, value_enum, conflicts_with = "cursor")]
+        state: Option<LaterStateArg>,
+        /// Maximum items to return, from 1 through 50; defaults to 25.
+        #[arg(long, conflicts_with = "cursor")]
+        limit: Option<usize>,
+        /// Opaque cursor from a previous Later response; use by itself.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ensure one exact Slack message is in the in-progress Later inbox.
+    Save {
+        /// Slack conversation ID or exact name.
+        conversation: String,
+        /// Exact Slack message timestamp.
+        message_ts: String,
+        /// Confirm the Slack mutation.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark one in-progress Later item complete.
+    Complete {
+        /// Slack conversation ID or exact name.
+        conversation: String,
+        /// Exact Slack message timestamp.
+        message_ts: String,
+        /// Confirm the Slack mutation.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one exact item from Later in any state.
+    Remove {
+        /// Slack conversation ID or exact name.
+        conversation: String,
+        /// Exact Slack message timestamp.
+        message_ts: String,
+        /// Confirm the Slack mutation.
+        #[arg(long)]
+        confirm: bool,
+        /// Emit stable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -706,6 +787,66 @@ async fn run_slack_command(command: Command, profile: Option<&str>) -> Result<()
                 json,
             )
         }
+        Command::Later {
+            command:
+                LaterCommand::List {
+                    state,
+                    limit,
+                    cursor,
+                    json,
+                },
+        } => print_later_page(
+            service
+                .list_later(LaterRequest {
+                    state: state.map(LaterState::from),
+                    limit,
+                    cursor: cursor.as_deref(),
+                })
+                .await?,
+            json,
+        ),
+        Command::Later {
+            command:
+                LaterCommand::Save {
+                    conversation,
+                    message_ts,
+                    confirm,
+                    json,
+                },
+        } => print_later_mutation(
+            service
+                .save_for_later(&conversation, &message_ts, confirm)
+                .await?,
+            json,
+        ),
+        Command::Later {
+            command:
+                LaterCommand::Complete {
+                    conversation,
+                    message_ts,
+                    confirm,
+                    json,
+                },
+        } => print_later_mutation(
+            service
+                .complete_later(&conversation, &message_ts, confirm)
+                .await?,
+            json,
+        ),
+        Command::Later {
+            command:
+                LaterCommand::Remove {
+                    conversation,
+                    message_ts,
+                    confirm,
+                    json,
+                },
+        } => print_later_mutation(
+            service
+                .remove_from_later(&conversation, &message_ts, confirm)
+                .await?,
+            json,
+        ),
         Command::Conversations {
             command:
                 ConversationsCommand::List {
@@ -1221,6 +1362,140 @@ fn format_reaction_mutation(report: &ReactionMutationReport) -> String {
         report.changed,
         report.reconciled
     )
+}
+
+fn print_later_page(page: LaterPage, json: bool) -> Result<()> {
+    if json {
+        return print_json(&page);
+    }
+    for line in format_later_page(&page) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn format_later_page(page: &LaterPage) -> Vec<String> {
+    let mut lines = Vec::new();
+    if page.items.is_empty() {
+        lines.push(format!("No {} Later items.", later_state_label(page.state)));
+    } else {
+        for item in &page.items {
+            lines.extend(format_later_item(item));
+        }
+    }
+    lines.push(format!(
+        "counts\tin_progress={}\tcompleted={}\tarchived={}\toverdue={}\ttotal={}",
+        page.counts.in_progress,
+        page.counts.completed,
+        page.counts.archived,
+        page.counts.overdue,
+        page.counts.total
+    ));
+    if page.has_more {
+        lines.push(format!(
+            "more\t{}",
+            escape_human(page.next_cursor.as_deref().unwrap_or("available"))
+        ));
+    }
+    lines
+}
+
+fn format_later_item(item: &LaterItem) -> Vec<String> {
+    let conversation = item
+        .conversation
+        .as_ref()
+        .map(|conversation| conversation.display_name.as_str())
+        .unwrap_or("[name unavailable]");
+    let (author, text) = item
+        .message
+        .as_ref()
+        .map(|message| {
+            (
+                format_author(
+                    message.author_id.as_deref(),
+                    message.author_name.as_deref(),
+                    message.author_display_name.as_deref(),
+                    message.author_resolution,
+                ),
+                escape_human(&message.rendered_text),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                "[author unavailable]".into(),
+                "[message unavailable]".into(),
+            )
+        });
+    let due = item
+        .due_at
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into());
+    let snoozed_until = item
+        .snoozed_until
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into());
+    let mut lines = vec![format!(
+        "{}\t{}\t{}\t{}\t{}\tupdated={}\tdue={}\tsnoozed_until={}\t{}",
+        later_state_label(item.state),
+        escape_human(conversation),
+        escape_human(&item.conversation_id),
+        escape_human(&item.message_ts),
+        author,
+        item.updated_at,
+        due,
+        snoozed_until,
+        text
+    )];
+    if let Some(message) = &item.message
+        && let Some(permalink) = &message.permalink
+    {
+        lines.push(format!("link\t{}", escape_human(permalink)));
+    }
+    if let Some(root) = &item.thread_root {
+        lines.push(format!("root\t{}", format_message_line(root)));
+    } else if item.thread_root_resolution == crate::model::LaterContextResolution::Unavailable {
+        lines.push("root\t[unavailable]".into());
+    }
+    lines
+}
+
+fn print_later_mutation(report: LaterMutationReport, json: bool) -> Result<()> {
+    if json {
+        return print_json(&report);
+    }
+    println!("{}", format_later_mutation(&report));
+    Ok(())
+}
+
+fn format_later_mutation(report: &LaterMutationReport) -> String {
+    format!(
+        "{}\t{}\t{}\tbefore={}\tafter={}\tchanged={}\treconciled={}",
+        match report.action {
+            LaterMutationAction::Save => "save",
+            LaterMutationAction::Complete => "complete",
+            LaterMutationAction::Remove => "remove",
+        },
+        escape_human(&report.conversation_id),
+        escape_human(&report.message_ts),
+        report
+            .before_state
+            .map(later_state_label)
+            .unwrap_or("absent"),
+        report
+            .after_state
+            .map(later_state_label)
+            .unwrap_or("absent"),
+        report.changed,
+        report.reconciled
+    )
+}
+
+fn later_state_label(state: LaterState) -> &'static str {
+    match state {
+        LaterState::InProgress => "in-progress",
+        LaterState::Completed => "completed",
+        LaterState::Archived => "archived",
+    }
 }
 
 fn print_rendered(rendered: RenderedMessage, json: bool) -> Result<()> {
@@ -2271,6 +2546,46 @@ mod tests {
             }
         ));
         assert!(matches!(
+            Cli::try_parse_from(["lurkline", "later", "list"])
+                .unwrap()
+                .command,
+            Command::Later {
+                command: LaterCommand::List {
+                    state: None,
+                    limit: None,
+                    cursor: None,
+                    json: false
+                }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "lurkline", "later", "list", "--state", "archived", "--limit", "12", "--json"
+            ])
+            .unwrap()
+            .command,
+            Command::Later {
+                command: LaterCommand::List {
+                    state: Some(LaterStateArg::Archived),
+                    limit: Some(12),
+                    cursor: None,
+                    json: true
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "lurkline",
+                "later",
+                "list",
+                "--cursor",
+                "next",
+                "--state",
+                "completed"
+            ])
+            .is_err()
+        );
+        assert!(matches!(
             Cli::try_parse_from(["lurkline", "users", "find", "alice", "--limit", "3"])
                 .unwrap()
                 .command,
@@ -2313,6 +2628,22 @@ mod tests {
 
     #[test]
     fn parses_guarded_root_reply_and_draft_publication() {
+        for command in ["save", "complete", "remove"] {
+            assert!(matches!(
+                Cli::try_parse_from([
+                    "lurkline",
+                    "later",
+                    command,
+                    "C123",
+                    "100.000001",
+                    "--confirm",
+                    "--json"
+                ])
+                .unwrap()
+                .command,
+                Command::Later { .. }
+            ));
+        }
         assert!(matches!(
             Cli::try_parse_from([
                 "lurkline",
@@ -2753,6 +3084,135 @@ mod tests {
             .to_string(),
             "Slack draft creation outcome is unknown for client message 00000000-0000-4000-8000-000000000001; do not retry automatically; reread active drafts before deciding whether to retry"
         );
+    }
+
+    #[test]
+    fn later_human_and_json_output_keep_exact_identity_and_partial_context() {
+        let message = Message {
+            channel_id: "C123".into(),
+            ts: "100.000002".into(),
+            thread_ts: Some("90.000001".into()),
+            permalink: Some("https://example.slack.com/saved\nlink".into()),
+            thread_root_permalink: Some("https://example.slack.com/root".into()),
+            permalink_resolution: crate::model::PermalinkResolution::Complete,
+            author_id: Some("U123".into()),
+            author_name: Some("ali\tce".into()),
+            author_display_name: Some("Alice Example".into()),
+            author_resolution: AuthorResolution::Directory,
+            text: "saved text".into(),
+            rendered_text: "saved\ntext".into(),
+            mention_resolution: crate::model::MentionResolution::NotNeeded,
+            mentions: Vec::new(),
+            blocks: None,
+            attachments: None,
+            reply_count: 0,
+            latest_reply: None,
+            reactions: Vec::new(),
+            files: Vec::new(),
+        };
+        let mut root = message.clone();
+        root.ts = "90.000001".into();
+        root.thread_ts = None;
+        root.rendered_text = "root".into();
+        root.permalink = None;
+        root.thread_root_permalink = None;
+        let populated = LaterItem {
+            conversation_id: "C123".into(),
+            message_ts: "100.000002".into(),
+            state: LaterState::InProgress,
+            created_at: 1,
+            updated_at: 2,
+            due_at: None,
+            snoozed_until: None,
+            completed_at: None,
+            conversation: Some(Conversation {
+                id: "C123".into(),
+                name: "display-name".into(),
+                display_name: "Display\tName".into(),
+                name_is_fallback: false,
+                metadata_is_complete: true,
+                kind: ConversationKind::Channel,
+                is_private: false,
+                is_archived: false,
+                is_member: true,
+                member_count: Some(3),
+                user_id: None,
+            }),
+            conversation_resolution: crate::model::LaterContextResolution::Complete,
+            message: Some(message),
+            message_resolution: crate::model::LaterContextResolution::Complete,
+            thread_root: Some(root),
+            thread_root_resolution: crate::model::LaterContextResolution::Complete,
+        };
+        let unavailable = LaterItem {
+            conversation_id: "C999".into(),
+            message_ts: "999.000001".into(),
+            state: LaterState::InProgress,
+            created_at: 3,
+            updated_at: 4,
+            due_at: Some(5),
+            snoozed_until: Some(6),
+            completed_at: None,
+            conversation: None,
+            conversation_resolution: crate::model::LaterContextResolution::Unavailable,
+            message: None,
+            message_resolution: crate::model::LaterContextResolution::Unavailable,
+            thread_root: None,
+            thread_root_resolution: crate::model::LaterContextResolution::Unavailable,
+        };
+        let page = LaterPage {
+            team_id: "T000TEST".into(),
+            state: LaterState::InProgress,
+            items: vec![populated, unavailable],
+            counts: crate::model::LaterCounts {
+                total: 2,
+                in_progress: 2,
+                completed: 0,
+                archived: 0,
+                overdue: 0,
+            },
+            limit: 2,
+            has_more: true,
+            next_cursor: Some("cursor\nunsafe".into()),
+        };
+        let lines = format_later_page(&page);
+        assert_eq!(
+            lines[0],
+            "in-progress\tDisplay\\tName\tC123\t100.000002\t@ali\\tce\tupdated=2\tdue=-\tsnoozed_until=-\tsaved\\ntext"
+        );
+        assert_eq!(lines[1], "link\thttps://example.slack.com/saved\\nlink");
+        assert_eq!(lines[2], "root\t90.000001\t@ali\\tce\troot\treplies=0");
+        assert_eq!(
+            lines[3],
+            "in-progress\t[name unavailable]\tC999\t999.000001\t[author unavailable]\tupdated=4\tdue=5\tsnoozed_until=6\t[message unavailable]"
+        );
+        assert_eq!(lines[4], "root\t[unavailable]");
+        assert_eq!(
+            lines[5],
+            "counts\tin_progress=2\tcompleted=0\tarchived=0\toverdue=0\ttotal=2"
+        );
+        assert_eq!(lines[6], "more\tcursor\\nunsafe");
+
+        let mutation = LaterMutationReport {
+            conversation_id: "C123".into(),
+            message_ts: "100.000002".into(),
+            action: LaterMutationAction::Complete,
+            before_state: Some(LaterState::InProgress),
+            after_state: Some(LaterState::Completed),
+            changed: true,
+            reconciled: true,
+        };
+        assert_eq!(
+            format_later_mutation(&mutation),
+            "complete\tC123\t100.000002\tbefore=in-progress\tafter=completed\tchanged=true\treconciled=true"
+        );
+
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["items"][0]["conversation_id"], "C123");
+        assert_eq!(json["items"][0]["message_ts"], "100.000002");
+        assert_eq!(json["items"][0]["thread_root_resolution"], "complete");
+        assert_eq!(json["items"][1]["conversation_resolution"], "unavailable");
+        assert_eq!(json["next_cursor"], "cursor\nunsafe");
     }
 
     #[test]

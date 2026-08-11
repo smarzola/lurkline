@@ -15,15 +15,17 @@ Use Lurkline to:
 - Download private Slack files to explicit, non-existing local paths.
 - Upload one local regular file to a conversation root or thread.
 - Add or remove confirmed emoji reactions idempotently.
+- Review the personal Slack Later inbox and deliberately save, complete, or
+  remove exact messages.
 - Render bounded Markdown as Slack `rich_text`, with explicit, verifiable user mentions.
 - Create, update, inspect, delete, and publish text or one-file Slack drafts.
 - Send confirmed root messages and thread replies.
 
-Lurkline reads by default. CLI publication, deletion, reaction, file-upload,
-and file-draft creation mutations require `--confirm`.
+Lurkline reads by default. CLI publication, deletion, Later, reaction,
+file-upload, and file-draft creation mutations require `--confirm`.
 The MCP server rejects every write unless you start it with
-`--allow-write`; publication, deletion, reactions, file uploads, and file-draft
-creation then also require `confirm: true`.
+`--allow-write`; publication, deletion, Later, reactions, file uploads, and
+file-draft creation then also require `confirm: true`.
 
 > [!WARNING]
 > Slack's browser-session APIs are unsupported and can change without notice.
@@ -76,10 +78,12 @@ The following safeguards apply to Slack writes:
 - `drafts delete`, `drafts send`, `message send`, `thread reply`, and reaction
   add/remove require `--confirm`.
 - `files upload` requires `--confirm`.
+- `later save`, `later complete`, and `later remove` require `--confirm` before
+  Lurkline performs even the first Slack read.
 - MCP draft mutations and publications require the server's `--allow-write`
   option.
-- MCP deletion, publication, reaction, file-upload, and file-draft creation
-  mutations also require `confirm: true` in each tool call.
+- MCP deletion, publication, Later, reaction, file-upload, and file-draft
+  creation mutations also require `confirm: true` in each tool call.
 - Every message publication uses a fresh UUID v4 client message ID.
 - Draft publication posts first and deletes the draft only after Slack returns
   a valid acknowledgement.
@@ -664,6 +668,66 @@ result, Lurkline reads the exact message again. A known non-target state returns
 `reaction_not_applied`, for which a deliberate retry is safe. An unreadable
 state returns `reaction_uncertain`; inspect the message before retrying.
 
+## Review Slack Later
+
+Open the in-progress Later inbox, or select another state:
+
+```sh
+lurkline later list
+lurkline later list --state completed --limit 25 --json
+lurkline later list --state archived
+```
+
+Each row keeps the exact conversation/message identity and Slack's created,
+updated, due, snooze, and completion metadata. Lurkline hydrates all source
+messages in one grouped request and, for saved replies, their roots in at most
+one additional grouped request. Deleted or inaccessible messages remain useful
+Later rows with explicit unavailable context. A file saved in Slack appears as
+an attachment on its containing message; there is no separate file-level Later
+identity.
+
+Human rows always show both the display name and canonical conversation ID.
+Conversation, saved-message, and optional root enrichment degrade independently
+on bounded access or transport failures; authentication failures and malformed
+verified response shapes still fail the list instead of being hidden.
+
+When `has_more` is true, continue with the returned opaque cursor by itself:
+
+```sh
+lurkline later list --cursor '<next-cursor>'
+```
+
+The cursor retains the selected state and page size and rejects count drift or
+an identity or upstream cursor repeated from any earlier page. A terminal page
+must account for the selected state count, while a non-terminal page must leave
+items outstanding; contradictory counts or premature termination fail closed.
+This gives deterministic, non-overlapping pages while that Later list is
+unchanged. Slack doesn't expose an immutable Later snapshot, so any concurrent
+Later change invalidates the continuation; restart from the first page after a
+mutation. Same-count replacement isn't always detectable.
+
+Save, complete, or remove one exact message deliberately:
+
+```sh
+lurkline later save platform 1712345678.000100 --confirm --json
+lurkline later complete platform 1712345678.000100 --confirm --json
+lurkline later remove platform 1712345678.000100 --confirm --json
+```
+
+Before writing, Lurkline resolves the conversation and scans all three Later
+views within a fixed bound. Saving an already in-progress item, completing an
+already completed item, and removing an absent item are safe no-ops. Saving a
+completed or archived item and completing an absent or archived item fail with
+recovery guidance because Slack's private reopen behavior isn't assumed.
+After a write, an exact bounded readback must prove the requested state. A scan
+cap or unprovable outcome returns a structured `later_mutation_uncertain` or
+`later_mutation_not_applied` error; a changed private response contract returns
+`invalid_response`. Inspect Later before retrying any uncertain result.
+
+These commands use Slack's unsupported browser `saved.*` methods. If Slack
+changes their required fields or state meanings, Lurkline fails closed instead
+of silently dropping or misclassifying items.
+
 ### Upload a file
 
 Upload one regular file to a conversation root:
@@ -1076,6 +1140,12 @@ already stored in Slack.
 Omit `--profile work` to use `LURKLINE_PROFILE` or the registry default. The
 MCP server and CLI resolve credentials through the same path.
 
+`slack_list_later` is available in read-only mode. The
+`slack_save_for_later`, `slack_complete_later`, and
+`slack_remove_from_later` tools require both `--allow-write` and
+`confirm: true`; they use the same bounded state scan and exact readback as the
+CLI.
+
 The following table maps common tasks to CLI commands and MCP tools:
 
 | Task | CLI command | MCP tool |
@@ -1085,6 +1155,8 @@ The following table maps common tasks to CLI commands and MCP tools:
 | List explicit unread state | `lurkline unreads` | `slack_list_unreads` |
 | Read an unread inbox snapshot | `lurkline inbox` | `slack_read_inbox` |
 | Read bounded recent activity | `lurkline activity` | `slack_read_activity` |
+| Review Slack Later | `lurkline later list` | `slack_list_later` |
+| Save, complete, or remove a Later item | `lurkline later save`, `complete`, `remove` | `slack_save_for_later`, `slack_complete_later`, `slack_remove_from_later` |
 | List or find conversations | `lurkline conversations` | `slack_list_conversations`, `slack_find_conversations` |
 | Search messages | `lurkline search messages` | `slack_search_messages` |
 | Read conversation history | `lurkline channel read` | `slack_read_channel` |
@@ -1115,6 +1187,8 @@ The following table lists primary and auxiliary bounds:
 | --- | ---: | --- |
 | Markdown input | 40,000 bytes | One user-directory scan only when explicit `slack-user:` mentions are present |
 | Draft list | One page of 100 | No conversation discovery |
+| Slack Later list | One page of 50; complete output capped by `LURKLINE_MAX_RESPONSE_BYTES` | 20 conversation pages, one shared user scan when needed, one grouped source-message request, and at most one grouped thread-root request |
+| Slack Later mutation proof | One exact message identity | 20 pages of 50 per non-empty Later state before and after the write |
 | One-file draft proof | One file and one destination | 10 active-draft pages of 100; six bounded reads per reconciliation phase, with at most 7.75 seconds of draft-state delay |
 | Conversation list | One page of 200 | Up to 20 user pages of 200 for DMs |
 | Conversation find | 100 | 20 conversation pages and 20 user pages of 200 |
@@ -1133,10 +1207,12 @@ The following table lists primary and auxiliary bounds:
 | User find | 100 | 20 user pages of 200 |
 
 Slack-provided opaque cursors are limited to 2,048 non-control characters.
-Locally issued activity continuation cursors are limited to 8,192 bytes and
-carry only bounded filters, offsets, and digests. Repeated response cursors
-fail instead of creating pagination loops. Result JSON reports continuation or
-scan truncation when the operation supports it.
+Locally issued activity continuation cursors are limited to 8,192 bytes.
+Slack Later continuation cursors are limited to 256 KiB and retain at most
+1,000 prior identities so overlap checks cover every earlier page within the
+mutation scan bound. Repeated response cursors fail instead of creating
+pagination loops. Result JSON reports continuation or scan truncation when the
+operation supports it.
 
 ### Configure request controls
 
@@ -1167,7 +1243,7 @@ The browser token and `d=` cookie carry your Slack user authority. Lurkline:
 - Rejects API redirects, validates file redirects, and bounds request input,
   response output, and streamed file bytes.
 - Keeps MCP writes disabled unless the operator passes `--allow-write`.
-- Requires per-call confirmation for publication, deletion, reaction,
+- Requires per-call confirmation for publication, deletion, Later, reaction,
   file-upload, and file-draft creation mutations.
 - Escapes control characters in human-readable output.
 - Keeps MCP protocol output separate from diagnostics.

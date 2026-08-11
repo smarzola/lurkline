@@ -127,6 +127,22 @@ pub enum Error {
         message_ts: String,
         name: String,
     },
+    #[error(
+        "Slack Later {action} outcome is unknown for {channel_id} at {message_ts}; do not retry automatically; restart the Later list and verify the exact item before deciding what to do"
+    )]
+    LaterMutationUncertain {
+        channel_id: String,
+        message_ts: String,
+        action: &'static str,
+    },
+    #[error(
+        "Slack Later {action} is confirmed not applied for {channel_id} at {message_ts}; the exact state is known and a deliberate retry is safe"
+    )]
+    LaterMutationNotApplied {
+        channel_id: String,
+        message_ts: String,
+        action: &'static str,
+    },
     #[error("local file operation failed: {operation}")]
     LocalFile { operation: String },
     #[error("{resource} was not found")]

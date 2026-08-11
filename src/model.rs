@@ -56,8 +56,66 @@ pub(crate) struct RawMessagesList {
     pub messages_data: BTreeMap<String, RawChannelMessages>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RawLaterMessagesList {
+    #[serde(default)]
+    pub messages: BTreeMap<String, RawMessage>,
+    pub messages_data: BTreeMap<String, RawChannelMessages>,
+}
+
+impl From<RawLaterMessagesList> for RawMessagesList {
+    fn from(value: RawLaterMessagesList) -> Self {
+        Self {
+            messages: value.messages,
+            messages_data: value.messages_data,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawLaterResponseMetadata {
+    pub next_cursor: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawLaterPage {
+    pub saved_items: Vec<RawLaterItem>,
+    pub counts: RawLaterCounts,
+    pub response_metadata: RawLaterResponseMetadata,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct RawLaterItem {
+    pub item_id: String,
+    pub item_type: String,
+    pub ts: String,
+    pub state: String,
+    pub todo_state: String,
+    pub is_archived: bool,
+    pub date_created: u64,
+    pub date_updated: u64,
+    pub date_due: u64,
+    pub date_snoozed_until: u64,
+    pub date_completed: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct RawLaterCounts {
+    pub total_count: u64,
+    pub uncompleted_count: u64,
+    pub completed_count: u64,
+    pub archived_count: u64,
+    pub uncompleted_overdue_count: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawLaterMutationResponse {
+    pub item: RawLaterItem,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawChannelMessages {
+    #[serde(default)]
     pub messages: Vec<RawMessage>,
 }
 
@@ -986,6 +1044,81 @@ pub struct ReactionMutationReport {
     pub name: String,
     pub target_present: bool,
     pub present: bool,
+    pub changed: bool,
+    pub reconciled: bool,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LaterState {
+    InProgress,
+    Completed,
+    Archived,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaterContextResolution {
+    Complete,
+    Unavailable,
+    NotNeeded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct LaterCounts {
+    pub total: u64,
+    pub in_progress: u64,
+    pub completed: u64,
+    pub archived: u64,
+    pub overdue: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct LaterItem {
+    pub conversation_id: String,
+    pub message_ts: String,
+    pub state: LaterState,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub due_at: Option<u64>,
+    pub snoozed_until: Option<u64>,
+    pub completed_at: Option<u64>,
+    pub conversation: Option<Conversation>,
+    pub conversation_resolution: LaterContextResolution,
+    pub message: Option<Message>,
+    pub message_resolution: LaterContextResolution,
+    pub thread_root: Option<Message>,
+    pub thread_root_resolution: LaterContextResolution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct LaterPage {
+    pub team_id: String,
+    pub state: LaterState,
+    pub items: Vec<LaterItem>,
+    pub counts: LaterCounts,
+    pub limit: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaterMutationAction {
+    Save,
+    Complete,
+    Remove,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct LaterMutationReport {
+    pub conversation_id: String,
+    pub message_ts: String,
+    pub action: LaterMutationAction,
+    pub before_state: Option<LaterState>,
+    pub after_state: Option<LaterState>,
     pub changed: bool,
     pub reconciled: bool,
 }
