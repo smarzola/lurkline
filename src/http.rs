@@ -2137,6 +2137,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn later_routes_reject_missing_required_response_fields() {
+        let (client, _) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"saved_items":[],"counts":{"total_count":0,"uncompleted_count":0,"completed_count":0,"archived_count":0,"uncompleted_overdue_count":0},"response_metadata":{}}"#
+                .to_vec(),
+            64 * 1024,
+        )
+        .await;
+        assert!(matches!(
+            client.saved_list(LaterState::InProgress, None, 25).await,
+            Err(Error::InvalidResponse {
+                method: "saved.list"
+            })
+        ));
+
+        let (client, _) = server(
+            StatusCode::OK,
+            br#"{"ok":true,"messages":{}}"#.to_vec(),
+            64 * 1024,
+        )
+        .await;
+        assert!(matches!(
+            client
+                .messages_list_batch(&[("C123".into(), vec!["100.000001".into()])])
+                .await,
+            Err(Error::InvalidResponse {
+                method: "messages.list"
+            })
+        ));
+
+        let (client, _) = server(StatusCode::OK, br#"{"ok":true}"#.to_vec(), 64 * 1024).await;
+        assert!(matches!(
+            client.saved_add("C123", "100.000001").await,
+            Err(Error::InvalidResponse {
+                method: "saved.add"
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn sends_browser_upload_allocation_and_completion_shapes() {
         let (client, capture) = server(
             StatusCode::OK,

@@ -52,15 +52,19 @@ pub(crate) struct RawMessagePage {
 pub(crate) struct RawMessagesList {
     #[serde(default)]
     pub messages: BTreeMap<String, RawMessage>,
-    #[serde(default)]
     pub messages_data: BTreeMap<String, RawChannelMessages>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct RawLaterResponseMetadata {
+    pub next_cursor: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawLaterPage {
     pub saved_items: Vec<RawLaterItem>,
     pub counts: RawLaterCounts,
-    pub response_metadata: RawResponseMetadata,
+    pub response_metadata: RawLaterResponseMetadata,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]

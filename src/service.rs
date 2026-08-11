@@ -1540,7 +1540,7 @@ impl SlackService {
                 )
                 .err(),
             ),
-            Err(error) if mutation_error_is_ambiguous(&error) => (true, None),
+            Err(error) if later_mutation_error_is_ambiguous(&error) => (true, None),
             Err(error) => return Err(error),
         };
 
@@ -1733,7 +1733,7 @@ impl SlackService {
             || roots.values().any(message_needs_directory)
         {
             if loaded.author_directory.is_none() {
-                loaded.author_directory = Some(self.author_directory(None).await);
+                loaded.author_directory = Some(self.later_author_directory(None).await?);
             }
             if let Some(directory) = &loaded.author_directory {
                 for message in messages.values_mut().chain(roots.values_mut()) {
@@ -4080,7 +4080,11 @@ impl SlackService {
         }
 
         let author_directory = if matched.iter().any(|conversation| conversation.is_im) {
-            Some(self.author_directory(None).await)
+            Some(if preserve_on_degradable_interruption {
+                self.later_author_directory(None).await?
+            } else {
+                self.author_directory(None).await
+            })
         } else {
             None
         };
@@ -4132,6 +4136,26 @@ impl SlackService {
             UserDirectoryScan::Interrupted { directory, .. } => {
                 AuthorDirectory::Interrupted(directory)
             }
+        }
+    }
+
+    async fn later_author_directory(
+        &self,
+        user_directory: Option<UserDirectory>,
+    ) -> Result<AuthorDirectory> {
+        if let Some(user_directory) = user_directory {
+            return Ok(AuthorDirectory::Loaded(user_directory));
+        }
+        match self.scan_user_directory().await {
+            UserDirectoryScan::Finished(user_directory) => {
+                Ok(AuthorDirectory::Loaded(user_directory))
+            }
+            UserDirectoryScan::Interrupted { directory, error }
+                if later_context_can_degrade(&error) =>
+            {
+                Ok(AuthorDirectory::Interrupted(directory))
+            }
+            UserDirectoryScan::Interrupted { error, .. } => Err(error),
         }
     }
 
@@ -6615,6 +6639,19 @@ fn mutation_error_is_ambiguous(error: &Error) -> bool {
     )
 }
 
+fn later_mutation_error_is_ambiguous(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::HttpStatus { .. }
+            | Error::ResponseTooLarge { .. }
+            | Error::Timeout { .. }
+            | Error::Transport { .. }
+    ) || matches!(
+        error,
+        Error::SlackApi { code, .. } if matches!(code.as_str(), "fatal_error" | "internal_error")
+    )
+}
+
 fn later_context_can_degrade(error: &Error) -> bool {
     matches!(
         error,
@@ -7792,9 +7829,9 @@ mod tests {
     use super::*;
     use crate::model::{
         RawChannelMessages, RawConversation, RawConversationsPage, RawFile, RawLaterCounts,
-        RawMessageSearchChannel, RawMessageSearchMatch, RawMessageSearchMatches,
-        RawMessageSearchPagination, RawMessageSearchResponse, RawReaction, RawResponseMetadata,
-        RawThreadCounts, RawUnread, RawUserProfile,
+        RawLaterResponseMetadata, RawMessageSearchChannel, RawMessageSearchMatch,
+        RawMessageSearchMatches, RawMessageSearchPagination, RawMessageSearchResponse, RawReaction,
+        RawResponseMetadata, RawThreadCounts, RawUnread, RawUserProfile,
     };
 
     struct FakeApi {
@@ -7830,6 +7867,7 @@ mod tests {
         user_calls: Arc<Mutex<Vec<UserCall>>>,
         user_list_error: bool,
         user_list_error_after: Option<usize>,
+        user_list_error_kind: Option<&'static str>,
         drafts_page: RawDraftsPage,
         draft_pages: Mutex<VecDeque<RawDraftsPage>>,
         draft_info: RawDraftResponse,
@@ -8005,6 +8043,12 @@ mod tests {
                         LaterState::Completed | LaterState::Archived => "saved.update",
                     },
                 }),
+                Some("invalid_response") => Err(Error::InvalidResponse {
+                    method: match state {
+                        LaterState::InProgress => "saved.add",
+                        LaterState::Completed | LaterState::Archived => "saved.update",
+                    },
+                }),
                 Some(code) => Err(Error::SlackApi {
                     method: match state {
                         LaterState::InProgress => "saved.add",
@@ -8067,7 +8111,7 @@ mod tests {
         RawLaterPage {
             saved_items: items,
             counts,
-            response_metadata: RawResponseMetadata {
+            response_metadata: RawLaterResponseMetadata {
                 next_cursor: next_cursor.into(),
             },
         }
@@ -8245,7 +8289,7 @@ mod tests {
                     .map(|(_, item)| item.clone())
                     .collect(),
                 counts,
-                response_metadata: RawResponseMetadata::default(),
+                response_metadata: RawLaterResponseMetadata::default(),
             })
         }
 
@@ -8357,7 +8401,15 @@ mod tests {
                     .user_list_error_after
                     .is_some_and(|after| call_index >= after)
             {
-                return Err(Error::Authentication);
+                return match self.user_list_error_kind {
+                    Some("timeout") => Err(Error::Timeout {
+                        method: "users.list",
+                    }),
+                    Some("invalid_response") => Err(Error::InvalidResponse {
+                        method: "users.list",
+                    }),
+                    _ => Err(Error::Authentication),
+                };
             }
             Ok(self
                 .user_pages
@@ -8890,6 +8942,7 @@ mod tests {
             user_calls: Arc::new(Mutex::new(Vec::new())),
             user_list_error: false,
             user_list_error_after: None,
+            user_list_error_kind: None,
             drafts_page: RawDraftsPage::default(),
             draft_pages: Mutex::new(VecDeque::new()),
             draft_info: RawDraftResponse::default(),
@@ -16552,6 +16605,101 @@ mod tests {
             ));
         }
 
+        let mut user_timeout = fake_api();
+        user_timeout.later_items.lock().unwrap().push(later_item());
+        let mut unresolved_author = source_message();
+        unresolved_author.user = Some("U123".into());
+        user_timeout.message_list.messages_data.insert(
+            "C123".into(),
+            RawChannelMessages {
+                messages: vec![unresolved_author],
+            },
+        );
+        user_timeout.user_list_error = true;
+        user_timeout.user_list_error_kind = Some("timeout");
+        let page = service(user_timeout)
+            .list_later(LaterRequest {
+                state: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items[0].message.as_ref().unwrap().author_resolution,
+            AuthorResolution::Unavailable
+        );
+
+        for error in ["authentication", "invalid_response"] {
+            let mut channel_api = fake_api();
+            channel_api.later_items.lock().unwrap().push(later_item());
+            let mut source = source_message();
+            source.user = Some("U123".into());
+            channel_api.message_list.messages_data.insert(
+                "C123".into(),
+                RawChannelMessages {
+                    messages: vec![source],
+                },
+            );
+            channel_api.user_list_error = true;
+            channel_api.user_list_error_kind = Some(error);
+            let result = service(channel_api)
+                .list_later(LaterRequest {
+                    state: None,
+                    limit: None,
+                    cursor: None,
+                })
+                .await;
+            assert!(matches!(
+                (error, result),
+                ("authentication", Err(Error::Authentication))
+                    | (
+                        "invalid_response",
+                        Err(Error::InvalidResponse {
+                            method: "users.list"
+                        })
+                    )
+            ));
+
+            let mut dm_api = fake_api();
+            dm_api.later_items.lock().unwrap().push((
+                LaterState::InProgress,
+                raw_later_item("D123", "100.000001", LaterState::InProgress),
+            ));
+            dm_api
+                .conversation_pages
+                .lock()
+                .unwrap()
+                .push_back(RawConversationsPage {
+                    channels: vec![RawConversation {
+                        id: "D123".into(),
+                        is_im: true,
+                        user: Some("U123".into()),
+                        ..RawConversation::default()
+                    }],
+                    ..RawConversationsPage::default()
+                });
+            dm_api.user_list_error = true;
+            dm_api.user_list_error_kind = Some(error);
+            let result = service(dm_api)
+                .list_later(LaterRequest {
+                    state: None,
+                    limit: None,
+                    cursor: None,
+                })
+                .await;
+            assert!(matches!(
+                (error, result),
+                ("authentication", Err(Error::Authentication))
+                    | (
+                        "invalid_response",
+                        Err(Error::InvalidResponse {
+                            method: "users.list"
+                        })
+                    )
+            ));
+        }
+
         let mut source_unavailable = fake_api();
         source_unavailable
             .later_items
@@ -16968,6 +17116,46 @@ mod tests {
                 method: "saved.add"
             })
         ));
+
+        let mut missing_save_ack = fake_api();
+        missing_save_ack.message_list.messages.insert(
+            "synthetic".into(),
+            RawMessage {
+                ts: "100.000001".into(),
+                text: "synthetic source".into(),
+                ..RawMessage::default()
+            },
+        );
+        missing_save_ack.later_mutation_error = Some("invalid_response");
+        missing_save_ack.later_apply_before_error = true;
+        let save_state = missing_save_ack.later_items.clone();
+        assert!(matches!(
+            service(missing_save_ack)
+                .save_for_later("C123", "100.000001", true)
+                .await,
+            Err(Error::InvalidResponse {
+                method: "saved.add"
+            })
+        ));
+        assert_eq!(save_state.lock().unwrap().len(), 1);
+
+        let mut missing_complete_ack = fake_api();
+        missing_complete_ack.later_items.lock().unwrap().push((
+            LaterState::InProgress,
+            raw_later_item("C123", "100.000001", LaterState::InProgress),
+        ));
+        missing_complete_ack.later_mutation_error = Some("invalid_response");
+        missing_complete_ack.later_apply_before_error = true;
+        let complete_state = missing_complete_ack.later_items.clone();
+        assert!(matches!(
+            service(missing_complete_ack)
+                .complete_later("C123", "100.000001", true)
+                .await,
+            Err(Error::InvalidResponse {
+                method: "saved.update"
+            })
+        ));
+        assert_eq!(complete_state.lock().unwrap()[0].0, LaterState::Completed);
     }
 
     #[tokio::test]

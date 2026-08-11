@@ -1408,8 +1408,9 @@ mod tests {
         error::Result,
         model::{
             ClientCountsPayload, RawConversationsPage, RawLaterCounts, RawLaterPage,
-            RawMessagePage, RawMessageSearchMatches, RawMessageSearchResponse, RawMessagesList,
-            RawResponseMetadata, RawThreadCounts, RawUser, RawUserProfile, RawUsersPage,
+            RawLaterResponseMetadata, RawMessagePage, RawMessageSearchMatches,
+            RawMessageSearchResponse, RawMessagesList, RawThreadCounts, RawUser, RawUserProfile,
+            RawUsersPage,
         },
         service::SlackApi,
     };
@@ -1463,7 +1464,7 @@ mod tests {
             Ok(RawLaterPage {
                 saved_items: vec![],
                 counts: RawLaterCounts::default(),
-                response_metadata: RawResponseMetadata::default(),
+                response_metadata: RawLaterResponseMetadata::default(),
             })
         }
 

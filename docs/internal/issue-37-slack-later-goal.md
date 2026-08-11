@@ -184,10 +184,10 @@ Follow `AGENTS.md`.
 - Never commit, log, snapshot, or print real Slack credentials, cookies, HAR
   payloads, workspace messages, names, identifiers, URLs, or file contents.
   Use synthetic fixtures in code, tests, docs, review packets, and commits.
-- Live smoke may read the signed-in `sfera` workspace but expose only aggregate
-  or boolean evidence. Slack writes are authorized only to the personal Later
-  state of a uniquely identified synthetic message in `smarzola`'s self-DM;
-  remove every temporary Later item and report exact residue.
+- Live smoke may read the already signed-in authorized workspace but expose
+  only aggregate or boolean evidence. Slack writes are authorized only to the
+  requester's self-DM Later state for one uniquely selected message; remove
+  every temporary Later item and report exact residue.
 - Do not add archive mutation, reminder scheduling, Later search, bulk actions,
   background polling, persistent caching, configuration, dependencies, or
   adjacent Slack mutations.
