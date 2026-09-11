@@ -4,6 +4,8 @@ Approval: user requested the pursue-goal workflow and “fix this” on 2026-09-
 with a screenshot reporting 27 dropped tools due to `outputSchema.type`.
 This authorizes the bounded schema fix, verification, independent review, and
 draft-to-ready PR delivery. Follow the pursue-goal skill for execution.
+The user then requested “Release” on 2026-09-11, authorizing merge and patch
+release `v0.17.2`, including publication and artifact verification.
 
 Repository: `/Users/smarzola/projects/lurkline`. Starting branch: `main`.
 Base: `81ad84fda52c8aa439b2566e524889bc7c22cb4e`; checkout clean and matches remote.
@@ -50,6 +52,11 @@ one shared helper. This corrects the schema without changing result payloads.
    The reviewer may use disposable runtime files but cannot edit tracked source.
 5. Keep the PR draft during implementation/review; mark ready after verification
    and published-head checks pass. Record any separately authorized delivery.
+6. Publish `v0.17.2` from the reviewed product merge. Align Cargo and MCP version
+   metadata, verify final PR and tagged-source checks, verify all three platform
+   archives and checksums, and run the published macOS binary through the SDK
+   discovery/result-validation walkthrough. Preserve existing review evidence
+   while product source remains unchanged.
 
 Both roles should use the simplest complete fix and proportional verification.
 The wire-level regression closes an actual protocol-validation gap; no new
@@ -103,3 +110,21 @@ Final review: no material blocking findings; no substantial avoidable complexity
 or ineffective tests. Implementation commit: `ecdb999b3f0f5dfe0671f22303ff9ed9adb12d7e`.
 Current status: implementation and both runtime walkthroughs complete. The PR
 is the source of truth for the final CI results and readiness transition.
+
+## Release v0.17.2
+
+PR #42 was verified ready at `57fd025` with all six CI checks passing before
+release approval. It returns to draft for the version update. Product source is
+unchanged from the independently reviewed `ecdb999` implementation.
+Cargo and MCP metadata now agree on `0.17.2`. Formatting, strict Clippy, all
+331 tests, release build, credential scan, and whitespace checks passed again.
+A focused independent review found only the intended metadata and authorization
+changes. The reviewer personally confirmed `lurkline --version` and MCP
+`serverInfo.version` both report `0.17.2`; the prior full implementation review
+and SDK walkthrough remain applicable because product source is unchanged.
+
+The linked PR records final-head CI, readiness, and merge. The
+[v0.17.2 release notes](https://github.com/smarzola/lurkline/releases/tag/v0.17.2)
+are the delivery record for the product tag, release workflow, platform assets,
+and post-download verification required by criterion 6. This keeps external
+delivery evidence with the published artifacts.
