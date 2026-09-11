@@ -1542,8 +1542,9 @@ mod tests {
 
         let client = ().serve(client_stdio).await.expect("client initializes");
         let peer_info = client.peer().peer_info().expect("server metadata");
-        assert_eq!(peer_info.server_info.name, "lurkline");
-        assert_eq!(peer_info.server_info.version, env!("CARGO_PKG_VERSION"));
+        let server_info = peer_info.server_info.as_ref().expect("server identity");
+        assert_eq!(server_info.name, "lurkline");
+        assert_eq!(server_info.version, env!("CARGO_PKG_VERSION"));
 
         let tools = client.peer().list_tools(None).await.expect("tools/list");
         assert_eq!(

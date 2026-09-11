@@ -100,6 +100,113 @@ fn assert_object_tool_schemas(tools: &Value, expected_count: usize) {
 }
 
 #[tokio::test]
+async fn modern_discovery_lists_tools_and_calls_without_initialize() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lurkline"))
+        .arg("mcp")
+        .env("SLACK_BASE_URL", "https://example.slack.com")
+        .env("SLACK_TEAM_ID", "T000TEST")
+        .env("SLACK_TOKEN", "xoxc-mcp-test-secret")
+        .env("SLACK_COOKIE", "d=xoxd-mcp-test-secret")
+        .env("LURKLINE_TIMEOUT_MS", "500")
+        .env_remove("LURKLINE_MAX_RESPONSE_BYTES")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = child.stderr.take().unwrap();
+    let metadata = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "raw-modern-test", "version": "1.0"},
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": metadata}
+        }),
+    )
+    .await;
+    let discovery = response_with_id(&mut stdout, 1).await;
+    assert!(
+        discovery["result"]["supportedVersions"]
+            .as_array()
+            .expect("discovery advertises supported protocols")
+            .contains(&json!("2026-07-28"))
+    );
+    let identity = &discovery["result"]["_meta"]["io.modelcontextprotocol/serverInfo"];
+    assert_eq!(identity["name"], "lurkline");
+    assert_eq!(identity["version"], env!("CARGO_PKG_VERSION"));
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+            "params": {"_meta": metadata}
+        }),
+    )
+    .await;
+    assert_object_tool_schemas(&response_with_id(&mut stdout, 2).await, 27);
+
+    for (id, name, arguments, expected_error) in [
+        (
+            3,
+            "slack_render_markdown",
+            json!({"markdown": "**hello**"}),
+            None,
+        ),
+        (
+            4,
+            "slack_find_users",
+            json!({"query": ""}),
+            Some("invalid_input"),
+        ),
+        (
+            5,
+            "slack_create_draft",
+            json!({"conversation": "C123", "markdown": "hello"}),
+            Some("write_not_allowed"),
+        ),
+    ] {
+        send(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"_meta": metadata, "name": name, "arguments": arguments}
+            }),
+        )
+        .await;
+        let response = response_with_id(&mut stdout, id).await;
+        let result = &response["result"];
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["isError"], expected_error.is_some());
+        if let Some(code) = expected_error {
+            assert_eq!(result["structuredContent"]["error"]["code"], code);
+        } else {
+            assert_eq!(result["structuredContent"]["text"], "hello");
+            assert_eq!(
+                result["structuredContent"]["blocks"][0]["type"],
+                "rich_text"
+            );
+        }
+    }
+
+    drop(stdin);
+    let status = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("MCP server did not stop on EOF")
+        .unwrap();
+    assert!(status.success());
+    let mut diagnostics = String::new();
+    stderr.read_to_string(&mut diagnostics).await.unwrap();
+    assert!(diagnostics.is_empty(), "unexpected stderr: {diagnostics}");
+}
+
+#[tokio::test]
 async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lurkline"))
         .arg("mcp")
@@ -133,6 +240,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     )
     .await;
     let initialized = response_with_id(&mut stdout, 1).await;
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(initialized["result"]["serverInfo"]["name"], "lurkline");
     assert_eq!(
         initialized["result"]["serverInfo"]["version"],
@@ -154,6 +262,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     )
     .await;
     let tools = response_with_id(&mut stdout, 2).await;
+    assert!(tools["result"].get("resultType").is_none());
     assert_object_tool_schemas(&tools, 27);
     let names = tools["result"]["tools"]
         .as_array()
@@ -442,6 +551,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     )
     .await;
     let rendered = response_with_id(&mut stdout, 20).await;
+    assert!(rendered["result"].get("resultType").is_none());
     assert_eq!(rendered["result"]["isError"], false);
     assert_eq!(rendered["result"]["structuredContent"]["text"], "hello");
     assert!(

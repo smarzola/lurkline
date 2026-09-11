@@ -1054,6 +1054,9 @@ published.
 
 ## Use the MCP server
 
+The server supports MCP 2026-07-28 discovery and existing clients that use the
+2025-11-25 initialization handshake. Both use the same tools and write guards.
+
 Start the read-only stdio server with a stored profile:
 
 ```sh
