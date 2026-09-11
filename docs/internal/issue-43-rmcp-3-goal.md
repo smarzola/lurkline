@@ -136,7 +136,7 @@ tests or reading the other role's report does not replace personal acceptance.
 
 - [x] Revision 2 approved; draft PR #44 opened from goal checkpoint `a2581c5`.
 - [x] SDK migration, meaningful regression coverage, and implementer acceptance pass.
-- [ ] Required checks and fresh independent review/acceptance pass.
+- [x] Required local checks and fresh independent review/acceptance pass.
 - [ ] Final PR head passes CI, PR is ready and merged, and v0.18.0 is published.
 - [ ] All three downloaded archives match their checksums and expected contents;
   the published macOS binary reports v0.18.0 and passes stdio discovery/calls.
@@ -149,9 +149,9 @@ and published-binary acceptance. Keep documentation precise and understandable
 without this conversation, following the repository's writing conventions.
 
 Implementer runtime: passed; actual SDK consumers launched and used both binaries.
-Reviewer runtime and final review: pending.
-Goal status: implementation and local verification complete; independent review pending.
-PR/release status: PR #44 remains draft; release pending review and CI.
+Reviewer runtime and final review: passed; no material blocking findings.
+Goal status: implementation, local verification, and independent review complete.
+PR/release status: PR #44 remains draft pending final-head CI; release follows merge.
 
 ## Implementation and verification evidence
 
@@ -195,3 +195,27 @@ Runtime logs: `modern-baseline.log`, `modern-upgraded.log`,
 Slack configuration and use synthetic inputs; no live Slack request is needed.
 Owned file roots are removed after use. This reproduces the modern-discovery
 compatibility failure, without claiming the issue's unnamed client was tested.
+
+## Independent review and delivery record
+
+Fresh Sol reviewer independently inspected `a283939..abffc94`, the approved goal,
+the two consumer implementations, source, tests, metadata, and documentation.
+The reviewer personally ran the upgraded executable through both official SDK
+consumers in default and enabled configurations. Modern discovery negotiated
+2026-07-28 and reported v0.18.0; discovery returned 27/30 tools, rendering
+succeeded, validation errors and both write guards behaved as expected, and
+processes exited 0 with empty server stderr. The strict legacy client validated
+all schemas and results and rejected a deliberately mistyped payload. Temporary
+roots were removed. The reviewer also reproduced the baseline discovery failure
+and passed all three raw stdio tests. Source and git state stayed clean.
+
+Final verdict: no material blocking findings, no substantial avoidable
+complexity, and no ineffective tests identified. Full reviewed implementation:
+`abffc9421ca2f74b466c05f588e44f79f5adac2d`. This evidence-only update does not
+change the reviewed product or runtime setup.
+
+PR #44 is the source of truth for final published-head CI, readiness, and merge.
+The [v0.18.0 release](https://github.com/smarzola/lurkline/releases/tag/v0.18.0)
+will record the source commit, release workflow, archive/checksum verification,
+and personal MCP usage against the downloaded macOS binary. Those delivery
+criteria remain pending until the corresponding external records confirm them.
