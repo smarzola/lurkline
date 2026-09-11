@@ -4,7 +4,7 @@ use url::{Url, form_urlencoded};
 use zeroize::Zeroizing;
 
 use crate::{
-    config::{CredentialBundle, validate_identifier},
+    config::{CredentialBundle, is_valid_workspace_host},
     error::{Error, Result},
 };
 
@@ -93,20 +93,37 @@ fn parse_words(words: &[Zeroizing<String>]) -> Result<CredentialBundle> {
     let mut team_id = query_value(&request_url, "slack_route")?;
     let (token, body_team_id) = parse_body_fields(body, content_type)?;
     merge_owned(&mut team_id, body_team_id)?;
-    let team_id = team_id.ok_or_else(|| invalid_curl("is missing slack_route"))?;
-    if !team_id.starts_with('T')
-        || validate_identifier("SLACK_TEAM_ID", &team_id).is_err()
-        || !team_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    {
-        return Err(invalid_curl("contains an invalid slack_route team ID"));
-    }
+    let route = team_id.ok_or_else(|| invalid_curl("is missing slack_route"))?;
+    let team_id = context_id_from_route(&route)?;
     let token = token.ok_or_else(|| invalid_curl("is missing the token form field"))?;
     if !token.starts_with("xoxc-") {
         return Err(invalid_curl("token must be a browser xoxc token"));
     }
     let base_url = request_url.origin().ascii_serialization();
-    CredentialBundle::parse_borrowed(base_url, team_id, &token, cookie)
+    CredentialBundle::parse_borrowed(base_url, team_id.to_owned(), &token, cookie)
         .map_err(|_| invalid_curl("contains invalid Slack browser credentials"))
+}
+
+fn context_id_from_route(route: &str) -> Result<&str> {
+    let valid_id = |id: &str| {
+        (2..=64).contains(&id.len())
+            && id.starts_with(['T', 'E'])
+            && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    };
+    let context = if let Some((organization, context)) = route.split_once(':') {
+        if !organization.starts_with('E') || !valid_id(organization) {
+            return Err(invalid_curl(
+                "contains an invalid slack_route organization ID",
+            ));
+        }
+        context
+    } else {
+        route
+    };
+    if !valid_id(context) {
+        return Err(invalid_curl("contains an invalid slack_route context ID"));
+    }
+    Ok(context)
 }
 
 fn next_value<'a>(words: &'a [Zeroizing<String>], index: &mut usize) -> Result<&'a str> {
@@ -159,13 +176,7 @@ fn validate_request_url(raw: &str) -> Result<Url> {
     {
         return Err(invalid_curl("must target a Slack HTTPS API request"));
     }
-    let host = url.host_str().unwrap_or_default();
-    let workspace = host.strip_suffix(".slack.com").unwrap_or_default();
-    if workspace.is_empty()
-        || workspace.contains('.')
-        || !workspace
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    if !is_valid_workspace_host(url.host_str().unwrap_or_default())
         || url.port().is_some_and(|port| port != 443)
     {
         return Err(invalid_curl("must target a Slack workspace origin"));
@@ -618,6 +629,95 @@ mod tests {
         );
         let bundle = parse_copy_as_curl(command.as_bytes()).unwrap();
         assert_eq!(bundle.team_id, "T123");
+    }
+
+    #[test]
+    fn imports_enterprise_contexts_from_query_and_form_routes() {
+        for (route, context) in [
+            ("T123ABC", "T123ABC"),
+            ("E123ABC", "E123ABC"),
+            ("E123ABC:E123ABC", "E123ABC"),
+            ("E123ABC:E456DEF", "E456DEF"),
+            ("E123ABC:T456DEF", "T456DEF"),
+        ] {
+            let query_command = current_chromium()
+                .replace("example.slack.com", "example.enterprise.slack.com")
+                .replace("slack_route=T123ABC", &format!("slack_route={route}"));
+            let form_command = format!(
+                "curl 'https://example.enterprise.slack.com/api/client.counts' \
+                 -b 'd=xoxd-test' --data 'token=xoxc-test&slack_route={}'",
+                route.replace(':', "%3A")
+            );
+            let multipart_command = query_command
+                .replace(&format!("?slack_route={route}"), "")
+                .replace(
+                    "xoxc-test-token\\r\\n------Boundary123--",
+                    &format!(
+                        "xoxc-test-token\\r\\n------Boundary123\\r\\n\
+                         Content-Disposition: form-data; name=\"slack_route\"\\r\\n\\r\\n\
+                         {route}\\r\\n------Boundary123--"
+                    ),
+                );
+            for command in [query_command, form_command, multipart_command] {
+                let bundle = parse_copy_as_curl(command.as_bytes()).unwrap();
+                assert_eq!(
+                    bundle.workspace_url(),
+                    "https://example.enterprise.slack.com"
+                );
+                assert_eq!(bundle.team_id, context);
+                let encoded = crate::auth::encode_bundle(&bundle).unwrap();
+                let profile = crate::auth::ProfileName::parse("work").unwrap();
+                let restored = crate::auth::decode_bundle(&profile, &encoded).unwrap();
+                assert_eq!(restored.workspace_url(), bundle.workspace_url());
+                assert_eq!(restored.team_id, context);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_enterprise_routes_and_conflicting_organizations() {
+        for route in [
+            "E",
+            "T",
+            "E123:",
+            ":E123",
+            "T123:E123",
+            "E123:U123",
+            "E123:E",
+            "E123:E456:E789",
+            "E_123:E456",
+            "E123:E-456",
+            "E123:E456%0A",
+        ] {
+            let command =
+                current_chromium().replace("slack_route=T123ABC", &format!("slack_route={route}"));
+            assert!(parse_copy_as_curl(command.as_bytes()).is_err(), "{route}");
+        }
+        for route in [
+            format!("E{}:E123", "A".repeat(64)),
+            format!("E123:E{}", "A".repeat(64)),
+        ] {
+            let command =
+                current_chromium().replace("slack_route=T123ABC", &format!("slack_route={route}"));
+            assert!(parse_copy_as_curl(command.as_bytes()).is_err());
+        }
+        let command = "curl 'https://example.enterprise.slack.com/api/test?slack_route=E123%3AE456' -b 'd=xoxd-test' --data 'token=xoxc-test&slack_route=E789%3AE456'";
+        let error = parse_copy_as_curl(command.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("conflicting duplicate values"));
+    }
+
+    #[test]
+    fn rejects_unsafe_enterprise_request_origins() {
+        for origin in [
+            "http://example.enterprise.slack.com",
+            "https://a.b.enterprise.slack.com",
+            "https://example.enterprise.slack.com.evil.example",
+            "https://user:password@example.enterprise.slack.com",
+            "https://example.enterprise.slack.com:8443",
+        ] {
+            let command = current_chromium().replace("https://example.slack.com", origin);
+            assert!(parse_copy_as_curl(command.as_bytes()).is_err(), "{origin}");
+        }
     }
 
     #[test]
