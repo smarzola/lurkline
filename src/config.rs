@@ -242,14 +242,7 @@ pub(crate) fn validate_base_url(raw: &str) -> Result<Url> {
     if url.scheme() != "https" {
         return Err(Error::invalid_config("SLACK_BASE_URL", "must use HTTPS"));
     }
-    let host = url.host_str().unwrap_or_default();
-    let workspace = host.strip_suffix(".slack.com").unwrap_or_default();
-    if workspace.is_empty()
-        || workspace.contains('.')
-        || !workspace
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
+    if !is_valid_workspace_host(url.host_str().unwrap_or_default()) {
         return Err(Error::invalid_config(
             "SLACK_BASE_URL",
             "must be a Slack workspace origin",
@@ -271,20 +264,25 @@ pub(crate) fn validate_base_url(raw: &str) -> Result<Url> {
 }
 
 pub(crate) fn is_valid_workspace_origin(url: &Url) -> bool {
-    let host = url.host_str().unwrap_or_default();
-    let workspace = host.strip_suffix(".slack.com").unwrap_or_default();
     url.scheme() == "https"
-        && !workspace.is_empty()
-        && !workspace.contains('.')
-        && workspace
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && is_valid_workspace_host(url.host_str().unwrap_or_default())
         && url.username().is_empty()
         && url.password().is_none()
         && url.path() == "/"
         && url.query().is_none()
         && url.fragment().is_none()
         && url.port().is_none_or(|port| port == 443)
+}
+
+pub(crate) fn is_valid_workspace_host(host: &str) -> bool {
+    let workspace = host
+        .strip_suffix(".enterprise.slack.com")
+        .or_else(|| host.strip_suffix(".slack.com"))
+        .unwrap_or_default();
+    !workspace.is_empty()
+        && workspace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 pub(crate) fn validate_identifier(name: &'static str, value: &str) -> Result<()> {
@@ -419,10 +417,13 @@ mod tests {
             "https://example.slack.com",
             "https://example-workspace.slack.com/",
             "https://example.slack.com:443/",
+            "https://example.enterprise.slack.com",
+            "https://example-org.enterprise.slack.com:443/",
         ] {
             let mut values = valid();
             values.insert("SLACK_BASE_URL", valid_url.into());
             Config::from_getter(|name| values.get(name).cloned()).unwrap();
+            assert!(is_valid_workspace_origin(&Url::parse(valid_url).unwrap()));
         }
 
         for invalid_url in [
@@ -430,6 +431,12 @@ mod tests {
             "https://workspace.slack.com.evil.example/",
             "https://slack.com/",
             "https://a.b.slack.com/",
+            "https://a.b.enterprise.slack.com/",
+            "https://example.enterprise.slack.com.evil.example/",
+            "https://example.enterprise-slack.com/",
+            "https://example.enterprise.slack.com:8443/",
+            "https://example.enterprise.slack.com/?query=value",
+            "https://example.enterprise.slack.com/#fragment",
             "https://user@workspace.slack.com/",
             "https://workspace.slack.com/client/",
             "https://workspace.slack.com:8443/",
@@ -444,6 +451,9 @@ mod tests {
                 "unexpected error for {invalid_url}: {error}"
             );
             assert!(!error.to_string().contains(invalid_url));
+            assert!(!is_valid_workspace_origin(
+                &Url::parse(invalid_url).unwrap()
+            ));
         }
     }
 

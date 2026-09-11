@@ -65,6 +65,11 @@ invoke a shell, or invoke `curl`. It accepts at most 256 KiB, verifies the Slack
 origin and browser credential shape, makes one bounded `client.counts` request,
 and stores only normalized session fields.
 
+Both `<workspace>.slack.com` and `<organization>.enterprise.slack.com` origins
+are supported. The importer accepts ordinary `T…` routes, standalone `E…`
+routes, and Enterprise `E…:T…` or `E…:E…` routes. For a compound route, it uses
+the final ID as the profile's session context. Existing profiles need no migration.
+
 After a successful import, clear the command from your clipboard and clipboard
 history. Don't save it in a file, shell history, issue, or chat.
 
