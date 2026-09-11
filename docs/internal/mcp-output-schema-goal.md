@@ -59,8 +59,10 @@ standalone test framework or production dependency is needed.
 
 - [x] Shared schema fix and raw stdio regression pass.
 - [x] Required local checks and implementer runtime acceptance pass.
-- [ ] Independent review and reviewer runtime acceptance pass.
-- [ ] Published PR head passes CI and is ready for review.
+- [x] Independent review and reviewer runtime acceptance pass.
+
+The linked PR records published-head CI and draft/ready status. Mark it ready
+only after the final published head passes the required checks.
 
 Baseline runtime: real `target/release/lurkline mcp`, version 0.17.1;
 27 tools returned, 27 missing object output roots, clean EOF shutdown.
@@ -89,5 +91,15 @@ removed. The SDK's validator logs ignored Rust integer format annotations; JSON
 integer/range constraints still apply. The scratch driver initially needed a
 canonical file-root path and the actual draft argument shape; these were fixed.
 
-Reviewer runtime: pending. Final review: pending.
-Current status: implementation verified locally; independent review and CI pending.
+Reviewer runtime: fresh Sol reviewer personally built and launched
+`ecdb999b3f0f5dfe0671f22303ff9ed9adb12d7e` with the official SDK on macOS ARM64.
+Discovery accepted 27 default and 30 fully enabled tools; all schemas compiled
+and rejected non-object outputs. Render success and invalid-input/write-guard
+errors validated, and a mistyped result was rejected. No Slack access occurred,
+server diagnostics were empty, temporary data was removed, and the worktree
+remained clean. Source review confirmed unchanged payloads and permissions.
+
+Final review: no material blocking findings; no substantial avoidable complexity
+or ineffective tests. Implementation commit: `ecdb999b3f0f5dfe0671f22303ff9ed9adb12d7e`.
+Current status: implementation and both runtime walkthroughs complete. The PR
+is the source of truth for the final CI results and readiness transition.
