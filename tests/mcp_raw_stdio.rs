@@ -85,6 +85,20 @@ fn schema_allows_null(value: &Value) -> bool {
     }
 }
 
+fn assert_object_tool_schemas(tools: &Value, expected_count: usize) {
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), expected_count);
+    for tool in tools {
+        for schema in ["inputSchema", "outputSchema"] {
+            assert_eq!(
+                tool[schema]["type"], "object",
+                "{} {schema} must declare an object root for strict MCP clients",
+                tool["name"]
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lurkline"))
@@ -140,6 +154,7 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     )
     .await;
     let tools = response_with_id(&mut stdout, 2).await;
+    assert_object_tool_schemas(&tools, 27);
     let names = tools["result"]["tools"]
         .as_array()
         .unwrap()
@@ -429,6 +444,20 @@ async fn raw_json_rpc_initializes_lists_tools_and_returns_a_validation_error() {
     let rendered = response_with_id(&mut stdout, 20).await;
     assert_eq!(rendered["result"]["isError"], false);
     assert_eq!(rendered["result"]["structuredContent"]["text"], "hello");
+    assert!(
+        rendered["result"]["structuredContent"]
+            .get("outbound_mentions")
+            .is_none()
+    );
+    let required = render_tool["outputSchema"]["$defs"]["RenderedMessage"]["required"]
+        .as_array()
+        .expect("rendered message required fields");
+    assert!(required.contains(&json!("text")));
+    assert!(required.contains(&json!("blocks")));
+    assert!(
+        !required.contains(&json!("outbound_mentions")),
+        "output schema must permit fields omitted during serialization"
+    );
     assert_eq!(
         rendered["result"]["structuredContent"]["blocks"][0]["type"],
         "rich_text"
@@ -880,6 +909,7 @@ async fn raw_json_rpc_exposes_and_guards_enabled_file_uploads() {
     )
     .await;
     let tools = response_with_id(&mut stdout, 101).await;
+    assert_object_tool_schemas(&tools, 30);
     let upload = tools["result"]["tools"]
         .as_array()
         .unwrap()

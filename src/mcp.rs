@@ -361,9 +361,25 @@ const fn default_file_upload_bytes() -> u64 {
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(untagged)]
+// MCP clients require an explicit object root alongside the success/error alternatives.
+#[schemars(extend("type" = "object"))]
 enum ToolOutput<T> {
     Data(T),
     Error { error: ToolError },
+}
+
+fn tool_output_schema<T: JsonSchema>() -> Arc<rmcp::model::JsonObject> {
+    // Output schemas must describe serialization, including omitted empty fields.
+    let schema = schemars::generate::SchemaSettings::draft2020_12()
+        .for_serialize()
+        .into_generator()
+        .into_root_schema_for::<ToolOutput<T>>();
+    Arc::new(
+        schema
+            .as_object()
+            .expect("tool output schema must be an object")
+            .clone(),
+    )
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -517,7 +533,7 @@ impl McpServer {
     /// Validate configuration and make a bounded Slack authentication probe.
     #[tool(
         name = "slack_doctor",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<DoctorReport>>(),
+        output_schema = tool_output_schema::<DoctorReport>(),
         annotations(
             title = "Diagnose Slack browser-session access",
             read_only_hint = true,
@@ -533,7 +549,7 @@ impl McpServer {
     /// Convert bounded CommonMark to Slack rich text, resolving only explicit user mentions.
     #[tool(
         name = "slack_render_markdown",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<RenderedMessage>>(),
+        output_schema = tool_output_schema::<RenderedMessage>(),
         annotations(
             title = "Render Markdown as Slack rich text",
             read_only_hint = true,
@@ -552,7 +568,7 @@ impl McpServer {
     /// List a bounded timestamp-paginated page of active Slack drafts.
     #[tool(
         name = "slack_list_drafts",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<DraftPage>>(),
+        output_schema = tool_output_schema::<DraftPage>(),
         annotations(
             title = "List Slack drafts",
             read_only_hint = true,
@@ -575,7 +591,7 @@ impl McpServer {
     /// Fetch one Slack draft by server ID.
     #[tool(
         name = "slack_get_draft",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<Draft>>(),
+        output_schema = tool_output_schema::<Draft>(),
         annotations(
             title = "Get Slack draft",
             read_only_hint = true,
@@ -591,7 +607,7 @@ impl McpServer {
     /// Create one root or thread Slack draft from Markdown.
     #[tool(
         name = "slack_create_draft",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<Draft>>(),
+        output_schema = tool_output_schema::<Draft>(),
         annotations(
             title = "Create Slack draft",
             read_only_hint = false,
@@ -622,7 +638,7 @@ impl McpServer {
     /// Create one root or thread Slack draft with exactly one private local file.
     #[tool(
         name = "slack_create_file_draft",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<FileDraftCreateReport>>(),
+        output_schema = tool_output_schema::<FileDraftCreateReport>(),
         annotations(
             title = "Create one-file Slack draft",
             read_only_hint = false,
@@ -695,7 +711,7 @@ impl McpServer {
     /// Replace one supported Slack draft's content from Markdown.
     #[tool(
         name = "slack_update_draft",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<Draft>>(),
+        output_schema = tool_output_schema::<Draft>(),
         annotations(
             title = "Update Slack draft",
             read_only_hint = false,
@@ -721,7 +737,7 @@ impl McpServer {
     /// Permanently delete one supported Slack draft.
     #[tool(
         name = "slack_delete_draft",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<DraftDeleteReport>>(),
+        output_schema = tool_output_schema::<DraftDeleteReport>(),
         annotations(
             title = "Delete Slack draft",
             read_only_hint = false,
@@ -747,7 +763,7 @@ impl McpServer {
     /// Publish a root message or thread reply from Markdown.
     #[tool(
         name = "slack_send_message",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<SentMessage>>(),
+        output_schema = tool_output_schema::<SentMessage>(),
         annotations(
             title = "Send Slack message",
             read_only_hint = false,
@@ -779,7 +795,7 @@ impl McpServer {
     /// Publish one supported draft and delete it only after Slack acknowledges the message.
     #[tool(
         name = "slack_send_draft",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<DraftSendReport>>(),
+        output_schema = tool_output_schema::<DraftSendReport>(),
         annotations(
             title = "Send Slack draft",
             read_only_hint = false,
@@ -805,7 +821,7 @@ impl McpServer {
     /// List named channels, DMs, group DMs, and thread counts Slack explicitly marks unread.
     #[tool(
         name = "slack_list_unreads",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<UnreadReport>>(),
+        output_schema = tool_output_schema::<UnreadReport>(),
         annotations(
             title = "List Slack unreads",
             read_only_hint = true,
@@ -821,7 +837,7 @@ impl McpServer {
     /// Read bounded unread conversations while resolving message authors once per snapshot.
     #[tool(
         name = "slack_read_inbox",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<InboxReport>>(),
+        output_schema = tool_output_schema::<InboxReport>(),
         annotations(
             title = "Read Slack inbox",
             read_only_hint = true,
@@ -844,7 +860,7 @@ impl McpServer {
     /// Read a deterministic, bounded recent-activity snapshot without changing Slack read state.
     #[tool(
         name = "slack_read_activity",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ActivityReport>>(),
+        output_schema = tool_output_schema::<ActivityReport>(),
         annotations(
             title = "Read recent Slack activity",
             read_only_hint = true,
@@ -879,7 +895,7 @@ impl McpServer {
     /// List one bounded page from the signed-in user's personal Slack Later inbox.
     #[tool(
         name = "slack_list_later",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<LaterPage>>(),
+        output_schema = tool_output_schema::<LaterPage>(),
         annotations(
             title = "List Slack Later items",
             read_only_hint = true,
@@ -906,7 +922,7 @@ impl McpServer {
     /// Ensure one exact Slack message is in the in-progress Later inbox.
     #[tool(
         name = "slack_save_for_later",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<LaterMutationReport>>(),
+        output_schema = tool_output_schema::<LaterMutationReport>(),
         annotations(
             title = "Save a Slack message for later",
             read_only_hint = false,
@@ -932,7 +948,7 @@ impl McpServer {
     /// Mark one exact in-progress Slack Later item complete.
     #[tool(
         name = "slack_complete_later",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<LaterMutationReport>>(),
+        output_schema = tool_output_schema::<LaterMutationReport>(),
         annotations(
             title = "Complete a Slack Later item",
             read_only_hint = false,
@@ -958,7 +974,7 @@ impl McpServer {
     /// Remove one exact Slack item from Later in any state.
     #[tool(
         name = "slack_remove_from_later",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<LaterMutationReport>>(),
+        output_schema = tool_output_schema::<LaterMutationReport>(),
         annotations(
             title = "Remove a Slack Later item",
             read_only_hint = false,
@@ -984,7 +1000,7 @@ impl McpServer {
     /// List a bounded page of Slack channels, DMs, and group DMs with names.
     #[tool(
         name = "slack_list_conversations",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ConversationPage>>(),
+        output_schema = tool_output_schema::<ConversationPage>(),
         annotations(
             title = "List Slack conversations",
             read_only_hint = true,
@@ -1007,7 +1023,7 @@ impl McpServer {
     /// Find Slack conversations by a bounded case-insensitive substring search.
     #[tool(
         name = "slack_find_conversations",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ConversationSearchReport>>(),
+        output_schema = tool_output_schema::<ConversationSearchReport>(),
         annotations(
             title = "Find Slack conversations",
             read_only_hint = true,
@@ -1030,7 +1046,7 @@ impl McpServer {
     /// Search Slack messages with optional conversation, date, and cursor filters.
     #[tool(
         name = "slack_search_messages",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<MessageSearchPage>>(),
+        output_schema = tool_output_schema::<MessageSearchPage>(),
         annotations(
             title = "Search Slack messages",
             read_only_hint = true,
@@ -1060,7 +1076,7 @@ impl McpServer {
     /// Read bounded recent history using a Slack conversation ID or exact name.
     #[tool(
         name = "slack_read_channel",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<MessagePage>>(),
+        output_schema = tool_output_schema::<MessagePage>(),
         annotations(
             title = "Read Slack channel history",
             read_only_hint = true,
@@ -1087,7 +1103,7 @@ impl McpServer {
     /// Read a bounded Slack thread by conversation ID or exact name and root timestamp.
     #[tool(
         name = "slack_read_thread",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ThreadPage>>(),
+        output_schema = tool_output_schema::<ThreadPage>(),
         annotations(
             title = "Read Slack thread",
             read_only_hint = true,
@@ -1115,7 +1131,7 @@ impl McpServer {
     /// Fetch one exact Slack message by conversation ID or exact name and timestamp.
     #[tool(
         name = "slack_get_message",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<Message>>(),
+        output_schema = tool_output_schema::<Message>(),
         annotations(
             title = "Get exact Slack message",
             read_only_hint = true,
@@ -1138,7 +1154,7 @@ impl McpServer {
     /// Fetch bounded metadata for one Slack file.
     #[tool(
         name = "slack_get_file",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<FileReference>>(),
+        output_schema = tool_output_schema::<FileReference>(),
         annotations(
             title = "Get Slack file metadata",
             read_only_hint = true,
@@ -1154,7 +1170,7 @@ impl McpServer {
     /// Download one private Slack file beneath the configured local file root.
     #[tool(
         name = "slack_download_file",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<FileDownloadReport>>(),
+        output_schema = tool_output_schema::<FileDownloadReport>(),
         annotations(
             title = "Download private Slack file",
             read_only_hint = false,
@@ -1208,7 +1224,7 @@ impl McpServer {
     /// Upload one local regular file to a Slack conversation root or thread.
     #[tool(
         name = "slack_upload_file",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<FileUploadReport>>(),
+        output_schema = tool_output_schema::<FileUploadReport>(),
         annotations(
             title = "Upload file to Slack",
             read_only_hint = false,
@@ -1273,7 +1289,7 @@ impl McpServer {
     /// List bounded workspace custom emoji and aliases.
     #[tool(
         name = "slack_list_custom_emoji",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<CustomEmojiList>>(),
+        output_schema = tool_output_schema::<CustomEmojiList>(),
         annotations(
             title = "List Slack custom emoji",
             read_only_hint = true,
@@ -1289,7 +1305,7 @@ impl McpServer {
     /// Ensure an emoji reaction is present on one exact Slack message.
     #[tool(
         name = "slack_add_reaction",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ReactionMutationReport>>(),
+        output_schema = tool_output_schema::<ReactionMutationReport>(),
         annotations(
             title = "Add Slack reaction",
             read_only_hint = false,
@@ -1320,7 +1336,7 @@ impl McpServer {
     /// Ensure an emoji reaction is absent from one exact Slack message.
     #[tool(
         name = "slack_remove_reaction",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<ReactionMutationReport>>(),
+        output_schema = tool_output_schema::<ReactionMutationReport>(),
         annotations(
             title = "Remove Slack reaction",
             read_only_hint = false,
@@ -1351,7 +1367,7 @@ impl McpServer {
     /// Find bounded Slack user profiles across paginated workspace membership.
     #[tool(
         name = "slack_find_users",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<ToolOutput<UserSearchReport>>(),
+        output_schema = tool_output_schema::<UserSearchReport>(),
         annotations(
             title = "Find Slack users",
             read_only_hint = true,

@@ -7,7 +7,8 @@ draft-to-ready PR delivery. Follow the pursue-goal skill for execution.
 
 Repository: `/Users/smarzola/projects/lurkline`. Starting branch: `main`.
 Base: `81ad84fda52c8aa439b2566e524889bc7c22cb4e`; checkout clean and matches remote.
-Work branch: `fix/mcp-output-schema`; GitHub base: `main`; draft PR pending.
+Work branch: `fix/mcp-output-schema`; GitHub base: `main`.
+Draft PR: https://github.com/smarzola/lurkline/pull/42.
 Commit this goal and evidence, following existing tracked internal goals.
 
 ## Baseline and decision
@@ -25,11 +26,18 @@ names, and safety gates. Do not wrap results or add a schema-rewriting layer.
 No storage, API payload, dependency, or Slack permission changes are needed.
 All runtime inputs are synthetic; no real Slack credentials or data are read.
 
+Runtime discovery found a second defect: the default schema generator describes
+deserialization, making `RenderedMessage.outbound_mentions` required even when
+serialization omits it. The official SDK rejects the successful render result.
+Generate all tool output schemas with Schemars' serialization contract through
+one shared helper. This corrects the schema without changing result payloads.
+
 ## Delivery and success criteria
 
 1. Every tool returned by actual `tools/list` has an explicit object output root,
    in default and fully enabled configurations. Existing input schemas remain
-   valid. Add assertions to the existing raw stdio tests to catch this defect.
+   valid. Add assertions to the existing raw stdio tests to catch missing root
+   types and a schema that requires the omitted `outbound_mentions` field.
 2. Launch the real MCP executable through an official TypeScript SDK client.
    Default discovery returns 27 accepted tools; fully enabled discovery returns
    30. A local Markdown render succeeds, invalid input returns a structured
@@ -49,12 +57,37 @@ standalone test framework or production dependency is needed.
 
 ## Status and evidence
 
-- [ ] Shared schema fix and raw stdio regression pass.
-- [ ] Required checks and implementer runtime acceptance pass.
+- [x] Shared schema fix and raw stdio regression pass.
+- [x] Required local checks and implementer runtime acceptance pass.
 - [ ] Independent review and reviewer runtime acceptance pass.
 - [ ] Published PR head passes CI and is ready for review.
 
 Baseline runtime: real `target/release/lurkline mcp`, version 0.17.1;
 27 tools returned, 27 missing object output roots, clean EOF shutdown.
-Implementer runtime: pending. Reviewer runtime: pending. Final review: pending.
-Current status: baseline reproduced; implementation pending.
+Implementation evidence:
+
+- The added stdio assertions failed on missing object roots before the fix in
+  both configurations. A second regression failed on required `outbound_mentions`
+  before the serialization-contract fix. Both now pass.
+- Format, strict locked Clippy, all-target tests (315 library, 13 CLI, 2 raw MCP,
+  1 metadata), locked release build, credential scan, and diff checks passed.
+  No new dependency was added to the repository.
+- Raw evidence: `/tmp/lurkline-mcp-schema-{red,green,clippy,tests,build}.log`,
+  `/tmp/lurkline-mcp-output-contract-red.log`, and
+  `/tmp/lurkline-mcp-sdk-{red,green}.log`.
+
+Implementer runtime: personally launched the built release executable on macOS
+ARM64 using `/tmp/lurkline-mcp-sdk-check/walkthrough.mjs`, official MCP TypeScript
+SDK 1.27.1, and Ajv 8 in a disposable scratch installation. The published v0.17.1
+baseline was rejected at `outputSchema.type` in both configurations. The patched
+binary returned 27/30 accepted tools; all schemas compiled and rejected null and
+scalar results. Markdown rendering returned valid structured output; invalid
+user input and blocked/unconfirmed writes returned schema-valid errors. A
+deliberately mistyped render result was rejected. No Slack requests or writes
+were needed; server diagnostics stayed empty and the disposable file root was
+removed. The SDK's validator logs ignored Rust integer format annotations; JSON
+integer/range constraints still apply. The scratch driver initially needed a
+canonical file-root path and the actual draft argument shape; these were fixed.
+
+Reviewer runtime: pending. Final review: pending.
+Current status: implementation verified locally; independent review and CI pending.
